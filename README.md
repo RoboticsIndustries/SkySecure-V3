@@ -40,11 +40,12 @@ The platform is validated against live aircraft data from OpenSky Network and de
 | v4 | Multi-Receiver Sensor Fusion | 📋 Planned |
 
 Current Work:
-   (July 13th) - L1 (TDOA) Created, tested, accuracy rate will be published after the full product is released 
-    (July 14th) - L2 (Kinematic Anomaly Detection) In creation stage, starting to get finished.
+   July 13th 2026 - L1 (TDOA) Created, tested, accuracy rate will be published after the full product is released.
+   July 14th 2026 - L2 (Kinematic Anomaly Detection) In creation stage.
+   Tentaive date of completion -  July 20th 2026
 
 Action Plan:
-    (August 31st) - End Of August: Everything should get created, Layers 1 - 5. Should have 4 working recievers, and 3-4 working lifesize radars. 
+      End Of August (August 31st) : Everything should get created, Layers 1 - 5. Should have 4 working recievers, and 3-4 working lifesize radars. 
 
 ---
 
