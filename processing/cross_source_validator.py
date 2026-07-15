@@ -289,8 +289,8 @@ class CrossSourceValidator:
 # outbound network access to opensky-network.org / adsb.lol / adsb.fi.
 async def _smoke_test():
     logging.basicConfig(level=logging.INFO)
-    icao = "a4f7c1"       # replace with a real live ICAO24 near you
-    lat, lon = 39.95, -75.6   # approx last-known position, for the point APIs
+    icao = "ada296"       # replace with a real live ICAO24 near you
+    lat, lon =  39.9659, -75.605   # approx last-known position, for the point APIs
     async with CrossSourceValidator() as validator:
         result = await validator.validate_aircraft(icao, lat, lon)
         print(result.to_dict())
