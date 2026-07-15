@@ -35,9 +35,16 @@ The platform is validated against live aircraft data from OpenSky Network and de
 | Layer | Method | Status |
 |---|---|---|
 | v1 | TDOA Position Consistency | ✅ Complete |
-| v2 | ACARS Message Anomaly Detection | 🔧 In Development (Target: Aug 2026) |
+| v2 | ACARS Message Anomaly Detection | 🔧 In Development |
 | v3 | ML-Based Trajectory Fingerprinting | 📋 Planned |
 | v4 | Multi-Receiver Sensor Fusion | 📋 Planned |
+
+Current Work:
+   (July 13th) - L1 (TDOA) Created, tested, accuracy rate will be published after the full product is released 
+    (July 14th) - L2 (Kinematic Anomaly Detection) In creation stage, starting to get finished.
+
+Action Plan:
+    (August 31st) - End Of August: Everything should get created, Layers 1 - 5. Should have 4 working recievers, and 3-4 working lifesize radars. 
 
 ---
 
