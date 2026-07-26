@@ -210,7 +210,7 @@ class AircraftBaseline:
         sigma = arr.std()
         if sigma < 1e-6:
             return 0.0
-        return abs((value - mu) / sigma)
+        return float(abs((value - mu) / sigma))
 
 
 class StatisticalDetector:

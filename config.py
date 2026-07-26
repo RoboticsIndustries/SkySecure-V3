@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     REDIS_TTL_HISTORY:       int   = 3600
 
     # ─── Database ──────────────────────────────────────────────
-    POSTGRES_DSN:            str   = "postgresql://skysecure:skysecure_secret@localhost:5432/skysecure"
+    POSTGRES_DSN:            str   = "postgresql://skysecure@localhost:5432/skysecure"
 
     # ─── ADS-B Sources ─────────────────────────────────────────
     ADSB_SOURCE:             str   = "opensky"   # opensky | beast | dump1090
@@ -66,7 +66,10 @@ class Settings(BaseSettings):
     # ─── API ───────────────────────────────────────────────────
     API_HOST:                str   = "0.0.0.0"
     API_PORT:                int   = 8000
-    API_CORS_ORIGINS:        List[str] = ["http://localhost:3000"]
+    API_CORS_ORIGINS:        List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
     WS_BROADCAST_INTERVAL:   float = 1.0   # seconds
 
     # ─── Logging ───────────────────────────────────────────────

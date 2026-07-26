@@ -7,7 +7,7 @@ Fetches REAL aircraft from OpenSky Network and validates them with TDOA.
 import sys
 sys.path.append('.')
 
-import requests
+import httpx
 import time
 from processing.tdoa_validator import (
     TDOAValidator, 
@@ -35,7 +35,7 @@ def fetch_live_aircraft(lat_min=39.5, lat_max=40.5, lon_min=-76.0, lon_max=-74.5
     print(f"   Area: {lat_min}°N to {lat_max}°N, {lon_min}°E to {lon_max}°E")
     
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = httpx.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         
@@ -66,7 +66,7 @@ def fetch_live_aircraft(lat_min=39.5, lat_max=40.5, lon_min=-76.0, lon_max=-74.5
         print(f"   ✅ Found {len(aircraft)} aircraft in area")
         return aircraft
         
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         print(f"   ❌ Error fetching data: {e}")
         return []
 

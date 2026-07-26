@@ -3,11 +3,10 @@ api/main.py
 ────────────
 FastAPI application with L1 multi-source position cross-validation.
 
-No physical receivers exist yet, so this uses independent live ADS-B
-aggregator networks (OpenSky, adsb.lol, adsb.fi) as stand-ins for true
-TDOA baselines — see processing/cross_source_validator.py for the full
-explanation and processing/tdoa_validator.py for the real-TDOA path once
-receiver hardware is deployed.
+No physical receivers exist yet. OpenSky, adsb.lol, and adsb.fi are treated
+as separate aggregator reports, not independent physical measurements and
+not substitutes for TDOA. See processing/cross_source_validator.py for scope
+and processing/tdoa_validator.py for the hardware-backed path.
 
 Key pieces:
 - L1 cross-validator, rate-limit-aware (bounded + cached per broadcast cycle)
@@ -24,10 +23,11 @@ import time
 from typing import Optional, List, Dict, Any
 
 import aiohttp
+import asyncpg
 import orjson
 import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from contextlib import asynccontextmanager
@@ -74,13 +74,60 @@ HEADERS = {
     "Accept":     "application/json",
 }
 
+ADSB_LOL_FALLBACK_URL = "https://api.adsb.lol/v2/point/39.9526/-75.1652/50"
+
+
+def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
+    """Normalize an adsb.lol point-feed response to the public API shape."""
+    aircraft = []
+    for raw in data.get("ac") or []:
+        icao = str(raw.get("hex") or "").upper().lstrip("~")
+        lat, lon = raw.get("lat"), raw.get("lon")
+        if len(icao) != 6 or lat is None or lon is None:
+            continue
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+
+        def number(value, *, integer=False):
+            try:
+                parsed = float(value)
+                return int(parsed) if integer else parsed
+            except (TypeError, ValueError):
+                return None
+
+        altitude = number(raw.get("alt_baro"), integer=True)
+        aircraft.append({
+            "icao": icao,
+            "cs": str(raw.get("flight") or raw.get("r") or "").strip() or None,
+            "lat": lat,
+            "lon": lon,
+            "alt": altitude,
+            "vel": number(raw.get("gs"), integer=True),
+            "hdg": number(raw.get("track")),
+            "vr": number(raw.get("baro_rate"), integer=True),
+            "gnd": raw.get("alt_baro") == "ground",
+            "src": "adsb_lol",
+            "risk": 0,
+            "anoms": [],
+            "cls": "CIVILIAN",
+            "conf": 0.75,
+            "mil": 0.0,
+            "band": "NORMAL",
+            "trail": [],
+        })
+    return aircraft
+
 
 # ─── L1 Helper Functions (real, live-data cross-validation) ──────────────────
 
-# Per-ICAO result cache so we don't re-query the same aircraft every
+# Per-ICAO-and-claim-source result cache so we don't re-query the same aircraft every
 # broadcast tick. External free-tier APIs will rate-limit/ban aggressive
 # per-aircraft polling, so this is not optional.
-_L1_CACHE: Dict[str, tuple] = {}
+_L1_CACHE: Dict[tuple[str, str], tuple] = {}
 _L1_CACHE_TTL = 60  # seconds
 
 # Hard cap on live cross-validation calls per broadcast cycle. The global
@@ -88,6 +135,10 @@ _L1_CACHE_TTL = 60  # seconds
 # a per-aircraft hit at that volume. Bump this only if you have paid/higher
 # rate limit tiers.
 _L1_MAX_PER_CYCLE = 20
+
+
+def _l1_cache_key(ac: dict) -> tuple[str, str]:
+    return ac["icao"], str(ac.get("src") or "unknown").lower()
 
 
 def _select_l1_candidates(aircraft_list: List[dict]) -> List[dict]:
@@ -99,7 +150,9 @@ def _select_l1_candidates(aircraft_list: List[dict]) -> List[dict]:
     fresh_candidates = [
         ac for ac in aircraft_list
         if ac.get("icao") and ac.get("lat") is not None and ac.get("lon") is not None
-        and (ac["icao"] not in _L1_CACHE or now - _L1_CACHE[ac["icao"]][0] > _L1_CACHE_TTL)
+        and str(ac.get("src") or "").lower() in {"opensky", "adsb_lol", "adsb_fi"}
+        and (_l1_cache_key(ac) not in _L1_CACHE
+             or now - _L1_CACHE[_l1_cache_key(ac)][0] > _L1_CACHE_TTL)
     ]
     fresh_candidates.sort(key=lambda ac: ac.get("risk", 0), reverse=True)
     return fresh_candidates[:_L1_MAX_PER_CYCLE]
@@ -121,21 +174,23 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
     if candidates:
         results = await asyncio.gather(
             *[
-                cross_validator.validate_aircraft(ac["icao"], ac["lat"], ac["lon"])
+                cross_validator.validate_aircraft(
+                    ac["icao"], ac["lat"], ac["lon"],
+                    claimed_source=ac.get("src"),
+                )
                 for ac in candidates
             ],
             return_exceptions=True,
         )
         for ac, result in zip(candidates, results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 log.warning(f"L1 cross-validation failed for {ac.get('icao')}: {result}")
                 continue
-            _L1_CACHE[ac["icao"]] = (now, result.to_dict())
+            _L1_CACHE[_l1_cache_key(ac)] = (now, result.to_dict())
 
     # Apply cache (fresh this cycle or still within TTL) to every aircraft
     for ac in aircraft_list:
-        icao = ac.get("icao")
-        cached = _L1_CACHE.get(icao)
+        cached = _L1_CACHE.get(_l1_cache_key(ac))
         if not cached or now - cached[0] > _L1_CACHE_TTL:
             continue
         result = cached[1]
@@ -151,7 +206,7 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
             ac["band"] = "HIGH"
             ac.setdefault("anoms", []).append({
                 "type": "L1_POSITION_DISAGREEMENT",
-                "description": f"Independent networks disagree by {result['max_disagreement_m']:.0f}m "
+                "description": f"Aggregator reports disagree by {result['max_disagreement_m']:.0f}m "
                                 f"({'/'.join(result['sources_used'])})",
             })
 
@@ -198,7 +253,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.API_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -219,6 +274,19 @@ async def _fetch_live_aircraft() -> List[dict]:
             ) as resp:
                 if resp.status != 200:
                     log.warning("OpenSky returned HTTP %d", resp.status)
+                    if resp.status == 429:
+                        async with session.get(
+                            ADSB_LOL_FALLBACK_URL,
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as fallback_resp:
+                            if fallback_resp.status == 200:
+                                fallback_data = await fallback_resp.json(content_type=None)
+                                fallback_aircraft = _parse_adsb_lol_aircraft(fallback_data)
+                                if TDOA_AVAILABLE and cross_validator:
+                                    await run_l1_cross_validation(fallback_aircraft)
+                                log.info("adsb.lol fallback: %d aircraft", len(fallback_aircraft))
+                                return fallback_aircraft
+                            log.warning("adsb.lol fallback returned HTTP %d", fallback_resp.status)
                     return []
                 data = await resp.json(content_type=None)
                 states = data.get("states") or []
@@ -463,11 +531,43 @@ async def validate_position_l1(
 
 @app.get("/healthz")
 async def healthz():
+    dependencies = {"redis": "error", "postgres": "error", "kafka": "error"}
+    try:
+        if redis_client is None:
+            raise ConnectionError("Redis client is not initialized")
+        await redis_client.ping()
+        dependencies["redis"] = "ok"
+
+        postgres = await asyncpg.connect(settings.POSTGRES_DSN, timeout=2)
+        try:
+            await postgres.fetchval("SELECT 1")
+            dependencies["postgres"] = "ok"
+        finally:
+            await postgres.close()
+
+        bootstrap = settings.KAFKA_BOOTSTRAP.split(",", 1)[0]
+        kafka_host, kafka_port = bootstrap.rsplit(":", 1)
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(kafka_host, int(kafka_port)),
+            timeout=2,
+        )
+        writer.close()
+        await writer.wait_closed()
+        dependencies["kafka"] = "ok"
+    except Exception:
+        detail = {
+            "status": "degraded",
+            "time": time.time(),
+            "dependencies": dependencies,
+        }
+        raise HTTPException(status_code=503, detail=detail)
+
     return {
         "status": "ok",
         "time": time.time(),
+        "dependencies": dependencies,
         "l1_enabled": TDOA_AVAILABLE,
-        "l1_sources_active": 3 if cross_validator else 0,
+        "l1_validator_ready": cross_validator is not None,
     }
 
 

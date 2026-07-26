@@ -1,7 +1,8 @@
 """
 Integration Test: TDOA Validator + Enhanced Anomaly Detector
 =============================================================
-Tests the complete integration of TDOA validation with SkySecure v2
+Tests synthetic timing fixtures through the validator and anomaly detector.
+This does not validate live receiver hardware or real TDOA.
 """
 
 import sys
@@ -17,7 +18,7 @@ def print_header(text):
     print("=" * 70 + "\n")
 
 def main():
-    print_header("SkySecure v2 + TDOA Integration Test")
+    print_header("SkySecure V3 Synthetic TDOA Integration Test")
     
     # Initialize TDOA validator
     print("📡 Initializing receiver network...")
@@ -39,6 +40,13 @@ def main():
     # Test Case 1: Legitimate Aircraft
     print_header("TEST 1: Legitimate Aircraft")
     
+    legit_position = Position.from_lat_lon_alt(39.8717, -75.2411, 3000)
+    legit_t0 = 1000.0
+    legit_receive_times = {
+        rid: legit_t0 + legit_position.distance_to(receiver.position) / 299792458
+        for rid, receiver in tdoa_validator.receivers.items()
+    }
+
     legit_track = {
         "icao": "AAL123",
         "lat": 39.8717,
@@ -48,12 +56,7 @@ def main():
         "velocity": 250,
         "vertical_rate": 500,
         "heading": 90,
-        "receive_times": {
-            "RX1_Brandywine": 1000.000523,
-            "RX2_WestChester": 1000.000589,
-            "RX3_Wilmington": 1000.000612,
-            "RX4_Camden": 1000.000498
-        }
+        "receive_times": legit_receive_times,
     }
     
     print(f"✈️  Aircraft: {legit_track['icao']}")
@@ -101,6 +104,14 @@ def main():
     print(f"      - Position error: {anomaly_score.tdoa_position_error:.1f} m")
     print(f"\n   🎯 OVERALL SCORE: {anomaly_score.overall_score:.2f}")
     print(f"   🚦 THREAT LEVEL: {anomaly_score.threat_level}")
+
+    assert tdoa_result.verdict == "LEGITIMATE", (
+        f"legitimate fixture was classified {tdoa_result.verdict} "
+        f"with {tdoa_result.max_error_meters:.1f}m error"
+    )
+    assert anomaly_score.threat_level == "LOW", (
+        f"legitimate fixture received {anomaly_score.threat_level} threat level"
+    )
     
     if anomaly_score.threat_level == "LOW":
         print("\n   ✅ Aircraft verified as LEGITIMATE")
@@ -178,6 +189,13 @@ def main():
     print(f"      - Position error: {anomaly_score.tdoa_position_error:.1f} m")
     print(f"\n   🎯 OVERALL SCORE: {anomaly_score.overall_score:.2f}")
     print(f"   🚦 THREAT LEVEL: {anomaly_score.threat_level}")
+
+    assert tdoa_result.verdict == "SPOOFED", (
+        f"spoof fixture was classified {tdoa_result.verdict}"
+    )
+    assert anomaly_score.threat_level in ["MEDIUM", "HIGH", "CRITICAL"], (
+        f"spoof fixture received {anomaly_score.threat_level} threat level"
+    )
     
     if anomaly_score.threat_level in ["HIGH", "CRITICAL"]:
         print("\n   🚨 SPOOFING DETECTED - Aircraft marked as THREAT")
@@ -185,25 +203,17 @@ def main():
     # Summary
     print_header("Integration Test Summary")
     
-    print("✅ TDOA Validator: Working")
-    print("✅ Enhanced Anomaly Detector: Working")
-    print("✅ Multi-Layer Detection: Working")
-    print("✅ Spoofing Detection: Successful")
+    print("✅ Synthetic timing validation passed")
+    print("✅ Enhanced anomaly scoring integration passed")
     
     print("\n📋 Integration Points Validated:")
     print("   ✓ TDOA validator can be imported")
     print("   ✓ Enhanced detector accepts TDOA validator")
     print("   ✓ TDOA scores integrate with anomaly scoring")
     print("   ✓ Legitimate aircraft verified correctly")
-    print("   ✓ Spoofed aircraft detected correctly")
-    
-    print("\n🎯 Ready for SkySecure v2 Integration!")
-    print("\nNext steps:")
-    print("   1. Copy files to your SkySecure-v2 repository")
-    print("   2. Update docker-compose.yml with TDOA service")
-    print("   3. Configure receiver network in config/receivers.json")
-    print("   4. Update fusion engine to include receive_times")
-    print("   5. Deploy and monitor for spoofing attempts")
+    print("   ✓ Synthetic spoof fixture detected correctly")
+    print("\n⚠ This test is not evidence of real TDOA capability; physical,")
+    print("  synchronized receivers are still required for that claim.")
     
     print("\n" + "=" * 70)
 

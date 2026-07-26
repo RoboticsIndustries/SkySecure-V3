@@ -9,7 +9,7 @@ Also publishes to Kafka for the anomaly detection pipeline.
 
 from __future__ import annotations
 import asyncio, time, logging, json
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 import redis.asyncio as aioredis
@@ -24,6 +24,44 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 15   # seconds — stay well within OpenSky rate limits
 REDIS_TTL     = 60   # seconds — aircraft expire if not refreshed
+ADSB_LOL_FALLBACK_URL = "https://api.adsb.lol/v2/point/39.9526/-75.1652/50"
+
+
+def _parse_adsb_lol_states(data: dict) -> list[list[Any]]:
+    """Convert adsb.lol records into the subset of OpenSky's state shape used here."""
+    states = []
+    for raw in data.get("ac") or []:
+        icao = str(raw.get("hex") or "").upper().lstrip("~")
+        lat, lon = raw.get("lat"), raw.get("lon")
+        if len(icao) != 6 or lat is None or lon is None:
+            continue
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+
+        def number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        alt_ft = number(raw.get("alt_baro"))
+        speed_kts = number(raw.get("gs"))
+        vertical_fpm = number(raw.get("baro_rate"))
+        state: list[Any] = [None] * 17
+        state[0] = icao
+        state[1] = str(raw.get("flight") or "").strip() or None
+        state[5], state[6] = lon, lat
+        state[7] = alt_ft / 3.28084 if alt_ft is not None else None
+        state[8] = str(raw.get("alt_baro") or "").lower() == "ground"
+        state[9] = speed_kts / 1.944 if speed_kts is not None else None
+        state[10] = number(raw.get("track"))
+        state[11] = vertical_fpm / 196.85 if vertical_fpm is not None else None
+        states.append(state)
+    return states
 
 
 async def run() -> None:
@@ -52,19 +90,31 @@ async def run() -> None:
                     "https://opensky-network.org/api/states/all",
                     timeout=aiohttp.ClientTimeout(total=25),
                 ) as resp:
+                    source = "opensky"
                     if resp.status == 429:
-                        log.warning("Rate limited by OpenSky — sleeping 60s")
-                        await asyncio.sleep(60)
-                        continue
-                    if resp.status != 200:
+                        log.warning("Rate limited by OpenSky — using adsb.lol fallback")
+                        async with session.get(
+                            ADSB_LOL_FALLBACK_URL,
+                            timeout=aiohttp.ClientTimeout(total=25),
+                        ) as fallback_resp:
+                            if fallback_resp.status != 200:
+                                log.warning("adsb.lol fallback HTTP %d", fallback_resp.status)
+                                await asyncio.sleep(POLL_INTERVAL)
+                                continue
+                            fallback_data = await fallback_resp.json(content_type=None)
+                            states = _parse_adsb_lol_states(fallback_data)
+                            recv_t = time.time()
+                            source = "adsb_lol"
+                            log.info("adsb.lol fallback returned %d states", len(states))
+                    elif resp.status != 200:
                         log.warning("OpenSky HTTP %d", resp.status)
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
-
-                    data   = await resp.json(content_type=None)
-                    states = data.get("states") or []
-                    recv_t = float(data.get("time", time.time()))
-                    log.info("OpenSky returned %d states", len(states))
+                    else:
+                        data = await resp.json(content_type=None)
+                        states = data.get("states") or []
+                        recv_t = float(data.get("time", time.time()))
+                        log.info("OpenSky returned %d states", len(states))
 
                     pipe = redis_client.pipeline()
                     published = 0
@@ -98,7 +148,7 @@ async def run() -> None:
                             "hdg":  float(s[10]) if s[10] else None,
                             "vr":   int(float(s[11]) * 196.85) if s[11] else None,
                             "gnd":  bool(s[8]) if s[8] is not None else False,
-                            "src":  "opensky",
+                            "src":  source,
                             "risk": 0, "anoms": [], "cls": "CIVILIAN",
                             "conf": 0.85, "mil": 0.0, "band": "NORMAL", "trail": [],
                         }
@@ -113,7 +163,7 @@ async def run() -> None:
                         # Also publish to Kafka for anomaly detection pipeline
                         try:
                             msg = RawADSBMessage(
-                                receiver_id="opensky", recv_time=recv_t,
+                                receiver_id=source, recv_time=recv_t,
                                 icao24=icao, raw_message="", msg_type=17,
                                 callsign=ac["cs"], lat=lat, lon=lon,
                                 altitude_baro=ft(s[7]),
