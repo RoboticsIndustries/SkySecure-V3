@@ -1,7 +1,6 @@
 -- SkySecure V2 — PostgreSQL + PostGIS Schema
 
 CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
 -- ─── Aircraft tracks (time-series) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS track_points (
@@ -23,7 +22,7 @@ CREATE TABLE IF NOT EXISTS track_points (
     on_ground       BOOLEAN
 );
 
-SELECT create_hypertable('track_points', 'time', if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_track_time ON track_points (time DESC);
 CREATE INDEX IF NOT EXISTS idx_track_icao ON track_points (icao24, time DESC);
 CREATE INDEX IF NOT EXISTS idx_track_geo ON track_points USING GIST (
     ST_SetSRID(ST_MakePoint(lon, lat), 4326)
@@ -73,15 +72,18 @@ CREATE TABLE IF NOT EXISTS military_icao_ranges (
     notes           TEXT
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_military_range_unique
+ON military_icao_ranges (country, range_start, range_end);
+
 -- Seed with known ranges (partial — from public aviation databases)
 INSERT INTO military_icao_ranges (country, range_start, range_end, service, notes) VALUES
-    ('US', 0xADF000, 0xADFFFF, 'USAF',  'USAF primary block'),
-    ('US', 0xAE0000, 0xAFFFFF, 'DOD',   'US DOD general'),
-    ('GB', 0x43C000, 0x43CFFF, 'RAF',   'Royal Air Force'),
-    ('FR', 0x3C4000, 0x3C5FFF, 'FAF',   'French Air Force'),
-    ('DE', 0x3C0000, 0x3C3FFF, 'GAF',   'German Air Force'),
-    ('RU', 0x100000, 0x1FFFFF, 'RuAF',  'Russian Federation'),
-    ('CN', 0x780000, 0x7FFFFF, 'PLAAF', 'Chinese PLA Air Force')
+    ('US', 11399168, 11403263, 'USAF',  'USAF primary block'),
+    ('US', 11403264, 11534335, 'DOD',   'US DOD general'),
+    ('GB', 4440064,  4444159,  'RAF',   'Royal Air Force'),
+    ('FR', 3948544,  3956735,  'FAF',   'French Air Force'),
+    ('DE', 3932160,  3948543,  'GAF',   'German Air Force'),
+    ('RU', 1048576,  2097151,  'RuAF',  'Russian Federation'),
+    ('CN', 7864320,  8388607,  'PLAAF', 'Chinese PLA Air Force')
 ON CONFLICT DO NOTHING;
 
 -- ─── ACARS messages ────────────────────────────────────────────

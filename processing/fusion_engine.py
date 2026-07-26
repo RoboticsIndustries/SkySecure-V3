@@ -27,6 +27,7 @@ import time
 from typing import Optional, List
 
 import redis.asyncio as aioredis
+import asyncpg
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
@@ -129,8 +130,9 @@ def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 class FusionEngine:
 
-    def __init__(self, redis_client: aioredis.Redis) -> None:
+    def __init__(self, redis_client: aioredis.Redis, postgres_pool=None) -> None:
         self.redis = redis_client
+        self.postgres = postgres_pool
         # In-memory Kalman state per aircraft (lat, lon, alt)
         # Cleared on restart (Redis carries position state)
         self._kalman: dict = {}   # icao24 → {lat: KF, lon: KF, alt: KF}
@@ -297,6 +299,39 @@ class FusionEngine:
             key=sv.icao24.encode(),
             value=sv.to_bytes(),
         )
+        if self.postgres is not None:
+            try:
+                await self.postgres.execute(
+                    """
+                    INSERT INTO track_points (
+                        time, icao24, callsign, lat, lon, altitude_baro,
+                        altitude_geo, velocity, heading, vertical_rate,
+                        source, confidence, risk_score, classification,
+                        raw_icao, on_ground
+                    ) VALUES (
+                        to_timestamp($1), $2, $3, $4, $5, $6, $7, $8,
+                        $9, $10, $11, $12, $13, $14, $15, $16
+                    )
+                    """,
+                    sv.last_seen,
+                    sv.icao24,
+                    sv.callsign,
+                    sv.lat,
+                    sv.lon,
+                    sv.altitude_baro,
+                    sv.altitude_geo,
+                    sv.velocity,
+                    sv.heading,
+                    sv.vertical_rate,
+                    sv.primary_source.value,
+                    sv.confidence,
+                    sv.risk_score,
+                    sv.classification.value,
+                    int(sv.icao24, 16),
+                    sv.on_ground,
+                )
+            except Exception as exc:
+                log.error("PostgreSQL track persistence failed for %s: %s", sv.icao24, exc)
 
     async def _lookup_icao_by_registration(self, registration: Optional[str]) -> Optional[str]:
         if not registration:
@@ -363,7 +398,13 @@ async def run() -> None:
     log.info("Starting fusion engine")
 
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
-    engine = FusionEngine(redis_client)
+    postgres_pool = await asyncpg.create_pool(
+        settings.POSTGRES_DSN,
+        min_size=1,
+        max_size=4,
+        command_timeout=10,
+    )
+    engine = FusionEngine(redis_client, postgres_pool=postgres_pool)
     dup_detector = DuplicateICAODetector(redis_client)
 
     consumer_adsb = AIOKafkaConsumer(
@@ -430,6 +471,8 @@ async def run() -> None:
         await consumer_adsb.stop()
         await consumer_mlat.stop()
         await producer.stop()
+        if postgres_pool is not None:
+            await postgres_pool.close()
         await redis_client.close()
 
 
