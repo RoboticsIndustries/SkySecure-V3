@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>SkySecure V2</title>
+<title>SkySecure V3</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.css"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -159,7 +159,7 @@ tr:hover td{background:#fafafa}
 <!-- Header -->
 <div class="hdr">
   <h1>
-    SkySecure V2 — Live Aircraft and Spoof Detection
+    SkySecure V3 — Live Aircraft Anomaly Monitoring
     <span style="font-size:12px;font-weight:400;color:#6b7280;display:flex;align-items:center;gap:5px">
       <span class="wsd connecting" id="wsd"></span>
       <span id="wslbl">Connecting...</span>
@@ -168,7 +168,7 @@ tr:hover td{background:#fafafa}
   <div class="tabs">
     <div class="tab active" onclick="switchTab('map')">Live Aircraft Map</div>
     <div class="tab"        onclick="switchTab('eda')">EDA and ML</div>
-    <div class="tab"        onclick="switchTab('ai')">AI Analysis</div>
+    <div class="tab"        onclick="switchTab('ai')">Local Dataset Analysis</div>
     <div class="tab"        onclick="switchTab('code')">Code</div>
     <div class="tab"        onclick="switchTab('manual')">Manual Packet Entry</div>
   </div>
@@ -176,16 +176,14 @@ tr:hover td{background:#fafafa}
 
 <!-- TAB: MAP -->
 <div class="tc active" id="tab-map">
-  <div id="banner" class="banner yellow">Starting — fetching aircraft from all sources...</div>
+  <div id="banner" class="banner yellow">Starting — waiting for the SkySecure API...</div>
   <div style="padding:5px 28px;display:flex;gap:16px;flex-shrink:0;background:#f9fafb;border-bottom:1px solid var(--border);font-size:11px;font-family:var(--mono)">
     <span style="color:var(--text2);font-weight:600">SOURCES:</span>
     <span id="src-backend"      style="color:#9ca3af">Docker backend: waiting</span>
-    <span id="src-adsbfi"       style="color:#9ca3af">adsb.fi: waiting</span>
-    <span id="src-opensky"      style="color:#9ca3af">OpenSky: waiting</span>
-    <span id="src-adsbexchange" style="color:#9ca3af">ADS-B Exchange: waiting</span>
+    <span id="src-live"         style="color:#9ca3af">Server live feed: waiting</span>
   </div>
   <div class="ctrl">
-    <label class="chk"><input type="checkbox" id="chk-spoof" onchange="applyFilters()"> Show only Spoof Probability &gt;= 30%</label>
+    <label class="chk"><input type="checkbox" id="chk-spoof" onchange="applyFilters()"> Show heuristic anomaly score &gt;= 30%</label>
     <label class="chk"><input type="checkbox" id="chk-mil"   onchange="applyFilters()"> Military only</label>
     <label class="chk"><input type="checkbox" id="chk-apt"   checked onchange="drawAirports()"> Airport regions</label>
     <select id="apt-sel" onchange="flyTo()"><option value="">Jump to airport...</option></select>
@@ -194,7 +192,7 @@ tr:hover td{background:#fafafa}
       <div class="chip civil"><span id="cc">0</span> civil</div>
       <div class="chip mil"><span id="cm">0</span> mil</div>
       <div class="chip dark"><span id="cd">0</span> dark</div>
-      <div class="chip spoof"><span id="cs">0</span> spoofed</div>
+      <div class="chip spoof"><span id="cs">0</span> suspicious</div>
     </div>
   </div>
   <div id="map"></div>
@@ -206,7 +204,7 @@ tr:hover td{background:#fafafa}
     <h2>Exploratory Data Analysis and ML Results</h2>
     <div class="sgrid">
       <div class="sc"><div class="v" id="e-tot">--</div><div class="l">Total Tracked</div></div>
-      <div class="sc"><div class="v" id="e-sp" style="color:#ef4444">--</div><div class="l">Likely Spoofed</div></div>
+      <div class="sc"><div class="v" id="e-sp" style="color:#ef4444">--</div><div class="l">Heuristically Suspicious</div></div>
       <div class="sc"><div class="v" id="e-mil" style="color:#f97316">--</div><div class="l">Military / Dark</div></div>
       <div class="sc"><div class="v" id="e-cl" style="color:#22c55e">--</div><div class="l">Clean Civilian</div></div>
     </div>
@@ -214,7 +212,7 @@ tr:hover td{background:#fafafa}
       <div class="cc"><h4>Classification Breakdown</h4><canvas id="ch-cls"></canvas></div>
       <div class="cc"><h4>Spoof Probability Distribution</h4><canvas id="ch-prob"></canvas></div>
     </div>
-    <h3>Most Likely Spoofed Aircraft</h3>
+    <h3>Highest Heuristic Anomaly Scores</h3>
     <div class="tw" style="margin-top:10px">
       <table>
         <thead><tr>
@@ -231,8 +229,8 @@ tr:hover td{background:#fafafa}
 <!-- TAB: AI ANALYSIS -->
 <div class="tc" id="tab-ai">
   <div class="scroll-tc">
-    <h2>AI Spoof Analysis</h2>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:20px;line-height:1.6">Upload your ACARS or ADS-B CSV dataset. Claude analyses each aircraft, explains exactly why it is flagged, and surfaces attack patterns across the full dataset.</p>
+    <h2>Local Dataset Analysis</h2>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:20px;line-height:1.6">Upload an ACARS or ADS-B CSV dataset for local, deterministic triage. Uploaded telemetry stays in this browser and labels are not independent confirmation of an attack.</p>
 
     <div class="dropzone" onclick="document.getElementById('ai-file').click()">
       <input type="file" id="ai-file" accept=".csv" style="display:none" onchange="handleCSV(this)"/>
@@ -252,11 +250,11 @@ tr:hover td{background:#fafafa}
       </div>
     </div>
 
-    <button id="ai-btn" class="btn" style="display:none;margin-bottom:20px" onclick="runAIAnalysis()">Analyse with Claude AI</button>
+    <button id="ai-btn" class="btn" style="display:none;margin-bottom:20px" onclick="runAIAnalysis()">Run Local Dataset Analysis</button>
 
     <div id="ai-loading" style="display:none;max-width:580px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:7px">
       <span class="spinner"></span>
-      <span style="font-weight:500;font-size:13px">Claude is analysing your dataset...</span>
+      <span style="font-weight:500;font-size:13px">Analysing your dataset locally...</span>
       <div id="ai-progress" style="font-size:12px;color:var(--text2);margin-top:5px;margin-left:24px">Reading records</div>
     </div>
 
@@ -264,10 +262,10 @@ tr:hover td{background:#fafafa}
       <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px" id="ai-stat-grid"></div>
       <div class="crow">
         <div class="cc"><h4>Spoof reason breakdown</h4><canvas id="ai-rc" style="max-height:180px"></canvas></div>
-        <div class="cc"><h4>Speed distribution (spoofed aircraft)</h4><canvas id="ai-sc" style="max-height:180px"></canvas></div>
+        <div class="cc"><h4>Speed distribution (labeled suspicious)</h4><canvas id="ai-sc" style="max-height:180px"></canvas></div>
       </div>
       <div style="background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:0 7px 7px 0;padding:18px;margin-bottom:20px">
-        <div style="font-size:10px;font-weight:700;color:var(--blue);letter-spacing:.08em;text-transform:uppercase;margin-bottom:9px">Claude AI Analysis</div>
+        <div style="font-size:10px;font-weight:700;color:var(--blue);letter-spacing:.08em;text-transform:uppercase;margin-bottom:9px">Local Heuristic Analysis</div>
         <div id="ai-narrative" style="font-size:13px;line-height:1.8;color:var(--text);white-space:pre-wrap"></div>
       </div>
       <h3>Flagged Aircraft — Detail</h3>
@@ -288,7 +286,7 @@ tr:hover td{background:#fafafa}
 <div class="tc" id="tab-code">
   <div class="scroll-tc">
     <h2>Code — Feature Extraction and Anomaly Detection</h2>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:22px;line-height:1.6">The core algorithmic logic powering SkySecure V2. Five independent modules, each unit-tested, following SOLID design principles and deployed via Docker containers.</p>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:22px;line-height:1.6">Selected algorithm examples used by SkySecure V3. The live deployment status of each module is shown separately from these reference snippets.</p>
 
     <div class="code-section">
       <h3>feature_extractor.py</h3>
@@ -367,7 +365,7 @@ tr:hover td{background:#fafafa}
     <span class="cmt"># Physically impossible speed</span>
     prob += np.where(df[<span class="str">'Speed_knots'</span>] > <span class="num">1200</span>, <span class="num">0.85</span>, <span class="num">0</span>)
     <span class="cmt"># Negative speed value</span>
-    prob += np.where(df[<span class="str">'Speed_knots'</span>] < <span class="num">0</span>,    <span class="num">0.9</span>,  <span class="num">0</span>)
+    prob += np.where(df[<span class="str">'Speed_knots'</span>] &lt; <span class="num">0</span>,    <span class="num">0.9</span>,  <span class="num">0</span>)
     <span class="kw">return</span> prob.clip(<span class="num">0</span>, <span class="num">1</span>)
 
 <span class="cmt"># Add movement anomaly contribution</span>
@@ -525,6 +523,12 @@ const MAX_PTS=120;
 let openIcao=null,hpSpd=null,hpAlt=null,hpHdg=null;
 let aiRC=null,aiSC=null;
 let csvRows=[],csvHeaders=[];
+
+function esc(value){
+  return String(value??'').replace(/[&<>'"]/g,ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'
+  })[ch]);
+}
 
 // ── Scoring ───────────────────────────────────────────────────
 function spoofScore(ac){
@@ -729,13 +733,13 @@ function buildPopup(a){
   const sp=spoofScore(a),col=sp>=60?'#ef4444':sp>=30?'#f97316':'#22c55e';
   const cls=checkMil(a)?'CONFIRMED MILITARY':(a.cls||'UNKNOWN').replace(/_/g,' ');
   const evts=acEvents[a.icao]||[];
-  return '<div class="pt">'+a.icao+(a.cs?' - '+a.cs:'')+'</div>'+
-    '<div class="pr"><span class="pk">Classification</span><b>'+cls+'</b></div>'+
+  return '<div class="pt">'+esc(a.icao)+(a.cs?' - '+esc(a.cs):'')+'</div>'+
+    '<div class="pr"><span class="pk">Classification</span><b>'+esc(cls)+'</b></div>'+
     '<div class="pr"><span class="pk">Spoof probability</span><b style="color:'+col+'">'+sp+'%</b></div>'+
     '<div class="pr"><span class="pk">Altitude</span><span>'+(a.alt?a.alt.toLocaleString()+' ft':'--')+'</span></div>'+
     '<div class="pr"><span class="pk">Speed</span><span>'+(a.vel?Math.round(a.vel)+' kts':'--')+'</span></div>'+
     '<div class="pr"><span class="pk">Heading</span><span>'+(a.hdg?Math.round(a.hdg)+'deg':'--')+'</span></div>'+
-    '<div class="pr"><span class="pk">Risk score</span><span>'+(a.risk||0)+'/100</span></div>'+
+    '<div class="pr"><span class="pk">Risk score</span><span>'+esc(a.risk||0)+'/100</span></div>'+
     (evts.length?'<div class="pr"><span class="pk" style="color:#ef4444">Events</span><span style="color:#ef4444;font-weight:700">'+evts.length+'</span></div>':'')+
     '<button class="view-hist" onclick="map.closePopup();openPanel(\''+a.icao+'\')">View History and Charts</button>';
 }
@@ -803,9 +807,9 @@ function handleCSV(input){
     b.textContent='Loaded '+csvRows.length.toLocaleString()+' rows — '+sp.toLocaleString()+' spoofed, '+(csvRows.length-sp).toLocaleString()+' clean — '+file.name;
     document.getElementById('ai-preview').style.display='block';
     document.getElementById('ai-row-count').textContent='(first 20 rows shown)';
-    document.getElementById('ai-thead').innerHTML='<tr>'+csvHeaders.map(h=>'<th style="padding:6px 10px;font-size:10px;font-weight:600;color:var(--text2);border-bottom:1px solid var(--border);background:var(--bg2)">'+h+'</th>').join('')+'</tr>';
+    document.getElementById('ai-thead').innerHTML='<tr>'+csvHeaders.map(h=>'<th style="padding:6px 10px;font-size:10px;font-weight:600;color:var(--text2);border-bottom:1px solid var(--border);background:var(--bg2)">'+esc(h)+'</th>').join('')+'</tr>';
     document.getElementById('ai-tbody').innerHTML=csvRows.slice(0,20).map(r=>
-      '<tr>'+csvHeaders.map(h=>'<td style="padding:5px 10px;border-bottom:1px solid var(--border);color:'+(r.IsSpoofed==='1'?'#991b1b':'var(--text)')+'">'+( r[h]||'--')+'</td>').join('')+'</tr>'
+      '<tr>'+csvHeaders.map(h=>'<td style="padding:5px 10px;border-bottom:1px solid var(--border);color:'+(r.IsSpoofed==='1'?'#991b1b':'var(--text)')+'">'+esc(r[h]||'--')+'</td>').join('')+'</tr>'
     ).join('');
     document.getElementById('ai-btn').style.display='inline-block';
     buildAICharts(csvRows);
@@ -842,8 +846,8 @@ function buildAICharts(rows){
   const topMsg=Object.entries(msgTypes).sort((a,b)=>b[1]-a[1])[0];
   document.getElementById('ai-stat-grid').innerHTML=[
     ['Total records',tot.toLocaleString(),'var(--text)'],
-    ['Spoofed',nSp.toLocaleString(),'#ef4444'],
-    ['Spoof rate',((nSp/tot)*100).toFixed(1)+'%','#f97316'],
+    ['Labeled suspicious',nSp.toLocaleString(),'#ef4444'],
+    ['Label rate',((nSp/tot)*100).toFixed(1)+'%','#f97316'],
     ['Top msg type',topMsg?topMsg[0]:'--','#8b5cf6'],
   ].map(([l,v,c])=>'<div class="sc"><div class="v" style="color:'+c+'">'+v+'</div><div class="l">'+l+'</div></div>').join('');
 }
@@ -869,33 +873,12 @@ async function runAIAnalysis(){
       else if((r.MessageContent||'').includes('MALFORMED')) reason='Malformed message';
       reasons[reason]=(reasons[reason]||0)+1;
     });
-    setP('Sending to Claude...');
-    const prompt=`You are an aviation cybersecurity analyst reviewing ADS-B and ACARS telemetry data for GPS spoofing and signal injection attacks.
-
-DATASET SUMMARY:
-- Total records: ${tot.toLocaleString()}
-- Spoofed records: ${nSp.toLocaleString()} (${((nSp/tot)*100).toFixed(1)}%)
-- Clean records: ${(tot-nSp).toLocaleString()}
-- Spoof reason breakdown: ${JSON.stringify(reasons)}
-
-SAMPLE RECORDS (mix of spoofed and clean):
-${JSON.stringify([...spoofed,...clean],null,2)}
-
-Write a 4-6 paragraph expert analysis covering:
-1. The dominant spoofing patterns and which data fields expose them
-2. Specific aircraft called out by ID with their exact anomalous values
-3. What a real attacker would be trying to achieve with these patterns
-4. Patterns in MessageType or MessageContent that correlate with spoofing
-5. Risk assessment: targeted attack, GPS jamming, or synthetic test data?
-
-Write in clear prose paragraphs only. No bullet points. Be specific with actual values from the data. End with a one-sentence threat level verdict.`;
-    const res=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,messages:[{role:'user',content:prompt}]})
-    });
-    if(!res.ok) throw new Error('API returned '+res.status);
-    const data=await res.json();
-    const narrative=data.content?.find(b=>b.type==='text')?.text||'Analysis unavailable.';
+    setP('Generating local heuristic summary...');
+    const reasonSummary=Object.entries(reasons)
+      .sort((a,b)=>b[1]-a[1])
+      .map(([reason,count])=>`${reason}: ${count}`)
+      .join(', ') || 'No labeled anomalies';
+    const narrative=`This analysis runs locally in your browser; no uploaded telemetry is sent to a third party. The dataset contains ${tot.toLocaleString()} records, of which ${nSp.toLocaleString()} are labeled suspicious (${((nSp/tot)*100).toFixed(1)}%).\n\nThe dominant label-derived reasons are: ${reasonSummary}. These are deterministic rule matches against the CSV's existing IsSpoofed labels, not independent confirmation of an attack.\n\nTreat the results as dataset triage only. Confirm suspicious records against independent receiver timing, source provenance, and known-good ground truth before making an operational claim.`;
     setP('Building per-aircraft breakdown...');
     const explained=spoofed.slice(0,100).map(r=>{
       const lat=parseFloat(r.Latitude),lon=parseFloat(r.Longitude),alt=parseFloat(r.Altitude_ft),spd=parseFloat(r.Speed_knots);
@@ -916,13 +899,13 @@ Write in clear prose paragraphs only. No bullet points. Be specific with actual 
     buildAICharts(csvRows);
     document.getElementById('ai-table').innerHTML=explained.map(r=>
       '<tr>'+
-      '<td style="font-weight:600;font-family:var(--mono);font-size:11px;color:#991b1b">'+r.AircraftID+'</td>'+
-      '<td>'+(r.FlightNumber||'--')+'</td>'+
-      '<td style="font-family:var(--mono);font-size:11px">'+(r.Latitude||'--')+' / '+(r.Longitude||'--')+'</td>'+
-      '<td style="color:'+(r.Altitude_ft==='999999'?'#ef4444':'var(--text)')+'">'+( r.Altitude_ft||'--')+'</td>'+
-      '<td style="color:'+(parseFloat(r.Speed_knots)<0?'#ef4444':'var(--text)')+'">'+( r.Speed_knots||'--')+'</td>'+
-      '<td style="font-size:11px;color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+( r.MessageContent||'--')+'</td>'+
-      '<td style="font-size:11px;color:#991b1b;max-width:200px">'+r._reason+'</td>'+
+      '<td style="font-weight:600;font-family:var(--mono);font-size:11px;color:#991b1b">'+esc(r.AircraftID)+'</td>'+
+      '<td>'+esc(r.FlightNumber||'--')+'</td>'+
+      '<td style="font-family:var(--mono);font-size:11px">'+esc(r.Latitude||'--')+' / '+esc(r.Longitude||'--')+'</td>'+
+      '<td style="color:'+(r.Altitude_ft==='999999'?'#ef4444':'var(--text)')+'">'+esc(r.Altitude_ft||'--')+'</td>'+
+      '<td style="color:'+(parseFloat(r.Speed_knots)<0?'#ef4444':'var(--text)')+'">'+esc(r.Speed_knots||'--')+'</td>'+
+      '<td style="font-size:11px;color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(r.MessageContent||'--')+'</td>'+
+      '<td style="font-size:11px;color:#991b1b;max-width:200px">'+esc(r._reason)+'</td>'+
       '<td><div class="pb"><div class="pb-bar"><div class="pb-fill" style="width:'+r._conf+'%;background:'+(r._conf>90?'#ef4444':'#f97316')+'"></div></div><b style="font-size:11px;color:'+(r._conf>90?'#ef4444':'#f97316')+'">'+r._conf+'%</b></div></td>'+
       '</tr>'
     ).join('');
@@ -946,7 +929,7 @@ function analyzeManual(){
     vr:parseFloat(document.getElementById('m-vr').value),
     risk:0,anoms:[],cls:'UNKNOWN'};
   const sp=spoofScore(a),mil=checkMil(a);
-  const cls=mil?'CONFIRMED MILITARY':sp>=60?'SPOOFED':sp>=30?'SUSPICIOUS':'CIVILIAN';
+  const cls=mil?'CONFIRMED MILITARY':sp>=60?'HEURISTIC ALERT':sp>=30?'SUSPICIOUS':'CIVILIAN';
   const col=sp>=60?'#ef4444':sp>=30?'#f97316':'#22c55e';
   const reasons=[];
   if(a.lat<-90||a.lat>90)   reasons.push('Latitude out of valid range (-90 to 90)');
@@ -1019,70 +1002,13 @@ function normalise(raw, src) {
   };
 }
 
-// Merge backend + direct caches, backend wins on conflict
-function mergeAndRender() {
-  const merged = { ..._directCache };
-  Object.assign(merged, _backendCache);   // backend overwrites direct on same ICAO
-  const aircraft = Object.values(merged);
-  if (aircraft.length === 0) return;
-  renderAircraft(aircraft);
-  updateEDA(aircraft);
-  const sources = _backendAlive
-    ? 'Docker + adsb.fi (8 regions) + OpenSky (4 quadrants) + airplanes.live (8 tiles)'
-    : 'adsb.fi (8 regions) + OpenSky (4 quadrants) + airplanes.live (8 tiles)';
-  const b = document.getElementById('banner');
-  b.className = 'banner green';
-  b.textContent = 'Live — ' + aircraft.length.toLocaleString() + ' aircraft | ' + sources;
-}
-
-// Source A: Docker backend WebSocket
-function connectWS() {
-  setWS('connecting');
-  wsConn = new WebSocket(WS_URL);
-  wsConn.binaryType = 'arraybuffer';
-  wsConn.onopen  = () => { setWS('connected'); _backendAlive = true; };
-  wsConn.onmessage = e => {
-    try {
-      const t = e.data instanceof ArrayBuffer ? new TextDecoder().decode(e.data) : e.data;
-      if (t === 'ping') { wsConn.send('pong'); return; }
-      const m = JSON.parse(t);
-      if (m.type === 'snapshot' && m.aircraft) {
-        _backendCache = {};
-        m.aircraft.forEach(a => { if (a.icao) _backendCache[a.icao] = a; });
-        mergeAndRender();
-      }
-    } catch (err) {}
-  };
-  wsConn.onclose = () => { setWS('disconnected'); _backendAlive = false; setTimeout(connectWS, 5000); };
-  wsConn.onerror = () => { _backendAlive = false; };
-}
-
-// Source B: Docker backend REST (fallback if WS drops)
-async function pollBackend() {
-  try {
-    const ctrl3 = new AbortController();
-    const t3 = setTimeout(() => ctrl3.abort(), 4000);
-    const r = await fetch(API + '/api/aircraft?limit=5000', { signal: ctrl3.signal });
-    clearTimeout(t3);
-    if (!r.ok) return;
-    const d = await r.json();
-    if (d.aircraft && d.aircraft.length > 0) {
-      _backendAlive = true;
-      _backendCache = {};
-      d.aircraft.forEach(a => { if (a.icao) _backendCache[a.icao] = a; });
-      mergeAndRender();
-    }
-  } catch (e) {}
-}
-
-// Source C: api.adsb.fi — CORS-enabled, free, global coverage
 // ── Source status tracking ────────────────────────────────────
 function updateSourceStatus(key, count, ok) {
   const el = document.getElementById('src-' + key);
   if (!el) return;
   el.style.color   = ok ? '#166534' : '#991b1b';
   el.style.fontWeight = ok ? '600' : '400';
-  el.textContent   = ({ backend: 'Docker backend', adsbexchange: 'ADS-B Exchange (adsb.lol)', adsbfi: 'adsb.fi', opensky: 'OpenSky' }[key] || key)
+  el.textContent   = ({ backend: 'Docker backend', live: 'Server live feed' }[key] || key)
                    + ': ' + (ok ? count.toLocaleString() + ' aircraft' : 'failed');
 }
 
@@ -1135,11 +1061,11 @@ async function pollLive() {
       d.aircraft.forEach(a => {
         if (a.icao && !_backendCache[a.icao]) _directCache[a.icao] = a;
       });
-      updateSourceStatus('adsbexchange', d.count, true);
+      updateSourceStatus('live', d.count, true);
       mergeAndRender();
     }
   } catch (e) {
-    updateSourceStatus('adsbexchange', 0, false);
+    updateSourceStatus('live', 0, false);
     console.warn('[live-aircraft] poll failed:', e.message);
   }
 }
@@ -1177,18 +1103,6 @@ window.addEventListener('DOMContentLoaded', () => {
   pollLive();
   setInterval(pollLive, 12000);
 });
-
-function mergeAndRender() {
-  const merged = { ..._directCache };
-  Object.assign(merged, _backendCache);
-  const aircraft = Object.values(merged);
-  if (aircraft.length === 0) return;
-  renderAircraft(aircraft);
-  updateEDA(aircraft);
-  const b = document.getElementById('banner');
-  b.className = 'banner green';
-  b.textContent = 'Live — ' + aircraft.length.toLocaleString() + ' aircraft tracked globally';
-}
 
 </script>
 </body>
