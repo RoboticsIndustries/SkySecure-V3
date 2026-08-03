@@ -59,6 +59,18 @@ Open:
 - API docs: `http://localhost:8000/docs`
 - Health: `http://localhost:8000/healthz`
 
+### Change live coverage
+
+The dashboard's **Live Coverage** row can switch the running feed without a restart:
+
+- Choose one of the listed airports, then select **Monitor area**.
+- Or pan the map, select **Use map center**, choose a radius, and select **Monitor area**.
+- Radius is limited to 1–250 nautical miles by the current public point-feed provider.
+
+The selection is stored in Redis and is shared immediately by the API and ADS-B ingestor. Environment values in `.env` remain the fallback defaults after a fresh Redis deployment.
+
+The mutable API is intentionally bound to loopback by Compose and rate-limited. Put authentication in front of the API before exposing it beyond the host.
+
 Check the stack:
 
 ```bash
@@ -72,7 +84,7 @@ The repository test environment must contain the dependencies in `requirements.t
 
 ```bash
 python -m pytest -q
-python -m compileall -q api anomaly processing config.py models.py
+python -m compileall -q api anomaly processing ingestion config.py coverage_area.py models.py
 cd frontend && npm run build
 cd .. && git diff --check
 docker compose config --quiet

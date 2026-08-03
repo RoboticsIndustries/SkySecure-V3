@@ -28,6 +28,11 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .banner.yellow{background:#fefce8;color:#854d0e;border:1px solid #fde68a}
 .banner.red   {background:#fef2f2;color:#991b1b;border:1px solid #fecaca}
 .ctrl{padding:9px 28px;display:flex;align-items:center;gap:14px;flex-shrink:0;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.coverage-ctrl{padding:8px 28px;display:flex;align-items:center;gap:8px;flex-shrink:0;border-bottom:1px solid var(--border);background:#f8fafc;flex-wrap:wrap;font-size:12px}
+.coverage-ctrl input{width:92px;padding:5px 7px;border:1px solid var(--border);border-radius:5px;background:var(--bg);font-size:12px}
+.coverage-ctrl button{padding:5px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);cursor:pointer;font-size:12px;font-weight:600}
+.coverage-ctrl button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+#coverage-status{color:var(--text2);font-size:11px;font-family:var(--mono)}
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
 .chk input{width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
 select{padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;background:var(--bg);cursor:pointer}
@@ -195,6 +200,16 @@ tr:hover td{background:#fafafa}
       <div class="chip dark"><span id="cd">0</span> dark</div>
       <div class="chip spoof"><span id="cs">0</span> suspicious</div>
     </div>
+  </div>
+  <div class="coverage-ctrl">
+    <strong>LIVE COVERAGE</strong>
+    <select id="coverage-airport" onchange="selectCoverageAirport()"><option value="">Choose airport...</option></select>
+    <label>Lat <input id="coverage-lat" type="number" min="-90" max="90" step="0.0001"></label>
+    <label>Lon <input id="coverage-lon" type="number" min="-180" max="180" step="0.0001"></label>
+    <label>Radius NM <input id="coverage-radius" type="number" min="1" max="250" value="250"></label>
+    <button id="coverage-map-center" onclick="useMapCenterForCoverage()">Use map center</button>
+    <button id="coverage-apply" class="primary" onclick="applyCoverage()">Monitor area</button>
+    <span id="coverage-status">Loading current area...</span>
   </div>
   <div id="map"></div>
 </div>
@@ -538,7 +553,7 @@ const AIRPORTS=[
   {iata:'MEX',name:'Mexico City',       lat:19.4361,lon:-99.072 },
 ];
 
-let allAC=[],markers={},aptLayers=[],map;
+let allAC=[],markers={},aptLayers=[],map,coverageCircle,currentCoverage=null;
 let ch1=null,ch2=null;
 const acHistory={},acEvents={};
 const MAX_PTS=120;
@@ -691,6 +706,12 @@ function initMap(){
     o.value=a.lat+','+a.lon; o.textContent=a.iata+' — '+a.name;
     sel.appendChild(o);
   });
+  const coverageSelect=document.getElementById('coverage-airport');
+  AIRPORTS.forEach(a=>{
+    const o=document.createElement('option');
+    o.value=a.iata; o.textContent=a.iata+' — '+a.name;
+    coverageSelect.appendChild(o);
+  });
   drawAirports();
 }
 
@@ -711,6 +732,87 @@ function flyTo(){
   const[lat,lon]=v.split(',').map(Number);
   map.flyTo([lat,lon],9,{duration:1.2});
   setTimeout(()=>document.getElementById('apt-sel').value='',100);
+}
+
+function drawCoverageArea(area){
+  if(coverageCircle) map.removeLayer(coverageCircle);
+  coverageCircle=L.circle([area.latitude,area.longitude],{
+    radius:area.radius_nm*1852,color:'#2563eb',fillColor:'#3b82f6',
+    fillOpacity:0.035,weight:2,dashArray:'7 5'
+  }).addTo(map);
+}
+
+function fillCoverage(area){
+  currentCoverage=area;
+  previewCoverageArea(area);
+}
+
+function previewCoverageArea(area){
+  document.getElementById('coverage-lat').value=Number(area.latitude).toFixed(4);
+  document.getElementById('coverage-lon').value=Number(area.longitude).toFixed(4);
+  document.getElementById('coverage-radius').value=area.radius_nm;
+  drawCoverageArea(area);
+}
+
+function insideCoverage(ac){
+  if(!currentCoverage||ac.lat==null||ac.lon==null) return true;
+  const rad=Math.PI/180;
+  const lat1=currentCoverage.latitude*rad,lat2=ac.lat*rad;
+  const dlat=lat2-lat1,dlon=(ac.lon-currentCoverage.longitude)*rad;
+  const h=Math.sin(dlat/2)**2+Math.cos(lat1)*Math.cos(lat2)*Math.sin(dlon/2)**2;
+  const distanceNm=3440.065*2*Math.asin(Math.min(1,Math.sqrt(h)));
+  return distanceNm<=currentCoverage.radius_nm;
+}
+
+async function loadCoverage(){
+  const status=document.getElementById('coverage-status');
+  try{
+    const r=await fetch(API+'/api/coverage');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const area=(await r.json()).coverage;
+    fillCoverage(area);
+    status.textContent='Active: '+area.label+' · '+area.radius_nm+' NM';
+  }catch(e){ status.textContent='Coverage settings unavailable'; }
+}
+
+function selectCoverageAirport(){
+  const iata=document.getElementById('coverage-airport').value;
+  const airport=AIRPORTS.find(a=>a.iata===iata); if(!airport) return;
+  previewCoverageArea({latitude:airport.lat,longitude:airport.lon,radius_nm:Number(document.getElementById('coverage-radius').value)||250});
+  map.flyTo([airport.lat,airport.lon],6,{duration:1.0});
+}
+
+function useMapCenterForCoverage(){
+  const center=map.getCenter();
+  document.getElementById('coverage-airport').value='';
+  document.getElementById('coverage-lat').value=center.lat.toFixed(4);
+  document.getElementById('coverage-lon').value=center.lng.toFixed(4);
+}
+
+async function applyCoverage(){
+  const lat=Number(document.getElementById('coverage-lat').value);
+  const lon=Number(document.getElementById('coverage-lon').value);
+  const radius=Number(document.getElementById('coverage-radius').value);
+  const iata=document.getElementById('coverage-airport').value;
+  const airport=AIRPORTS.find(a=>a.iata===iata);
+  const status=document.getElementById('coverage-status');
+  if(!Number.isFinite(lat)||lat < -90||lat > 90||!Number.isFinite(lon)||lon < -180||lon > 180||!Number.isInteger(radius)||radius < 1||radius > 250){
+    status.textContent='Enter valid coordinates and a 1–250 NM radius'; return;
+  }
+  const area={latitude:lat,longitude:lon,radius_nm:radius,label:airport?(airport.iata+' — '+airport.name):'Custom map area'};
+  status.textContent='Switching live feed...';
+  try{
+    const r=await fetch(API+'/api/coverage',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(area)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    fillCoverage(area); map.flyTo([lat,lon],6,{duration:1.0});
+    _directCache={}; _backendCache={}; mergeAndRender();
+    status.textContent='Active: '+area.label+' · '+radius+' NM';
+    await pollLive();
+  }catch(e){
+    if(currentCoverage) previewCoverageArea(currentCoverage);
+    document.getElementById('coverage-airport').value='';
+    status.textContent='Coverage update failed: '+e.message;
+  }
 }
 
 function applyFilters(){ renderAircraft(allAC); }
@@ -1078,13 +1180,12 @@ function updateSourceStatus(key, count, ok) {
 function mergeAndRender() {
   const merged = { ..._directCache };
   Object.assign(merged, _backendCache);
-  const aircraft = Object.values(merged);
-  if (aircraft.length === 0) return;
+  const aircraft = Object.values(merged).filter(insideCoverage);
   renderAircraft(aircraft);
   updateEDA(aircraft);
   const b = document.getElementById('banner');
   b.className   = 'banner green';
-  b.textContent = 'Live — ' + aircraft.length.toLocaleString() + ' aircraft tracked globally';
+  b.textContent = 'Live — ' + aircraft.length.toLocaleString() + ' aircraft tracked in current area';
 }
 
 // ── WebSocket (for anomaly scores from fusion pipeline) ───────
@@ -1098,7 +1199,7 @@ function connectWS() {
       const t = e.data instanceof ArrayBuffer ? new TextDecoder().decode(e.data) : e.data;
       if (t === 'ping') { wsConn.send('pong'); return; }
       const m = JSON.parse(t);
-      if (m.type === 'snapshot' && m.aircraft && m.aircraft.length > 0) {
+      if (m.type === 'snapshot' && Array.isArray(m.aircraft)) {
         _backendCache = {};
         m.aircraft.forEach(a => { if (a.icao) _backendCache[a.icao] = a; });
         updateSourceStatus('backend', m.aircraft.length, true);
@@ -1119,8 +1220,9 @@ async function pollLive() {
     clearTimeout(timer);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-    if (d.aircraft && d.aircraft.length > 0) {
-      // Merge into directCache — backend WS data (with anomaly scores) wins
+    if (Array.isArray(d.aircraft)) {
+      // Replace the direct feed snapshot so a live area switch drops old-region tracks.
+      _directCache = {};
       d.aircraft.forEach(a => {
         if (a.icao && !_backendCache[a.icao]) _directCache[a.icao] = a;
       });
@@ -1158,6 +1260,7 @@ function switchTab(name) {
 
 window.addEventListener('DOMContentLoaded', () => {
   initMap();
+  loadCoverage();
 
   // WebSocket for real-time anomaly-scored data
   connectWS();

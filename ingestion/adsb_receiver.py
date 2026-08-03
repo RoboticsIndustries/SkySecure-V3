@@ -19,6 +19,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from models import RawADSBMessage
 from config import settings
+from coverage_area import COVERAGE_LOCK_KEY, coverage_url, load_coverage_area, load_coverage_area_record, within_coverage_area
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ def adsb_lol_fallback_url(
     radius_nm = settings.ADSB_FALLBACK_RADIUS_NM if radius_nm is None else radius_nm
     radius_nm = max(0, min(250, int(radius_nm)))
     return f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}"
+
+
+async def current_coverage_url(redis_client: Any) -> str:
+    return coverage_url(await load_coverage_area(redis_client))
 
 
 def _parse_adsb_lol_states(data: dict) -> list[list[Any]]:
@@ -97,6 +102,7 @@ async def run() -> None:
         while True:
             t0 = time.time()
             try:
+                area, coverage_token = await load_coverage_area_record(redis_client)
                 async with session.get(
                     "https://opensky-network.org/api/states/all",
                     timeout=aiohttp.ClientTimeout(total=25),
@@ -105,7 +111,7 @@ async def run() -> None:
                     if resp.status == 429:
                         log.warning("Rate limited by OpenSky — using adsb.lol fallback")
                         async with session.get(
-                            adsb_lol_fallback_url(),
+                            coverage_url(area),
                             timeout=aiohttp.ClientTimeout(total=25),
                         ) as fallback_resp:
                             if fallback_resp.status != 200:
@@ -127,7 +133,13 @@ async def run() -> None:
                         recv_t = float(data.get("time", time.time()))
                         log.info("OpenSky returned %d states", len(states))
 
+                    _, current_token = await load_coverage_area_record(redis_client)
+                    if current_token != coverage_token:
+                        log.info("Coverage changed during fetch; discarding stale batch")
+                        continue
+
                     pipe = redis_client.pipeline()
+                    kafka_messages = []
                     published = 0
 
                     for s in states:
@@ -141,6 +153,8 @@ async def run() -> None:
                         except (TypeError, ValueError):
                             continue
                         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                            continue
+                        if not within_coverage_area(lat, lon, area):
                             continue
 
                         def ft(m):
@@ -183,17 +197,35 @@ async def run() -> None:
                                 vertical_rate=int(float(s[11]) * 196.85) if s[11] else None,
                                 on_ground=bool(s[8]) if s[8] is not None else False,
                             )
-                            await producer.send(
-                                topic=settings.TOPIC_RAW_ADSB,
-                                key=icao.encode(),
-                                value=msg.to_bytes(),
-                            )
+                            kafka_messages.append((icao.encode(), msg.to_bytes()))
                         except Exception:
                             pass  # Kafka failure doesn't block display
 
                         published += 1
 
-                    await pipe.execute()
+                    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+                    async with lock:
+                        _, final_token = await load_coverage_area_record(redis_client)
+                        if final_token != coverage_token:
+                            log.info("Coverage changed during processing; discarding stale batch")
+                            continue
+                        for key, value in kafka_messages:
+                            await lock.extend(30, replace_ttl=True)
+                            try:
+                                await asyncio.wait_for(
+                                    producer.send(
+                                        topic=settings.TOPIC_RAW_ADSB,
+                                        key=key,
+                                        value=value,
+                                    ),
+                                    timeout=2.0,
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning("Kafka send timed out for %s", key.decode(errors="ignore"))
+                            except Exception:
+                                pass  # Kafka failure does not block direct Redis display
+                        await lock.extend(30, replace_ttl=True)
+                        await asyncio.wait_for(pipe.execute(), timeout=5.0)
                     log.info("Wrote %d aircraft to Redis (ac:*)", published)
 
             except Exception as e:

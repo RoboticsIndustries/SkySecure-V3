@@ -37,7 +37,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models import StateVector, RiskBand, Classification, DetectionLayer, LayerStatus
 from config import settings, KAFKA_CONSUMER_STABILITY
-from ingestion.adsb_receiver import adsb_lol_fallback_url
+from coverage_area import (
+    COVERAGE_LOCK_KEY,
+    COVERAGE_RATE_KEY,
+    CoverageArea,
+    coverage_url,
+    default_coverage_area,
+    load_coverage_area,
+    load_coverage_area_record,
+    save_coverage_area,
+    within_coverage_area,
+)
 
 # L1 imports — real multi-source cross-validation (no receiver hardware yet;
 # see processing/cross_source_validator.py for why this replaces the old
@@ -67,7 +77,10 @@ anomaly_detector: Optional[EnhancedAnomalyDetector] = None
 _live_cache: Dict[str, Any] = {
     "ts":       0,
     "aircraft": [],
+    "coverage_token": b"",
 }
+_live_fetch_lock = asyncio.Lock()
+
 _layer_vector_cache: Dict[str, Any] = {
     "client_id": None,
     "ts": 0.0,
@@ -75,6 +88,22 @@ _layer_vector_cache: Dict[str, Any] = {
 }
 _layer_vector_cache_lock = asyncio.Lock()
 LIVE_CACHE_TTL = 30   # seconds
+
+
+def _track_in_coverage(track: Dict[str, Any], area: CoverageArea) -> bool:
+    try:
+        return within_coverage_area(float(track["lat"]), float(track["lon"]), area)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _websocket_origin_allowed(websocket: WebSocket) -> bool:
+    origin = websocket.headers.get("origin")
+    if origin is None:
+        return True  # Non-browser monitoring clients do not send Origin.
+    allowed = {value.rstrip("/") for value in settings.API_CORS_ORIGINS}
+    return origin.rstrip("/") in allowed
+
 
 HEADERS = {
     "User-Agent": "SkySecure/2.0 (airspace research)",
@@ -265,11 +294,13 @@ app.add_middleware(
 
 # ─── Live aircraft fetching ───────────────────────────────────────────────────
 
-async def _fetch_live_aircraft() -> List[dict]:
+async def _fetch_live_aircraft(area: Optional[CoverageArea] = None) -> List[dict]:
     """
     Fetch from OpenSky and apply TDOA validation to each aircraft.
     """
     try:
+        if area is None:
+            area = await load_coverage_area(redis_client) if redis_client else default_coverage_area()
         connector = aiohttp.TCPConnector(ssl=True)
         async with aiohttp.ClientSession(connector=connector, headers=HEADERS) as session:
             async with session.get(
@@ -280,7 +311,7 @@ async def _fetch_live_aircraft() -> List[dict]:
                     log.warning("OpenSky returned HTTP %d", resp.status)
                     if resp.status == 429:
                         async with session.get(
-                            adsb_lol_fallback_url(),
+                            coverage_url(area),
                             timeout=aiohttp.ClientTimeout(total=20),
                         ) as fallback_resp:
                             if fallback_resp.status == 200:
@@ -304,6 +335,8 @@ async def _fetch_live_aircraft() -> List[dict]:
             except (TypeError, ValueError):
                 continue
             if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                continue
+            if not within_coverage_area(lat, lon, area):
                 continue
             icao = s[0].upper().strip()
             if len(icao) != 6:
@@ -345,35 +378,77 @@ async def _fetch_live_aircraft() -> List[dict]:
 
 # ─── REST Endpoints ───────────────────────────────────────────────────────────
 
+@app.get("/api/coverage")
+async def get_coverage_area_config():
+    area = await load_coverage_area(redis_client) if redis_client else default_coverage_area()
+    return {"coverage": area.model_dump()}
+
+
+@app.put("/api/coverage")
+async def update_coverage_area_config(area: CoverageArea):
+    global _live_cache
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+    async with lock:
+        if await redis_client.get(COVERAGE_RATE_KEY):
+            raise HTTPException(status_code=429, detail="Coverage may be changed once every 2 seconds")
+        await save_coverage_area(redis_client, area)
+        await redis_client.set(COVERAGE_RATE_KEY, "1", ex=2)
+    _live_cache = {"ts": 0, "aircraft": [], "coverage_token": b""}
+    return {"coverage": area.model_dump(), "status": "updated"}
+
 @app.get("/api/live-aircraft")
 async def get_live_aircraft():
     """
-    Server-side proxy for OpenSky with TDOA validation.
-    Returns all globally tracked aircraft with spoofing detection.
+    Server-side proxy for the selected live coverage area with L1 validation.
+    Returns aircraft within the runtime-configured center and radius.
     Cached for 30 seconds.
     """
     global _live_cache
 
-    now = time.time()
-    if now - _live_cache["ts"] < LIVE_CACHE_TTL and _live_cache["aircraft"]:
-        return {
-            "count":    len(_live_cache["aircraft"]),
-            "source":   "cache",
-            "aircraft": _live_cache["aircraft"],
-            "tdoa_enabled": TDOA_AVAILABLE,
-        }
+    async with _live_fetch_lock:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="Redis unavailable")
 
-    aircraft = await _fetch_live_aircraft()
+        coverage_lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+        async with coverage_lock:
+            area, coverage_token = await load_coverage_area_record(redis_client)
+            now = time.time()
+            if (
+                now - _live_cache["ts"] < LIVE_CACHE_TTL
+                and _live_cache["aircraft"]
+                and _live_cache.get("coverage_token") == coverage_token
+            ):
+                return {
+                    "count": len(_live_cache["aircraft"]),
+                    "source": "cache",
+                    "aircraft": _live_cache["aircraft"],
+                    "tdoa_enabled": TDOA_AVAILABLE,
+                }
 
-    if aircraft:
-        _live_cache = {"ts": now, "aircraft": aircraft}
+        for _ in range(5):
+            aircraft = await _fetch_live_aircraft(area)
+            coverage_lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+            async with coverage_lock:
+                current_area, current_token = await load_coverage_area_record(redis_client)
+                if current_token == coverage_token:
+                    _live_cache = {
+                        "ts": time.time(),
+                        "aircraft": aircraft,
+                        "coverage_token": coverage_token,
+                    }
+                    return {
+                        "count": len(aircraft),
+                        "source": "live",
+                        "aircraft": aircraft,
+                        "tdoa_enabled": TDOA_AVAILABLE,
+                    }
+            # The operator switched during the fetch. The lock guarantees the
+            # token and response decision are atomic with PUT.
+            area, coverage_token = current_area, current_token
 
-    return {
-        "count":    len(aircraft),
-        "source":   "live",
-        "aircraft": aircraft,
-        "tdoa_enabled": TDOA_AVAILABLE,
-    }
+        raise HTTPException(status_code=409, detail="Coverage changed repeatedly; retry the request")
 
 
 @app.get("/api/aircraft")
@@ -386,6 +461,7 @@ async def get_all_aircraft(
     """
     keys = await redis_client.keys("sv:*")
     results = []
+    area = await load_coverage_area(redis_client)
 
     if keys:
         pipe = redis_client.pipeline()
@@ -400,12 +476,15 @@ async def get_all_aircraft(
                 sv = StateVector.from_bytes(raw)
                 if sv.risk_score >= min_risk:
                     ac = sv.to_api_dict()
-                    results.append(ac)
+                    if _track_in_coverage(ac, area):
+                        results.append(ac)
             except Exception:
                 continue
 
     if TDOA_AVAILABLE and cross_validator:
         await run_l1_cross_validation(results)
+    area = await load_coverage_area(redis_client)
+    results = [result for result in results if _track_in_coverage(result, area)]
 
     return {
         "count": len(results),
@@ -418,6 +497,7 @@ async def get_all_aircraft(
 @app.get("/api/alerts")
 async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50)):
     alerts = []
+    area = await load_coverage_area(redis_client)
     for sv in await _load_state_vectors():
             try:
                 if sv.risk_score >= min_score and sv.anomalies:
@@ -432,6 +512,8 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
                         "lon":            sv.lon,
                         "last_seen":      sv.last_seen,
                     }
+                    if not _track_in_coverage(alert, area):
+                        continue
                     
                     # Add L1 cross-validation status if available. This is
                     # an already-small alert list, so a direct per-item call
@@ -453,41 +535,50 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
             except Exception:
                 continue
     alerts.sort(key=lambda x: x["risk_score"], reverse=True)
+    area = await load_coverage_area(redis_client)
+    alerts = [alert for alert in alerts if _track_in_coverage(alert, area)]
     return {"count": len(alerts), "alerts": alerts[:limit]}
 
 
 @app.get("/api/stats")
 async def get_stats():
-    keys = await redis_client.keys("sv:*")
-    total = len(keys) if keys else 0
-    classifications = {c.value: 0 for c in Classification}
-    risk_bands = {b.value: 0 for b in RiskBand}
-    
-    tdoa_stats = {"validated": 0, "spoofed": 0, "uncertain": 0}
-    
-    if keys:
-        pipe = redis_client.pipeline()
-        for k in keys:
-            pipe.get(k)
-        for raw in await pipe.execute():
-            if not raw:
-                continue
-            try:
-                sv = StateVector.from_bytes(raw)
-                classifications[sv.classification.value] += 1
-                risk_bands[sv.risk_band.value] += 1
-            except Exception:
-                continue
-    
-    return {
-        "timestamp":       time.time(),
-        "total_tracks":    total,
-        "classifications": classifications,
-        "risk_bands":      risk_bands,
-        "ws_clients":      len(_ws_clients),
-        "tdoa_enabled":    TDOA_AVAILABLE,
-        "tdoa_stats":      tdoa_stats,
-    }
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+    async with lock:
+        keys = await redis_client.keys("sv:*")
+        total = 0
+        area = await load_coverage_area(redis_client)
+        classifications = {c.value: 0 for c in Classification}
+        risk_bands = {b.value: 0 for b in RiskBand}
+        tdoa_stats = {"validated": 0, "spoofed": 0, "uncertain": 0}
+
+        if keys:
+            pipe = redis_client.pipeline()
+            for key in keys:
+                pipe.get(key)
+            for raw in await pipe.execute():
+                if not raw:
+                    continue
+                try:
+                    sv = StateVector.from_bytes(raw)
+                    if not _track_in_coverage(sv.to_api_dict(), area):
+                        continue
+                    total += 1
+                    classifications[sv.classification.value] += 1
+                    risk_bands[sv.risk_band.value] += 1
+                except Exception:
+                    continue
+
+        return {
+            "timestamp": time.time(),
+            "total_tracks": total,
+            "classifications": classifications,
+            "risk_bands": risk_bands,
+            "ws_clients": len(_ws_clients),
+            "tdoa_enabled": TDOA_AVAILABLE,
+            "tdoa_stats": tdoa_stats,
+        }
 
 
 async def _load_state_vectors() -> List[StateVector]:
@@ -741,18 +832,27 @@ async def healthz():
 
 @app.websocket("/ws/tracks")
 async def ws_tracks(websocket: WebSocket):
+    if not _websocket_origin_allowed(websocket):
+        await websocket.close(code=1008, reason="Origin not allowed")
+        return
     await websocket.accept()
     _ws_clients.add(websocket)
     try:
-        # Send initial snapshot with TDOA data
-        payload = orjson.dumps({
-            "type":     "snapshot",
-            "ts":       time.time(),
-            "count":    len(_track_snapshot),
-            "aircraft": _track_snapshot,
-            "tdoa_enabled": TDOA_AVAILABLE,
-        })
-        await websocket.send_bytes(payload)
+        # Send initial snapshot under the same lock used by coverage updates.
+        if redis_client is None:
+            raise RuntimeError("Redis unavailable")
+        lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=10, blocking_timeout=5)
+        async with lock:
+            area = await load_coverage_area(redis_client)
+            initial_tracks = [track for track in _track_snapshot if _track_in_coverage(track, area)]
+            payload = orjson.dumps({
+                "type":     "snapshot",
+                "ts":       time.time(),
+                "count":    len(initial_tracks),
+                "aircraft": initial_tracks,
+                "tdoa_enabled": TDOA_AVAILABLE,
+            })
+            await asyncio.wait_for(websocket.send_bytes(payload), timeout=1.0)
 
         while True:
             try:
@@ -770,6 +870,61 @@ async def ws_tracks(websocket: WebSocket):
 
 
 # ─── Background: broadcast loop ───────────────────────────────────────────────
+
+async def _publish_track_snapshot(tracks: List[Dict[str, Any]]) -> None:
+    """Atomically publish only tracks belonging to the active coverage area."""
+    global _track_snapshot
+    if redis_client is None:
+        return
+    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=10, blocking_timeout=5)
+    async with lock:
+        area = await load_coverage_area(redis_client)
+        tracks = [track for track in tracks if _track_in_coverage(track, area)]
+        _track_snapshot = tracks
+        if not _ws_clients:
+            return
+        payload = orjson.dumps({
+            "type": "snapshot",
+            "ts": time.time(),
+            "count": len(tracks),
+            "aircraft": tracks,
+            "tdoa_enabled": TDOA_AVAILABLE,
+        })
+        clients = list(_ws_clients)
+        await lock.extend(10, replace_ttl=True)
+        results = await asyncio.gather(
+            *(asyncio.wait_for(ws.send_bytes(payload), timeout=1.0) for ws in clients),
+            return_exceptions=True,
+        )
+        for ws, result in zip(clients, results):
+            if isinstance(result, BaseException):
+                _ws_clients.discard(ws)
+
+
+async def _publish_alert(ac: Dict[str, Any], anomalies: List[Dict[str, Any]]) -> None:
+    """Publish an alert while holding the same coverage lock used by PUT."""
+    if redis_client is None:
+        return
+    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=10, blocking_timeout=5)
+    async with lock:
+        area = await load_coverage_area(redis_client)
+        if not _track_in_coverage(ac, area):
+            return
+        payload = orjson.dumps({
+            "type": "alert",
+            "ts": time.time(),
+            "aircraft": ac,
+            "anomalies": anomalies,
+        })
+        clients = list(_ws_clients)
+        await lock.extend(10, replace_ttl=True)
+        results = await asyncio.gather(
+            *(asyncio.wait_for(ws.send_bytes(payload), timeout=1.0) for ws in clients),
+            return_exceptions=True,
+        )
+        for ws, result in zip(clients, results):
+            if isinstance(result, BaseException):
+                _ws_clients.discard(ws)
 
 async def broadcast_loop() -> None:
     """Broadcast all aircraft with TDOA validation to WebSocket clients."""
@@ -806,32 +961,15 @@ async def broadcast_loop() -> None:
                     except Exception:
                         continue
 
+            area = await load_coverage_area(redis_client)
+            tracks = [track for track in tracks if _track_in_coverage(track, area)]
+
             # L1 cross-validation runs once per broadcast tick on the whole
             # snapshot (internally bounded/cached), not per-track
             if TDOA_AVAILABLE and cross_validator:
                 await run_l1_cross_validation(tracks)
 
-            _track_snapshot = tracks
-
-            if not _ws_clients:
-                continue
-
-            payload = orjson.dumps({
-                "type":     "snapshot",
-                "ts":       time.time(),
-                "count":    len(tracks),
-                "aircraft": tracks,
-                "tdoa_enabled": TDOA_AVAILABLE,
-            })
-
-            dead = set()
-            for ws in _ws_clients:
-                try:
-                    await ws.send_bytes(payload)
-                except Exception:
-                    dead.add(ws)
-            for ws in dead:
-                _ws_clients.discard(ws)
+            await _publish_track_snapshot(tracks)
 
         except Exception as e:
             log.error("Broadcast loop error: %s", e)
@@ -857,6 +995,10 @@ async def alert_consumer_loop() -> None:
             try:
                 sv = StateVector.from_bytes(msg.value)
                 ac = sv.to_api_dict()
+                area = await load_coverage_area(redis_client)
+                if not _track_in_coverage(ac, area):
+                    await consumer.commit()
+                    continue
                 
                 # Apply L1 cross-validation to this single alert (one item
                 # at a time off the Kafka topic, so a direct call is fine —
@@ -873,20 +1015,7 @@ async def alert_consumer_loop() -> None:
                     except Exception as e:
                         log.warning(f"L1 validation failed in alert loop: {e}")
                 
-                alert_payload = orjson.dumps({
-                    "type":     "alert",
-                    "ts":       time.time(),
-                    "aircraft": ac,
-                    "anomalies": [a.to_api_dict() for a in sv.anomalies],
-                })
-                dead = set()
-                for ws in _ws_clients:
-                    try:
-                        await ws.send_bytes(alert_payload)
-                    except Exception:
-                        dead.add(ws)
-                for ws in dead:
-                    _ws_clients.discard(ws)
+                await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
                 await consumer.commit()
             except Exception as e:
                 log.error("Alert push error: %s", e)
