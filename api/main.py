@@ -35,8 +35,8 @@ from contextlib import asynccontextmanager
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from models import StateVector, RiskBand, Classification
-from config import settings
+from models import StateVector, RiskBand, Classification, DetectionLayer, LayerStatus
+from config import settings, KAFKA_CONSUMER_STABILITY
 
 # L1 imports — real multi-source cross-validation (no receiver hardware yet;
 # see processing/cross_source_validator.py for why this replaces the old
@@ -67,6 +67,12 @@ _live_cache: Dict[str, Any] = {
     "ts":       0,
     "aircraft": [],
 }
+_layer_vector_cache: Dict[str, Any] = {
+    "client_id": None,
+    "ts": 0.0,
+    "vectors": [],
+}
+_layer_vector_cache_lock = asyncio.Lock()
 LIVE_CACHE_TTL = 30   # seconds
 
 HEADERS = {
@@ -413,17 +419,9 @@ async def get_all_aircraft(
 
 @app.get("/api/alerts")
 async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50)):
-    keys = await redis_client.keys("sv:*")
     alerts = []
-    if keys:
-        pipe = redis_client.pipeline()
-        for k in keys:
-            pipe.get(k)
-        for raw in await pipe.execute():
-            if not raw:
-                continue
+    for sv in await _load_state_vectors():
             try:
-                sv = StateVector.from_bytes(raw)
                 if sv.risk_score >= min_score and sv.anomalies:
                     alert = {
                         "icao24":         sv.icao24,
@@ -431,7 +429,7 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
                         "risk_score":     sv.risk_score,
                         "risk_band":      sv.risk_band.value,
                         "classification": sv.classification.value,
-                        "anomalies": [{"type": a.anomaly_type.value, "description": a.description} for a in sv.anomalies],
+                        "anomalies": [a.to_api_dict() for a in sv.anomalies],
                         "lat":            sv.lat,
                         "lon":            sv.lon,
                         "last_seen":      sv.last_seen,
@@ -440,7 +438,8 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
                     # Add L1 cross-validation status if available. This is
                     # an already-small alert list, so a direct per-item call
                     # (not the batch/rate-limit path used for the full feed) is fine.
-                    if TDOA_AVAILABLE and cross_validator and sv.lat and sv.lon:
+                    if (TDOA_AVAILABLE and cross_validator
+                            and sv.lat is not None and sv.lon is not None):
                         try:
                             l1_result = await cross_validator.validate_aircraft(sv.icao24, sv.lat, sv.lon)
                             alert['l1'] = {
@@ -491,6 +490,175 @@ async def get_stats():
         "tdoa_enabled":    TDOA_AVAILABLE,
         "tdoa_stats":      tdoa_stats,
     }
+
+
+async def _load_state_vectors() -> List[StateVector]:
+    """Load current enriched tracks with non-blocking discovery and a short cache."""
+    if redis_client is None:
+        return []
+    async with _layer_vector_cache_lock:
+        now = time.time()
+        if (
+            _layer_vector_cache["client_id"] == id(redis_client)
+            and now - _layer_vector_cache["ts"] < 5.0
+        ):
+            return _layer_vector_cache["vectors"]
+
+        keys = []
+        async for key in redis_client.scan_iter(match="sv:*", count=500):
+            keys.append(key)
+        if not keys:
+            _layer_vector_cache.update(
+                client_id=id(redis_client), ts=now, vectors=[]
+            )
+            return []
+        pipe = redis_client.pipeline()
+        for key in keys:
+            pipe.get(key)
+        vectors = []
+        for raw in await pipe.execute():
+            if not raw:
+                continue
+            try:
+                vectors.append(StateVector.from_bytes(raw))
+            except Exception:
+                continue
+        _layer_vector_cache.update(
+            client_id=id(redis_client), ts=now, vectors=vectors
+        )
+        return vectors
+
+
+def _empty_layer_summary() -> Dict[str, Dict[str, Any]]:
+    descriptions = {
+        "L1": "Position and source cross-validation",
+        "L2": "Kinematic and behavioral anomaly detection",
+        "L3": "Learned trajectory models",
+        "L4": "Multi-sensor fusion",
+        "L5": "Identity and threat intelligence",
+    }
+    return {
+        layer.value: {
+            "description": descriptions[layer.value],
+            "evaluated": 0,
+            "triggered": 0,
+            "skipped": 0,
+            "trigger_count": 0,
+            "detectors": {},
+            "skipped_reasons": {},
+        }
+        for layer in DetectionLayer
+    }
+
+
+@app.get("/api/layers")
+async def get_layer_summary():
+    """Return evaluated/skipped/triggered counts for every canonical layer."""
+    layers = _empty_layer_summary()
+    vectors = await _load_state_vectors()
+    now = time.time()
+
+    for sv in vectors:
+        for evaluation in sv.layer_evaluations.values():
+            bucket = layers[evaluation.layer.value]
+            if (
+                evaluation.layer == DetectionLayer.L4
+                and evaluation.status == LayerStatus.TRIGGERED
+                and now - evaluation.timestamp > settings.FUSION_TRIGGER_TTL_SEC
+            ):
+                bucket["skipped"] += 1
+                reason = "L4 trigger evidence expired"
+                bucket["skipped_reasons"][reason] = (
+                    bucket["skipped_reasons"].get(reason, 0) + 1
+                )
+                continue
+            if evaluation.status == LayerStatus.SKIPPED:
+                bucket["skipped"] += 1
+                reason = evaluation.skipped_reason or "Unspecified"
+                bucket["skipped_reasons"][reason] = (
+                    bucket["skipped_reasons"].get(reason, 0) + 1
+                )
+            else:
+                bucket["evaluated"] += 1
+            if evaluation.status == LayerStatus.TRIGGERED:
+                bucket["triggered"] += 1
+
+        for flag in sv.anomalies:
+            if (
+                flag.layer == DetectionLayer.L4
+                and now - flag.timestamp > settings.FUSION_TRIGGER_TTL_SEC
+            ):
+                continue
+            bucket = layers[flag.layer.value]
+            bucket["trigger_count"] += 1
+            bucket["detectors"][flag.detector] = bucket["detectors"].get(flag.detector, 0) + 1
+
+    # L1 runs in the API cross-source snapshot rather than the Kafka anomaly service.
+    for aircraft in _track_snapshot:
+        result = aircraft.get("l1")
+        if not result:
+            continue
+        layers["L1"]["evaluated"] += 1
+        if result.get("verdict") == "SPOOFED":
+            layers["L1"]["triggered"] += 1
+            layers["L1"]["trigger_count"] += 1
+            layers["L1"]["detectors"]["cross_source_position"] = (
+                layers["L1"]["detectors"].get("cross_source_position", 0) + 1
+            )
+
+    return {"timestamp": time.time(), "tracks": len(vectors), "layers": layers}
+
+
+@app.get("/api/layers/{layer}/triggers")
+async def get_layer_triggers(layer: str, limit: int = Query(100, ge=1, le=1000)):
+    """Return recent trigger evidence for one canonical detection layer."""
+    try:
+        selected = DetectionLayer(layer.upper())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown layer: {layer}") from exc
+
+    triggers = []
+    now = time.time()
+    for sv in await _load_state_vectors():
+        for flag in sv.anomalies:
+            if flag.layer != selected:
+                continue
+            if (
+                flag.layer == DetectionLayer.L4
+                and now - flag.timestamp > settings.FUSION_TRIGGER_TTL_SEC
+            ):
+                continue
+            triggers.append({
+                "aircraft_id": sv.icao24,
+                "callsign": sv.callsign,
+                "layer": flag.layer.value,
+                "detector": flag.detector,
+                "type": flag.anomaly_type.value,
+                "score_delta": flag.score_delta,
+                "description": flag.description,
+                "evidence": flag.meta,
+                "timestamp": flag.timestamp,
+            })
+
+    if selected == DetectionLayer.L1:
+        for aircraft in _track_snapshot:
+            result = aircraft.get("l1") or {}
+            if result.get("verdict") != "SPOOFED":
+                continue
+            triggers.append({
+                "aircraft_id": aircraft.get("icao"),
+                "callsign": aircraft.get("cs"),
+                "layer": "L1",
+                "detector": "cross_source_position",
+                "type": "POSITION_DISAGREEMENT",
+                "score_delta": 80,
+                "description": "Independent source positions disagree",
+                "evidence": result,
+                "timestamp": aircraft.get("ts", time.time()),
+            })
+
+    triggers.sort(key=lambda item: item["timestamp"], reverse=True)
+    return {"layer": selected.value, "count": len(triggers), "triggers": triggers[:limit]}
 
 
 # ─── L1 cross-validation endpoints ────────────────────────────────────────────
@@ -680,11 +848,13 @@ async def alert_consumer_loop() -> None:
         group_id=f"{settings.KAFKA_GROUP_PREFIX}.api-alerts",
         value_deserializer=lambda v: v,
         auto_offset_reset="latest",
+        **KAFKA_CONSUMER_STABILITY,
     )
     await consumer.start()
     try:
         async for msg in consumer:
             if not _ws_clients:
+                await consumer.commit()
                 continue
             try:
                 sv = StateVector.from_bytes(msg.value)
@@ -693,7 +863,8 @@ async def alert_consumer_loop() -> None:
                 # Apply L1 cross-validation to this single alert (one item
                 # at a time off the Kafka topic, so a direct call is fine —
                 # the rate-limit concern is about the full global feed)
-                if TDOA_AVAILABLE and cross_validator and ac.get("lat") and ac.get("lon"):
+                if (TDOA_AVAILABLE and cross_validator
+                        and ac.get("lat") is not None and ac.get("lon") is not None):
                     try:
                         l1_result = await cross_validator.validate_aircraft(ac["icao"], ac["lat"], ac["lon"])
                         ac["l1"] = {
@@ -708,7 +879,7 @@ async def alert_consumer_loop() -> None:
                     "type":     "alert",
                     "ts":       time.time(),
                     "aircraft": ac,
-                    "anomalies": [{"type": a.anomaly_type.value, "description": a.description} for a in sv.anomalies],
+                    "anomalies": [a.to_api_dict() for a in sv.anomalies],
                 })
                 dead = set()
                 for ws in _ws_clients:
@@ -718,7 +889,9 @@ async def alert_consumer_loop() -> None:
                         dead.add(ws)
                 for ws in dead:
                     _ws_clients.discard(ws)
+                await consumer.commit()
             except Exception as e:
                 log.error("Alert push error: %s", e)
+                raise
     finally:
         await consumer.stop()

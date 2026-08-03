@@ -27,6 +27,10 @@ class FusionPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         await engine.save(sv, producer)
 
+        redis.setex.assert_awaited_once()
+        self.assertEqual(redis.setex.await_args.args[0], "fusion:sv:ABC123")
+        producer.send_and_wait.assert_awaited_once()
+        producer.send.assert_not_called()
         pool.execute.assert_awaited_once()
         sql, *values = pool.execute.await_args.args
         self.assertIn("INSERT INTO track_points", sql)
@@ -34,6 +38,26 @@ class FusionPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values[2], "TEST1")
         self.assertEqual(values[3], 39.9)
         self.assertEqual(values[4], -75.1)
+
+    async def test_fusion_load_uses_service_owned_state_namespace(self):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        engine = FusionEngine(redis)
+
+        await engine._load_or_create("abc123")
+
+        redis.get.assert_awaited_once_with("fusion:sv:ABC123")
+
+    async def test_failed_fused_delivery_does_not_advance_fusion_state(self):
+        redis = AsyncMock()
+        producer = AsyncMock()
+        producer.send_and_wait.side_effect = RuntimeError("broker unavailable")
+        engine = FusionEngine(redis)
+
+        with self.assertRaisesRegex(RuntimeError, "broker unavailable"):
+            await engine.save(StateVector(icao24="ABC123"), producer)
+
+        redis.setex.assert_not_awaited()
 
 
 if __name__ == "__main__":

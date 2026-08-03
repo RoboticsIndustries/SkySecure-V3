@@ -43,6 +43,7 @@ select{padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-siz
 .scroll-tc h2{font-size:19px;font-weight:600;margin-bottom:18px}
 .scroll-tc h3{font-size:14px;font-weight:600;margin:22px 0 10px}
 .sgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}
+#layer-grid{grid-template-columns:repeat(5,minmax(0,1fr))}
 .sc{background:var(--bg2);border:1px solid var(--border);border-radius:7px;padding:14px;text-align:center}
 .sc .v{font-size:26px;font-weight:600}
 .sc .l{font-size:11px;color:var(--text2);margin-top:3px}
@@ -133,7 +134,7 @@ tr:hover td{background:#fafafa}
 .evtmsg{color:var(--text);line-height:1.5;margin-top:1px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:8px}
-@media(max-width:768px){.sgrid{grid-template-columns:1fr 1fr}.crow{grid-template-columns:1fr}.fgrid{grid-template-columns:1fr}.chips{display:none}}
+@media(max-width:768px){.sgrid,#layer-grid{grid-template-columns:1fr 1fr}.crow{grid-template-columns:1fr}.fgrid{grid-template-columns:1fr}.chips{display:none}}
 </style>
 </head>
 <body>
@@ -207,6 +208,26 @@ tr:hover td{background:#fafafa}
       <div class="sc"><div class="v" id="e-sp" style="color:#ef4444">--</div><div class="l">Heuristically Suspicious</div></div>
       <div class="sc"><div class="v" id="e-mil" style="color:#f97316">--</div><div class="l">Military / Dark</div></div>
       <div class="sc"><div class="v" id="e-cl" style="color:#22c55e">--</div><div class="l">Clean Civilian</div></div>
+    </div>
+    <h3>Detection Layers</h3>
+    <div class="sgrid" id="layer-grid">
+      <div class="sc"><div class="v" id="layer-L1">--</div><div class="l">L1 Position / Source · T/E/S</div></div>
+      <div class="sc"><div class="v" id="layer-L2">--</div><div class="l">L2 Kinematic · T/E/S</div></div>
+      <div class="sc"><div class="v" id="layer-L3">--</div><div class="l">L3 Trajectory ML · T/E/S</div></div>
+      <div class="sc"><div class="v" id="layer-L4">--</div><div class="l">L4 Sensor Fusion · T/E/S</div></div>
+      <div class="sc"><div class="v" id="layer-L5">--</div><div class="l">L5 Identity / Intel · T/E/S</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin:16px 0 8px">
+      <h3 style="margin:0">Layer Trigger Evidence</h3>
+      <select id="layer-select" onchange="updateLayerTriggers()">
+        <option>L1</option><option selected>L2</option><option>L3</option><option>L4</option><option>L5</option>
+      </select>
+    </div>
+    <div class="tw" style="margin-bottom:18px">
+      <table>
+        <thead><tr><th>Aircraft</th><th>Detector</th><th>Type</th><th>Score</th><th>Evidence</th></tr></thead>
+        <tbody id="layer-trigger-body"><tr><td colspan="5" style="text-align:center;color:#9ca3af">Waiting for layer telemetry</td></tr></tbody>
+      </table>
     </div>
     <div class="crow">
       <div class="cc"><h4>Classification Breakdown</h4><canvas id="ch-cls"></canvas></div>
@@ -482,8 +503,9 @@ df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
-const API    = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000/ws/tracks';
+const API_HOST = window.location.hostname || 'localhost';
+const API = window.SKYSECURE_API_URL || (window.location.protocol + '//' + API_HOST + ':8000');
+const WS_URL = window.SKYSECURE_WS_URL || ((window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + API_HOST + ':8000/ws/tracks');
 
 const MIL_RANGES=[
   [0xADF000,0xADFFFF],[0xAE0000,0xAFFFFF],[0xA9F000,0xA9FFFF],
@@ -742,6 +764,47 @@ function buildPopup(a){
     '<div class="pr"><span class="pk">Risk score</span><span>'+esc(a.risk||0)+'/100</span></div>'+
     (evts.length?'<div class="pr"><span class="pk" style="color:#ef4444">Events</span><span style="color:#ef4444;font-weight:700">'+evts.length+'</span></div>':'')+
     '<button class="view-hist" onclick="map.closePopup();openPanel(\''+a.icao+'\')">View History and Charts</button>';
+}
+
+// ── Detection layer telemetry ─────────────────────────────────
+async function updateLayerSummary(){
+  try {
+    const r=await fetch(API+'/api/layers');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    Object.entries(data.layers||{}).forEach(([name,layer])=>{
+      const el=document.getElementById('layer-'+name);
+      if(!el) return;
+      el.textContent=(layer.triggered||0)+' / '+(layer.evaluated||0)+' / '+(layer.skipped||0);
+      const reasons=Object.entries(layer.skipped_reasons||{}).map(([reason,count])=>count+'× '+reason);
+      el.title=(layer.trigger_count||0)+' total triggers'+(reasons.length?'; skipped: '+reasons.join('; '):'');
+      el.style.color=layer.triggered?'#ef4444':layer.evaluated?'#22c55e':'#9ca3af';
+    });
+  } catch(e) {
+    ['L1','L2','L3','L4','L5'].forEach(name=>{
+      const el=document.getElementById('layer-'+name); if(el){el.textContent='offline';el.style.color='#9ca3af';}
+    });
+  }
+}
+
+async function updateLayerTriggers(){
+  const layer=document.getElementById('layer-select').value;
+  const body=document.getElementById('layer-trigger-body');
+  try {
+    const r=await fetch(API+'/api/layers/'+layer+'/triggers?limit=50');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    if(!data.triggers.length){
+      body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#9ca3af">No '+esc(layer)+' triggers in current tracks</td></tr>';
+      return;
+    }
+    body.innerHTML=data.triggers.map(t=>'<tr>'+
+      '<td style="font-family:var(--mono);font-weight:600">'+esc(t.aircraft_id)+'</td>'+
+      '<td>'+esc(t.detector)+'</td><td>'+esc(t.type.replace(/_/g,' '))+'</td>'+
+      '<td>+'+esc(t.score_delta)+'</td><td style="font-family:var(--mono);font-size:10px">'+esc(JSON.stringify(t.evidence))+'</td></tr>').join('');
+  } catch(e) {
+    body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#991b1b">Layer telemetry unavailable</td></tr>';
+  }
 }
 
 // ── EDA ───────────────────────────────────────────────────────
@@ -1102,6 +1165,10 @@ window.addEventListener('DOMContentLoaded', () => {
   // Poll /api/live-aircraft every 12s — server proxies adsb.lol, no CORS
   pollLive();
   setInterval(pollLive, 12000);
+
+  updateLayerSummary();
+  updateLayerTriggers();
+  setInterval(()=>{ updateLayerSummary(); updateLayerTriggers(); }, 15000);
 });
 
 </script>

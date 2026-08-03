@@ -37,6 +37,10 @@ class Classification(str, Enum):
 class AnomalyType(str, Enum):
     IMPOSSIBLE_SPEED        = "IMPOSSIBLE_SPEED"
     IMPOSSIBLE_ALTITUDE     = "IMPOSSIBLE_ALTITUDE"
+    ABNORMAL_ACCELERATION   = "ABNORMAL_ACCELERATION"
+    ABNORMAL_TURN_RATE      = "ABNORMAL_TURN_RATE"
+    ABNORMAL_CLIMB_RATE     = "ABNORMAL_CLIMB_RATE"
+    TRAJECTORY_DEVIATION    = "TRAJECTORY_DEVIATION"
     GNSS_SPOOF              = "GNSS_SPOOF"
     IDENTITY_SPOOF          = "IDENTITY_SPOOF"
     GHOST_AIRCRAFT          = "GHOST_AIRCRAFT"        # ADS-B but no MLAT confirm
@@ -48,6 +52,21 @@ class AnomalyType(str, Enum):
     ALTITUDE_BARO_GEO_DELTA = "ALTITUDE_BARO_GEO_DELTA"
     MILITARY_BEHAVIOR       = "MILITARY_BEHAVIOR"
     DUPLICATE_ICAO          = "DUPLICATE_ICAO"
+
+
+class DetectionLayer(str, Enum):
+    """Canonical SkySecure detection layers used across services and UI."""
+    L1 = "L1"  # position/source validation
+    L2 = "L2"  # kinematic and behavioral detection
+    L3 = "L3"  # learned trajectory models
+    L4 = "L4"  # multi-sensor fusion
+    L5 = "L5"  # identity and threat intelligence
+
+
+class LayerStatus(str, Enum):
+    EVALUATED = "EVALUATED"
+    TRIGGERED = "TRIGGERED"
+    SKIPPED = "SKIPPED"
 
 
 class RiskBand(str, Enum):
@@ -146,11 +165,13 @@ class RawACARSMessage(BaseModel):
 class SourceReport(BaseModel):
     """One source's contribution to the fused state."""
     source:     DataSource
+    receiver_id: Optional[str] = None
     lat:        Optional[float] = None
     lon:        Optional[float] = None
     altitude:   Optional[int]   = None
     velocity:   Optional[float] = None
     heading:    Optional[float] = None
+    vertical_rate: Optional[int] = None
     weight:     float           = 1.0
     confidence: float           = 1.0
     timestamp:  float           = Field(default_factory=time.time)
@@ -158,10 +179,35 @@ class SourceReport(BaseModel):
 
 class AnomalyFlag(BaseModel):
     anomaly_type: AnomalyType
+    # Defaults preserve compatibility with state vectors written before layer
+    # telemetry existed. New detectors always set these fields explicitly.
+    layer:        DetectionLayer = DetectionLayer.L2
+    detector:     str = "legacy"
     score_delta:  int
     description:  str
     timestamp:    float = Field(default_factory=time.time)
     meta:         Dict[str, Any] = {}
+
+    def to_api_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.anomaly_type.value,
+            "layer": self.layer.value,
+            "detector": self.detector,
+            "score_delta": self.score_delta,
+            "description": self.description,
+            "evidence": self.meta,
+            "timestamp": self.timestamp,
+        }
+
+
+class LayerEvaluation(BaseModel):
+    layer:                 DetectionLayer
+    status:                LayerStatus = LayerStatus.EVALUATED
+    detectors_evaluated:   List[str] = []
+    triggered_detectors:   List[str] = []
+    score_delta:           int = 0
+    skipped_reason:        Optional[str] = None
+    timestamp:             float = Field(default_factory=time.time)
 
 
 class StateVector(BaseModel):
@@ -200,6 +246,7 @@ class StateVector(BaseModel):
     risk_score:     int             = 0     # 0–100
     risk_band:      RiskBand        = RiskBand.NORMAL
     anomalies:      List[AnomalyFlag] = []
+    layer_evaluations: Dict[str, LayerEvaluation] = {}
 
     # Temporal
     first_seen:     float           = Field(default_factory=time.time)
@@ -258,6 +305,19 @@ class StateVector(BaseModel):
             "risk":     self.risk_score,
             "band":     self.risk_band.value,
             "anoms":    [a.anomaly_type.value for a in self.anomalies],
+            "layer_triggers": [a.to_api_dict() for a in self.anomalies],
+            "layer_evaluations": {
+                key: {
+                    "layer": value.layer.value,
+                    "status": value.status.value,
+                    "detectors_evaluated": value.detectors_evaluated,
+                    "triggered_detectors": value.triggered_detectors,
+                    "score_delta": value.score_delta,
+                    "skipped_reason": value.skipped_reason,
+                    "timestamp": value.timestamp,
+                }
+                for key, value in self.layer_evaluations.items()
+            },
             "ts":       self.last_seen,
             "trail":    self.position_history[-20:],  # last 20 for trail
         }

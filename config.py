@@ -3,7 +3,7 @@ config.py — Centralised configuration via environment variables.
 """
 from __future__ import annotations
 from functools import lru_cache
-from typing import List
+from typing import List, Dict, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # ─── Fusion ────────────────────────────────────────────────
     FUSION_CONFLICT_NM:      float = 5.0          # NM discrepancy → flag
     FUSION_STALE_THRESHOLD:  int   = 30           # seconds
+    FUSION_COMPARISON_WINDOW_SEC: int = 5         # max ADS-B/MLAT event-time skew
+    FUSION_TRIGGER_TTL_SEC:  int   = 60           # active L4 evidence lifetime
 
     # ─── Anomaly Detection ─────────────────────────────────────
     MAX_GROUNDSPEED_KNOTS:   float = 1200.0
@@ -83,3 +85,14 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# Conservative client timeouts keep consumer groups stable when Kafka runs via
+# amd64 emulation on Apple Silicon. Native Linux remains comfortably within them.
+KAFKA_CONSUMER_STABILITY: Dict[str, Any] = {
+    "enable_auto_commit": False,
+    "request_timeout_ms": 90_000,
+    "session_timeout_ms": 45_000,
+    "heartbeat_interval_ms": 15_000,
+    "max_poll_interval_ms": 600_000,
+    "retry_backoff_ms": 1_000,
+}

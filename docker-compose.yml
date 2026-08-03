@@ -30,10 +30,11 @@ services:
     networks: [skysecure]
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 5s
+      # The amd64 Kafka CLI can take ~40s under Apple Silicon emulation.
+      interval: 15s
+      timeout: 60s
       retries: 12
-      start_period: 20s
+      start_period: 60s
 
   kafka-init:
     platform: linux/amd64

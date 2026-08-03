@@ -31,6 +31,8 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import orjson
+import redis.asyncio as aioredis
 from scipy.optimize import least_squares
 from pyproj import Transformer
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -39,7 +41,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models import RawADSBMessage, RawMLATReport
-from config import settings
+from config import settings, KAFKA_CONSUMER_STABILITY
 
 log = logging.getLogger(__name__)
 
@@ -249,7 +251,32 @@ class FrameAccumulator:
         self.solver = solver
         # key: (icao24, msg_hash) → TDOAFrame
         self._frames: Dict[str, TDOAFrame] = {}
-        self._solved: set = set()   # avoid re-solving
+        self._solved: Dict[str, float] = {}   # key → solve time
+
+    def snapshot(self) -> dict:
+        return {
+            "frames": {
+                key: {
+                    "icao24": frame.icao24,
+                    "raw_message": frame.raw_message,
+                    "receptions": frame.receptions,
+                    "created_at": frame.created_at,
+                }
+                for key, frame in self._frames.items()
+            },
+            "solved": self._solved,
+        }
+
+    def restore(self, data: dict) -> None:
+        self._frames = {}
+        for key, raw in data.get("frames", {}).items():
+            frame = TDOAFrame(raw["icao24"], raw["raw_message"])
+            frame.receptions = [tuple(item) for item in raw.get("receptions", [])]
+            frame.created_at = float(raw.get("created_at", time.time()))
+            self._frames[key] = frame
+        self._solved = {
+            key: float(solved_at) for key, solved_at in data.get("solved", {}).items()
+        }
 
     def add_message(self, msg: RawADSBMessage) -> Optional[RawMLATReport]:
         """
@@ -284,7 +311,7 @@ class FrameAccumulator:
         if frame.is_solvable(settings.MLAT_MIN_RECEIVERS):
             result = self._try_solve(frame)
             if result:
-                self._solved.add(key)
+                self._solved[key] = time.time()
                 del self._frames[key]
                 return result
 
@@ -330,9 +357,38 @@ class FrameAccumulator:
         expired = [k for k, f in self._frames.items() if f.age() > self.WINDOW_SEC * 4]
         for k in expired:
             del self._frames[k]
+        solved_cutoff = time.time() - self.WINDOW_SEC * 20
+        self._solved = {
+            key: solved_at for key, solved_at in self._solved.items()
+            if solved_at >= solved_cutoff
+        }
 
 
 # ─── Main Processing Loop ─────────────────────────────────────────────────────
+
+async def process_adsb_for_mlat(
+    accumulator, producer, raw_value: bytes, state_store=None
+) -> bool:
+    """Process one input and wait for any MLAT output to reach Kafka."""
+    before = accumulator.snapshot()
+    try:
+        adsb_msg = RawADSBMessage.from_bytes(raw_value)
+        report = accumulator.add_message(adsb_msg)
+        if report is not None:
+            await producer.send_and_wait(
+                topic=settings.TOPIC_RAW_MLAT,
+                key=report.icao24.encode(),
+                value=report.to_bytes(),
+            )
+        if state_store is not None:
+            await state_store.setex(
+                "mlat:accumulator", 60, orjson.dumps(accumulator.snapshot())
+            )
+        return report is not None
+    except Exception:
+        accumulator.restore(before)
+        raise
+
 
 async def run() -> None:
     logging.basicConfig(level=settings.LOG_LEVEL)
@@ -341,6 +397,13 @@ async def run() -> None:
     registry = ReceiverRegistry()
     solver = MLATSolver()
     accumulator = FrameAccumulator(registry, solver)
+    state_store = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+    saved_state = await state_store.get("mlat:accumulator")
+    if saved_state:
+        try:
+            accumulator.restore(orjson.loads(saved_state))
+        except Exception as exc:
+            log.warning("Discarding invalid MLAT accumulator state: %s", exc)
 
     # In production: load receiver locations from DB
     # For demo: register a few example receivers
@@ -355,6 +418,7 @@ async def run() -> None:
         group_id=f"{settings.KAFKA_GROUP_PREFIX}.mlat-solver",
         value_deserializer=lambda v: v,
         auto_offset_reset="latest",
+        **KAFKA_CONSUMER_STABILITY,
     )
 
     producer = AIOKafkaProducer(
@@ -369,25 +433,22 @@ async def run() -> None:
     try:
         async for kafka_msg in consumer:
             try:
-                adsb_msg = RawADSBMessage.from_bytes(kafka_msg.value)
-                report = accumulator.add_message(adsb_msg)
-
-                if report:
-                    await producer.send(
-                        topic=settings.TOPIC_RAW_MLAT,
-                        key=report.icao24.encode(),
-                        value=report.to_bytes(),
-                    )
+                if await process_adsb_for_mlat(
+                    accumulator, producer, kafka_msg.value, state_store
+                ):
                     solved_count += 1
                     if solved_count % 100 == 0:
                         log.info("MLAT: %d positions solved", solved_count)
+                await consumer.commit()
 
             except Exception as e:
                 log.error("MLAT processing error: %s", e)
+                raise
 
     finally:
         await consumer.stop()
         await producer.stop()
+        await state_store.close()
 
 
 if __name__ == "__main__":
