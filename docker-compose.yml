@@ -4,6 +4,7 @@ services:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    restart: unless-stopped
     networks: [skysecure]
 
   kafka:
@@ -35,6 +36,7 @@ services:
       timeout: 60s
       retries: 12
       start_period: 60s
+    restart: unless-stopped
 
   kafka-init:
     platform: linux/amd64
@@ -52,6 +54,7 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
     networks: [skysecure]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -71,6 +74,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
     networks: [skysecure]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U skysecure -d skysecure"]
@@ -193,6 +197,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
     networks: [skysecure]
 
 volumes:
