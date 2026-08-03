@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models import StateVector, RiskBand, Classification, DetectionLayer, LayerStatus
 from config import settings, KAFKA_CONSUMER_STABILITY
+from ingestion.adsb_receiver import adsb_lol_fallback_url
 
 # L1 imports — real multi-source cross-validation (no receiver hardware yet;
 # see processing/cross_source_validator.py for why this replaces the old
@@ -79,9 +80,6 @@ HEADERS = {
     "User-Agent": "SkySecure/2.0 (airspace research)",
     "Accept":     "application/json",
 }
-
-ADSB_LOL_FALLBACK_URL = "https://api.adsb.lol/v2/point/39.9526/-75.1652/50"
-
 
 def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
     """Normalize an adsb.lol point-feed response to the public API shape."""
@@ -282,7 +280,7 @@ async def _fetch_live_aircraft() -> List[dict]:
                     log.warning("OpenSky returned HTTP %d", resp.status)
                     if resp.status == 429:
                         async with session.get(
-                            ADSB_LOL_FALLBACK_URL,
+                            adsb_lol_fallback_url(),
                             timeout=aiohttp.ClientTimeout(total=20),
                         ) as fallback_resp:
                             if fallback_resp.status == 200:

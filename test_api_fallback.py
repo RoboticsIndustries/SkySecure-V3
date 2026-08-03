@@ -9,9 +9,16 @@ from api.main import (
     run_l1_cross_validation,
 )
 from processing.cross_source_validator import CrossValidationResult
+from ingestion.adsb_receiver import adsb_lol_fallback_url
 
 
 class AdsbLolFallbackTests(unittest.TestCase):
+    def test_fallback_area_is_configurable_and_radius_is_bounded(self):
+        self.assertEqual(
+            adsb_lol_fallback_url(40.7128, -74.0060, 300),
+            "https://api.adsb.lol/v2/point/40.7128/-74.006/250",
+        )
+
     def test_parses_adsb_lol_aircraft_into_api_shape(self):
         payload = {
             "ac": [

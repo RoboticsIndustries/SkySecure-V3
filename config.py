@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     OPENSKY_PASSWORD:        str   = ""
     OPENSKY_POLL_INTERVAL:   int   = 10          # seconds
     OPENSKY_BASE_URL:        str   = "https://opensky-network.org/api"
+    ADSB_FALLBACK_LAT:       float = 39.9526
+    ADSB_FALLBACK_LON:       float = -75.1652
+    ADSB_FALLBACK_RADIUS_NM: int   = 250
 
     DUMP1090_HOST:           str   = "localhost"
     DUMP1090_PORT:           int   = 30003        # BaseStation / SBS format

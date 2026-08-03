@@ -91,8 +91,11 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
       REDIS_URL: redis://redis:6379/0
       ADSB_SOURCE: multi
-      OPENSKY_USERNAME: ""
-      OPENSKY_PASSWORD: ""
+      OPENSKY_USERNAME: ${OPENSKY_USERNAME:-}
+      OPENSKY_PASSWORD: ${OPENSKY_PASSWORD:-}
+      ADSB_FALLBACK_LAT: ${ADSB_FALLBACK_LAT:-39.9526}
+      ADSB_FALLBACK_LON: ${ADSB_FALLBACK_LON:--75.1652}
+      ADSB_FALLBACK_RADIUS_NM: ${ADSB_FALLBACK_RADIUS_NM:-250}
     depends_on:
       kafka:
         condition: service_healthy
@@ -171,6 +174,9 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://skysecure:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/skysecure
+      ADSB_FALLBACK_LAT: ${ADSB_FALLBACK_LAT:-39.9526}
+      ADSB_FALLBACK_LON: ${ADSB_FALLBACK_LON:--75.1652}
+      ADSB_FALLBACK_RADIUS_NM: ${ADSB_FALLBACK_RADIUS_NM:-250}
     depends_on:
       kafka:
         condition: service_healthy

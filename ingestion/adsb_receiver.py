@@ -24,7 +24,18 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 15   # seconds — stay well within OpenSky rate limits
 REDIS_TTL     = 60   # seconds — aircraft expire if not refreshed
-ADSB_LOL_FALLBACK_URL = "https://api.adsb.lol/v2/point/39.9526/-75.1652/50"
+
+def adsb_lol_fallback_url(
+    lat: float | None = None,
+    lon: float | None = None,
+    radius_nm: int | None = None,
+) -> str:
+    """Build a configurable adsb.lol area query (API maximum: 250 NM)."""
+    lat = settings.ADSB_FALLBACK_LAT if lat is None else max(-90.0, min(90.0, lat))
+    lon = settings.ADSB_FALLBACK_LON if lon is None else max(-180.0, min(180.0, lon))
+    radius_nm = settings.ADSB_FALLBACK_RADIUS_NM if radius_nm is None else radius_nm
+    radius_nm = max(0, min(250, int(radius_nm)))
+    return f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}"
 
 
 def _parse_adsb_lol_states(data: dict) -> list[list[Any]]:
@@ -94,7 +105,7 @@ async def run() -> None:
                     if resp.status == 429:
                         log.warning("Rate limited by OpenSky — using adsb.lol fallback")
                         async with session.get(
-                            ADSB_LOL_FALLBACK_URL,
+                            adsb_lol_fallback_url(),
                             timeout=aiohttp.ClientTimeout(total=25),
                         ) as fallback_resp:
                             if fallback_resp.status != 200:
