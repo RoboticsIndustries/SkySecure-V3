@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-# SkySecure-V3
-=======
-# SkySecure v2
+# SkySecure V3
 
 **ADS-B Aviation Cybersecurity Platform — Spoofing Detection & Signal Authentication**
 
@@ -125,4 +122,3 @@ MIT License — see [LICENSE](LICENSE) for details.
 ---
 
 *Built by Aryan — CAP Chief Master Sergeant, Brandywine Cadet Squadron | JSHS 2026 Competitor*
->>>>>>> a33cf16 (populated files)
