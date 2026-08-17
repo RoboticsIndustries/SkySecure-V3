@@ -1,0 +1,155 @@
+version: "3.9"
+
+services:
+  # ─── Message Bus ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks: [skysecure]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 8
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    networks: [skysecure]
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [kafka]
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw.adsb --partitions 8 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw.mlat --partitions 4 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw.acars --partitions 4 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic fused.tracks --partitions 8 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic alerts.anomaly --partitions 4 --replication-factor 1
+      echo 'Topics created.'
+      "
+    networks: [skysecure]
+
+  # ─── State Store ─────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    networks: [skysecure]
+
+  # ─── Persistent Store ────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:15-3.3
+    environment:
+      POSTGRES_DB: skysecure
+      POSTGRES_USER: skysecure
+      POSTGRES_PASSWORD: skysecure_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks: [skysecure]
+
+  # ─── ADS-B Ingestion ─────────────────────────────────────────
+  adsb-ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: python -m ingestion.adsb_receiver
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+      ADSB_SOURCE: multi            # multi | opensky | beast | dump1090
+      OPENSKY_USERNAME: ""
+      OPENSKY_PASSWORD: ""
+    depends_on: [kafka, redis]
+    restart: unless-stopped
+    networks: [skysecure]
+
+  # ─── MLAT Solver ─────────────────────────────────────────────
+  mlat-solver:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: python -m processing.mlat_solver
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [kafka, redis]
+    restart: unless-stopped
+    networks: [skysecure]
+
+  # ─── Fusion Engine ───────────────────────────────────────────
+  fusion-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: python -m processing.fusion_engine
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://skysecure:skysecure_secret@postgres:5432/skysecure
+    depends_on: [kafka, redis, postgres]
+    restart: unless-stopped
+    networks: [skysecure]
+
+  # ─── Anomaly Detector ────────────────────────────────────────
+  anomaly-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: python -m anomaly.detector
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [kafka, redis]
+    restart: unless-stopped
+    networks: [skysecure]
+
+  # ─── REST + WebSocket API ────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://skysecure:skysecure_secret@postgres:5432/skysecure
+    depends_on: [kafka, redis, postgres]
+    restart: unless-stopped
+    networks: [skysecure]
+
+  # ─── Frontend ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on: [api]
+    networks: [skysecure]
+
+volumes:
+  pgdata:
+
+networks:
+  skysecure:
+    driver: bridge

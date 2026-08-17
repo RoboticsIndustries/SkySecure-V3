@@ -1,0 +1,48 @@
+# Web / API
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+websockets==12.0
+httpx==0.27.0
+aiohttp==3.9.5
+
+# Kafka
+confluent-kafka==2.4.0
+aiokafka==0.10.0
+
+# Redis
+redis==5.0.4
+aioredis==2.0.1
+
+# Database
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.30
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# Data Processing
+numpy==1.26.4
+scipy==1.13.0
+pandas==2.2.2
+pyproj==3.6.1          # geodetic calculations
+
+# Machine Learning
+torch==2.3.0
+scikit-learn==1.4.2
+joblib==1.4.2
+
+# ADS-B / Aviation
+pyModeS==2.19           # Mode S / ADS-B decoder
+
+# Serialization
+pydantic==2.7.1
+orjson==3.10.3
+msgpack==1.0.8
+
+# Utilities
+python-dotenv==1.0.1
+structlog==24.1.0
+prometheus-client==0.20.0
+tenacity==8.3.0
+haversine==2.8.1
+pydantic-settings==2.3.4
+lz4==4.3.3
