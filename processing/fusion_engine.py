@@ -255,9 +255,11 @@ class FusionEngine:
             sv.heading = msg.heading
         if is_current_event and msg.vertical_rate is not None:
             sv.vertical_rate = msg.vertical_rate
-        if is_current_event and msg.nic is not None:
+        # Integrity metadata belongs to the current ADS-B report.  A current
+        # source that omits NIC/NACp means "unavailable now", not "reuse an old
+        # value".  Delayed reports must not clear newer metadata.
+        if is_current_event:
             sv.nic = msg.nic
-        if is_current_event and msg.nac_p is not None:
             sv.nac_p = msg.nac_p
         if is_current_event and msg.callsign:
             sv.callsign = msg.callsign

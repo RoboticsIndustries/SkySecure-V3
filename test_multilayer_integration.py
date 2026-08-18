@@ -416,6 +416,64 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             [flag.detector for flag in result.anomalies],
         )
 
+    async def test_current_adsb_report_without_integrity_clears_stale_metadata(self):
+        now = time.time()
+        existing = StateVector(
+            icao24="ABC123",
+            nic=8,
+            nac_p=10,
+            last_seen=now,
+        )
+        redis = AsyncMock()
+        redis.get.return_value = existing.to_bytes()
+        message = RawADSBMessage(
+            receiver_id="opensky",
+            recv_time=now + 1,
+            icao24="ABC123",
+            raw_message="",
+            msg_type=17,
+            lat=40.0,
+            lon=-75.0,
+            nic=None,
+            nac_p=None,
+        )
+
+        result = await FusionEngine(redis).process_adsb(message)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIsNone(result.nic)
+        self.assertIsNone(result.nac_p)
+
+    async def test_delayed_adsb_report_does_not_clear_newer_integrity_metadata(self):
+        now = time.time()
+        existing = StateVector(
+            icao24="ABC123",
+            nic=8,
+            nac_p=10,
+            last_seen=now,
+        )
+        redis = AsyncMock()
+        redis.get.return_value = existing.to_bytes()
+        message = RawADSBMessage(
+            receiver_id="opensky",
+            recv_time=now - 1,
+            icao24="ABC123",
+            raw_message="",
+            msg_type=17,
+            lat=40.0,
+            lon=-75.0,
+            nic=None,
+            nac_p=None,
+        )
+
+        result = await FusionEngine(redis).process_adsb(message)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.nic, 8)
+        self.assertEqual(result.nac_p, 10)
+
     async def test_aggregator_dropout_is_not_called_transponder_loss(self):
         state = StateVector(
             icao24="ABC123",
