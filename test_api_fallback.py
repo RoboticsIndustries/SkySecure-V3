@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 from api.main import (
     _L1_CACHE,
+    _deduplicate_track_records,
     _fetch_live_aircraft,
     _select_l1_candidates,
     _parse_adsb_lol_aircraft,
@@ -54,6 +55,19 @@ class AdsbLolFallbackTests(unittest.TestCase):
         }]
 
         self.assertEqual(_select_l1_candidates(tracks), [])
+
+    def test_websocket_track_dedup_prefers_canonical_state_vector(self):
+        records = [
+            ("ac", {"icao": "A1B2C3", "risk": 0, "src": "adsb_lol"}),
+            ("sv", {"icao": "A1B2C3", "risk": 80, "src": "ADSB"}),
+            ("ac", {"icao": "D4E5F6", "risk": 0, "src": "adsb_lol"}),
+        ]
+
+        tracks = _deduplicate_track_records(records)
+
+        self.assertEqual({track["icao"] for track in tracks}, {"A1B2C3", "D4E5F6"})
+        selected = next(track for track in tracks if track["icao"] == "A1B2C3")
+        self.assertEqual(selected["risk"], 80)
 
 
 class _FakeResponse:
@@ -127,6 +141,41 @@ class AdsbLolFallbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await run_l1_cross_validation(adsb_lol)
 
         self.assertEqual(validator.validate_aircraft.await_count, 2)
+
+    async def test_l1_cache_is_scoped_to_claim_position(self):
+        validator = AsyncMock()
+        validator.validate_aircraft.return_value = CrossValidationResult(
+            icao="ABC123", is_valid=True, max_disagreement_m=0,
+            confidence=0.9, sources_used=["adsb_lol"], verdict="VALIDATED",
+        )
+        _L1_CACHE.clear()
+        first = [{"icao": "ABC123", "lat": 39.9500, "lon": -75.1600, "src": "opensky"}]
+        moved = [{"icao": "ABC123", "lat": 39.9600, "lon": -75.1700, "src": "opensky"}]
+
+        with patch("api.main.cross_validator", validator):
+            await run_l1_cross_validation(first)
+            await run_l1_cross_validation(moved)
+
+        self.assertEqual(validator.validate_aircraft.await_count, 2)
+
+    async def test_cached_spoof_verdict_does_not_duplicate_anomaly(self):
+        validator = AsyncMock()
+        validator.validate_aircraft.return_value = CrossValidationResult(
+            icao="ABC123", is_valid=False, max_disagreement_m=9000,
+            confidence=0.95, sources_used=["adsb_lol", "adsb_fi"], verdict="SPOOFED",
+        )
+        _L1_CACHE.clear()
+        aircraft = [{
+            "icao": "ABC123", "lat": 39.95, "lon": -75.16,
+            "src": "opensky", "risk": 0, "anoms": [],
+        }]
+
+        with patch("api.main.cross_validator", validator):
+            await run_l1_cross_validation(aircraft)
+            await run_l1_cross_validation(aircraft)
+
+        anomalies = [a for a in aircraft[0]["anoms"] if a["type"] == "L1_POSITION_DISAGREEMENT"]
+        self.assertEqual(len(anomalies), 1)
 
 
 if __name__ == "__main__":

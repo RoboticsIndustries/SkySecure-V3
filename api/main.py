@@ -159,10 +159,10 @@ def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
 
 # ─── L1 Helper Functions (real, live-data cross-validation) ──────────────────
 
-# Per-ICAO-and-claim-source result cache so we don't re-query the same aircraft every
+# Per-claim result cache so we don't re-query the same aircraft every
 # broadcast tick. External free-tier APIs will rate-limit/ban aggressive
 # per-aircraft polling, so this is not optional.
-_L1_CACHE: Dict[tuple[str, str], tuple] = {}
+_L1_CACHE: Dict[tuple[str, str, float, float, int], tuple] = {}
 _L1_CACHE_TTL = 60  # seconds
 
 # Hard cap on live cross-validation calls per broadcast cycle. The global
@@ -172,22 +172,41 @@ _L1_CACHE_TTL = 60  # seconds
 _L1_MAX_PER_CYCLE = 20
 
 
-def _l1_cache_key(ac: dict) -> tuple[str, str]:
-    return ac["icao"], str(ac.get("src") or "unknown").lower()
+def _l1_cache_key(
+    ac: dict,
+    now: Optional[float] = None,
+) -> tuple[str, str, float, float, int]:
+    """Bind a cached L1 verdict to the position and time it validated."""
+    current_time = time.time() if now is None else now
+    observed_at = ac.get("obs_ts", ac.get("last_seen", current_time))
+    try:
+        observation_bucket = int(float(observed_at) // _L1_CACHE_TTL)
+    except (TypeError, ValueError):
+        observation_bucket = int(current_time // _L1_CACHE_TTL)
+    return (
+        ac["icao"],
+        str(ac.get("src") or "unknown").lower(),
+        round(float(ac["lat"]), 5),
+        round(float(ac["lon"]), 5),
+        observation_bucket,
+    )
 
 
-def _select_l1_candidates(aircraft_list: List[dict]) -> List[dict]:
+def _select_l1_candidates(
+    aircraft_list: List[dict],
+    now: Optional[float] = None,
+) -> List[dict]:
     """Pick which aircraft get a live cross-validation check this cycle:
     anything already flagged risky by other layers first, then fill the
     remaining budget so coverage rotates rather than always hitting the
     same first N aircraft in the list."""
-    now = time.time()
+    now = time.time() if now is None else now
     fresh_candidates = [
         ac for ac in aircraft_list
         if ac.get("icao") and ac.get("lat") is not None and ac.get("lon") is not None
         and str(ac.get("src") or "").lower() in {"opensky", "adsb_lol", "adsb_fi"}
-        and (_l1_cache_key(ac) not in _L1_CACHE
-             or now - _L1_CACHE[_l1_cache_key(ac)][0] > _L1_CACHE_TTL)
+        and (_l1_cache_key(ac, now) not in _L1_CACHE
+             or now - _L1_CACHE[_l1_cache_key(ac, now)][0] > _L1_CACHE_TTL)
     ]
     fresh_candidates.sort(key=lambda ac: ac.get("risk", 0), reverse=True)
     return fresh_candidates[:_L1_MAX_PER_CYCLE]
@@ -204,7 +223,10 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
         return
 
     now = time.time()
-    candidates = _select_l1_candidates(aircraft_list)
+    for key, cached in list(_L1_CACHE.items()):
+        if now - cached[0] > _L1_CACHE_TTL:
+            _L1_CACHE.pop(key, None)
+    candidates = _select_l1_candidates(aircraft_list, now)
 
     if candidates:
         results = await asyncio.gather(
@@ -221,11 +243,11 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
             if isinstance(result, BaseException):
                 log.warning(f"L1 cross-validation failed for {ac.get('icao')}: {result}")
                 continue
-            _L1_CACHE[_l1_cache_key(ac)] = (now, result.to_dict())
+            _L1_CACHE[_l1_cache_key(ac, now)] = (now, result.to_dict())
 
     # Apply cache (fresh this cycle or still within TTL) to every aircraft
     for ac in aircraft_list:
-        cached = _L1_CACHE.get(_l1_cache_key(ac))
+        cached = _L1_CACHE.get(_l1_cache_key(ac, now))
         if not cached or now - cached[0] > _L1_CACHE_TTL:
             continue
         result = cached[1]
@@ -239,11 +261,16 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
         if result["verdict"] == "SPOOFED":
             ac["risk"] = max(ac.get("risk", 0), 80)
             ac["band"] = "HIGH"
-            ac.setdefault("anoms", []).append({
-                "type": "L1_POSITION_DISAGREEMENT",
-                "description": f"Aggregator reports disagree by {result['max_disagreement_m']:.0f}m "
-                                f"({'/'.join(result['sources_used'])})",
-            })
+            anomalies = ac.setdefault("anoms", [])
+            if not any(
+                isinstance(item, dict) and item.get("type") == "L1_POSITION_DISAGREEMENT"
+                for item in anomalies
+            ):
+                anomalies.append({
+                    "type": "L1_POSITION_DISAGREEMENT",
+                    "description": f"Aggregator reports disagree by {result['max_disagreement_m']:.0f}m "
+                                   f"({'/'.join(result['sources_used'])})",
+                })
 
 
 _THREAT_TO_RISK = {
@@ -265,7 +292,7 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
         icao = ac.get("icao")
         if not icao or ac.get("lat") is None or ac.get("lon") is None:
             continue
-        cached_l1 = _L1_CACHE.get(_l1_cache_key(ac))
+        cached_l1 = _L1_CACHE.get(_l1_cache_key(ac, now))
         l1_result = None
         if cached_l1 and now - cached_l1[0] <= _L1_CACHE_TTL:
             l1_result = cached_l1[1]
@@ -994,6 +1021,19 @@ async def _publish_alert(ac: Dict[str, Any], anomalies: List[Dict[str, Any]]) ->
             if isinstance(result, BaseException):
                 _ws_clients.discard(ws)
 
+def _deduplicate_track_records(records: List[tuple[str, dict]]) -> List[dict]:
+    """Return one track per ICAO, preferring canonical fused state vectors."""
+    selected: Dict[str, tuple[str, dict]] = {}
+    for namespace, track in records:
+        icao = str(track.get("icao") or "").upper()
+        if not icao:
+            continue
+        existing = selected.get(icao)
+        if existing is None or (namespace == "sv" and existing[0] != "sv"):
+            selected[icao] = (namespace, track)
+    return [record[1] for record in selected.values()]
+
+
 async def broadcast_loop() -> None:
     """Broadcast all aircraft with TDOA validation to WebSocket clients."""
     global _track_snapshot
@@ -1005,29 +1045,33 @@ async def broadcast_loop() -> None:
             fused_keys = await redis_client.keys("sv:*")
 
             all_keys = list(set(keys + fused_keys))
-            tracks = []
+            records: List[tuple[str, dict]] = []
 
             if all_keys:
                 pipe = redis_client.pipeline()
                 for k in all_keys:
                     pipe.get(k)
-                for raw in await pipe.execute():
+                for key, raw in zip(all_keys, await pipe.execute()):
                     if not raw:
                         continue
+                    key_text = key.decode() if isinstance(key, bytes) else str(key)
+                    namespace = key_text.split(":", 1)[0]
                     try:
                         import orjson as _oj
                         ac = _oj.loads(raw)
                         if isinstance(ac, dict) and ac.get("icao"):
-                            tracks.append(ac)
+                            records.append((namespace, ac))
                             continue
                     except Exception:
                         pass
                     try:
                         sv = StateVector.from_bytes(raw)
                         ac = sv.to_api_dict()
-                        tracks.append(ac)
+                        records.append((namespace, ac))
                     except Exception:
                         continue
+
+            tracks = _deduplicate_track_records(records)
 
             area = await load_coverage_area(redis_client)
             tracks = [track for track in tracks if _track_in_coverage(track, area)]
