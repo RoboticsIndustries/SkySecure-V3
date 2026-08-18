@@ -187,6 +187,31 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.layer_evaluations["L4"].status, LayerStatus.TRIGGERED)
         self.assertEqual(result.layer_evaluations["L4"].timestamp, 102.0)
 
+    async def test_slightly_delayed_mlat_can_compare_with_newer_adsb(self):
+        redis = AsyncMock()
+        state = StateVector(
+            icao24="ABC123", last_seen=200.0,
+            source_reports=[SourceReport(
+                source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=200.0
+            )],
+            layer_evaluations={"L4": LayerEvaluation(
+                layer=DetectionLayer.L4, status=LayerStatus.SKIPPED, timestamp=200.0
+            )},
+        )
+        redis.get.return_value = state.to_bytes()
+
+        result = await FusionEngine(redis).process_mlat(RawMLATReport(
+            session_id="late-aligned", solve_time=199.0, icao24="ABC123",
+            lat=40.0, lon=-75.0, altitude_baro=10000,
+            num_receivers=4, tdoa_residual=10.0, cep90=10.0,
+        ))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.last_update_source, DataSource.MLAT)
+        self.assertEqual(result.layer_evaluations["L4"].status, LayerStatus.EVALUATED)
+        self.assertEqual(result.layer_evaluations["L4"].timestamp, 199.0)
+
     async def test_delayed_mlat_cannot_overwrite_newer_l4_lifecycle(self):
         redis = AsyncMock()
         newer_flag = AnomalyFlag(

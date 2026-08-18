@@ -4,6 +4,7 @@ from config import KAFKA_CONSUMER_STABILITY
 from models import (
     AnomalyFlag,
     AnomalyType,
+    DataSource,
     DetectionLayer,
     LayerEvaluation,
     LayerStatus,
@@ -48,6 +49,7 @@ class LayerTelemetryTests(unittest.TestCase):
         )
         state = StateVector(
             icao24="ABC123",
+            last_update_source=DataSource.MLAT,
             anomalies=[flag],
             layer_evaluations={DetectionLayer.L2.value: evaluation},
         )
@@ -56,6 +58,7 @@ class LayerTelemetryTests(unittest.TestCase):
         payload = restored.to_api_dict()
 
         self.assertEqual(restored.anomalies[0].layer, DetectionLayer.L2)
+        self.assertEqual(restored.last_update_source, DataSource.MLAT)
         self.assertEqual(restored.anomalies[0].detector, "velocity_baseline")
         self.assertEqual(payload["layer_evaluations"]["L2"]["status"], "TRIGGERED")
         self.assertEqual(payload["layer_triggers"][0]["layer"], "L2")

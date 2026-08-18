@@ -253,6 +253,9 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
             *[
                 cross_validator.validate_aircraft(
                     ac["icao"], ac["lat"], ac["lon"],
+                    claimed_velocity_kts=ac.get("vel"),
+                    claimed_heading_deg=ac.get("hdg"),
+                    claimed_observed_at=ac.get("ts"),
                     claimed_source=ac.get("src"),
                 )
                 for ac in candidates
@@ -1099,13 +1102,13 @@ def _merge_l1_results(tracks: List[dict], claims: List[dict]) -> None:
             target["band"] = claim.get("band", target.get("band"))
         anomalies = target.setdefault("anoms", [])
         existing_types = {
-            item.get("type") for item in anomalies if isinstance(item, dict)
+            item.get("type") if isinstance(item, dict) else item for item in anomalies
         }
         for item in claim.get("anoms", []):
-            if not isinstance(item, dict) or item.get("type") not in existing_types:
-                anomalies.append(item)
-                if isinstance(item, dict):
-                    existing_types.add(item.get("type"))
+            anomaly_type = item.get("type") if isinstance(item, dict) else item
+            if anomaly_type and anomaly_type not in existing_types:
+                anomalies.append(anomaly_type)
+                existing_types.add(anomaly_type)
 
 
 async def broadcast_loop() -> None:

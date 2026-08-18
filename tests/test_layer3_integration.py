@@ -1,7 +1,7 @@
 import unittest
 
 from anomaly.detector import AnomalyDetector
-from models import StateVector
+from models import DataSource, SourceReport, StateVector
 
 
 class Layer3IntegrationTests(unittest.TestCase):
@@ -30,6 +30,28 @@ class Layer3IntegrationTests(unittest.TestCase):
         self.assertEqual(integrity_flags[0].score_delta, 20)
         self.assertEqual(integrity_flags[0].meta["integrity_score"], 1.0)
         self.assertEqual(result.risk_score, 20)
+
+    def test_mlat_update_does_not_resample_retained_adsb_integrity(self):
+        adsb = StateVector(
+            icao24="ABC123", nic=8, nac_p=10, last_seen=100.0, update_count=1,
+            last_update_source=DataSource.ADSB,
+            source_reports=[SourceReport(
+                source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=100.0
+            )],
+        )
+        self.detector.process(adsb)
+        mlat = StateVector(
+            icao24="ABC123", nic=8, nac_p=10, last_seen=100.0, update_count=2,
+            last_update_source=DataSource.MLAT,
+            source_reports=adsb.source_reports + [SourceReport(
+                source=DataSource.MLAT, lat=40.0, lon=-75.0, timestamp=99.0
+            )],
+        )
+
+        result = self.detector.process(mlat)
+
+        self.assertEqual(len(self.detector.integrity.integrity_history["ABC123"]), 1)
+        self.assertEqual(result.layer_evaluations["L3"].status.value, "SKIPPED")
 
     def test_replayed_event_does_not_grow_canonical_detector_history(self):
         event = StateVector(

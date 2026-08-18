@@ -34,7 +34,7 @@ from models import (
     LayerEvaluation, LayerStatus, RiskBand,
 )
 from config import settings, KAFKA_CONSUMER_STABILITY
-from anomaly.enhanced_detector import EnhancedAnomalyDetector
+from anomaly.enhanced_detector import EnhancedAnomalyDetector, LayerResult
 
 log = logging.getLogger(__name__)
 
@@ -585,6 +585,21 @@ class AnomalyDetector:
                 log.warning("Discarding invalid L2 baseline for %s: %s", icao, exc)
         self._hydrated_l2.add(icao)
 
+    async def hydrate_last_result(self, redis_client, icao: str) -> None:
+        """Restore the last committed enrichment so Kafka replay after restart is inert."""
+        if icao in self._last_results:
+            return
+        raw = await redis_client.get(f"sv:{icao}")
+        if not raw:
+            return
+        try:
+            prior = StateVector.from_bytes(raw)
+            l2 = prior.layer_evaluations.get(DetectionLayer.L2.value)
+            if l2 and "velocity_baseline" in l2.detectors_evaluated:
+                self._last_results[icao] = prior
+        except Exception as exc:
+            log.warning("Discarding invalid prior detector result for %s: %s", icao, exc)
+
     async def persist_l2_baseline(
         self,
         redis_client,
@@ -601,6 +616,19 @@ class AnomalyDetector:
         )
         self._last_l2_persist[icao] = now
 
+    async def persist_event_state(self, redis_client, sv: StateVector) -> None:
+        """Atomically commit replay identity, enrichment, and its L2 baseline."""
+        pipeline = redis_client.pipeline(transaction=True)
+        pipeline.setex(
+            f"baseline:l2:{sv.icao24}", 86_400,
+            orjson.dumps(self.statistical.get_baseline(sv.icao24).to_dict()),
+        )
+        pipeline.setex(
+            f"sv:{sv.icao24}", settings.REDIS_TTL_STATE_VECTOR, sv.to_bytes()
+        )
+        await pipeline.execute()
+        self._last_l2_persist[sv.icao24] = time.monotonic()
+
     def prune_l2_state(self, max_idle_seconds: float = 86_400.0) -> int:
         """Bound process-local detector state; Redis remains the durable copy."""
         cutoff = time.monotonic() - max_idle_seconds
@@ -614,18 +642,24 @@ class AnomalyDetector:
             self._last_l2_persist.pop(icao, None)
             self._last_l2_access.pop(icao, None)
             self._last_results.pop(icao, None)
+            self.integrity.forget(icao)
+            self.lstm._sequences.pop(icao, None)
+            self.scorer._last_scores.pop(icao, None)
         return len(stale)
+
+    def is_replay(self, sv: StateVector) -> bool:
+        prior = self._last_results.get(sv.icao24)
+        return prior is not None and (
+            sv.last_seen, sv.update_count
+        ) <= (
+            prior.last_seen, prior.update_count
+        )
 
     def process(self, sv: StateVector) -> StateVector:
         """Run all detection layers on a state vector, return enriched SV."""
         prior_result = self._last_results.get(sv.icao24)
-        if prior_result is not None and (
-            sv.last_seen,
-            sv.update_count,
-        ) <= (
-            prior_result.last_seen,
-            prior_result.update_count,
-        ):
+        if self.is_replay(sv):
+            assert prior_result is not None
             # Kafka is at-least-once. Return the already enriched result so a
             # replay is side-effect-free and cannot overwrite Redis with an
             # unprocessed or older state vector.
@@ -667,9 +701,19 @@ class AnomalyDetector:
 
         # Canonical L3 combines trajectory behavior with ADS-B integrity
         # metadata when the selected source supplies NIC/NACp.
-        integrity_result = self.integrity.check_integrity(
-            sv.icao24, sv.nic, sv.nac_p, sv.last_seen, sv.update_count
+        is_adsb_integrity_event = (
+            sv.last_update_source == DataSource.ADSB
+            or (sv.last_update_source == DataSource.UNKNOWN and not sv.source_reports)
         )
+        if is_adsb_integrity_event:
+            integrity_result = self.integrity.check_integrity(
+                sv.icao24, sv.nic, sv.nac_p, sv.last_seen, sv.update_count
+            )
+        else:
+            integrity_result = LayerResult(
+                name="l3_integrity", score=0.0, available=False,
+                reason="No new ADS-B integrity observation",
+            )
         integrity_flag = None
         if integrity_result.available and integrity_result.score >= 0.5:
             integrity_flag = AnomalyFlag(
@@ -760,13 +804,13 @@ async def run() -> None:
         async for msg in consumer:
             try:
                 sv = StateVector.from_bytes(msg.value)
+                await detector.hydrate_last_result(redis_client, sv.icao24)
                 await detector.hydrate_l2_baseline(redis_client, sv.icao24)
+                if detector.is_replay(sv):
+                    await consumer.commit()
+                    continue
                 sv = detector.process(sv)
-                await detector.persist_l2_baseline(redis_client, sv.icao24)
-
-                # Write enriched SV back to Redis
-                key = f"sv:{sv.icao24}"
-                await redis_client.setex(key, settings.REDIS_TTL_STATE_VECTOR, sv.to_bytes())
+                await detector.persist_event_state(redis_client, sv)
 
                 # Publish alerts for ALERT/CRITICAL band
                 if sv.risk_band in (RiskBand.ALERT, RiskBand.CRITICAL):

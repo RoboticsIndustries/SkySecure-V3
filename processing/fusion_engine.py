@@ -286,6 +286,7 @@ class FusionEngine:
         if is_current_event:
             sv.confidence = confidence_for_source(DataSource.ADSB)
         sv.last_seen = max(prior_last_seen, msg.recv_time)
+        sv.last_update_source = DataSource.ADSB
         sv.update_count += 1
         if is_current_event:
             sv.add_position_history()
@@ -308,7 +309,11 @@ class FusionEngine:
             + ([current_l4_evaluation.timestamp] if current_l4_evaluation else []),
             default=float("-inf"),
         )
-        if report.solve_time < latest_l4_event:
+        if (
+            report.solve_time < latest_l4_event
+            and latest_l4_event - report.solve_time
+                > settings.FUSION_COMPARISON_WINDOW_SEC
+        ):
             return None
         prior_last_seen = sv.last_seen
         # A new MLAT report supersedes the previous L4 comparison evidence.
@@ -403,6 +408,7 @@ class FusionEngine:
         )[-10:]
         sv.confidence = max(sv.confidence, mlat_conf)
         sv.last_seen = max(prior_last_seen, report.solve_time)
+        sv.last_update_source = DataSource.MLAT
         sv.update_count += 1
         if report.solve_time >= prior_last_seen:
             sv.add_position_history()

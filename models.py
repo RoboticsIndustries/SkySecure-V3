@@ -237,6 +237,7 @@ class StateVector(BaseModel):
 
     # Data provenance
     primary_source: DataSource      = DataSource.UNKNOWN
+    last_update_source: DataSource  = DataSource.UNKNOWN
     sources:        List[DataSource] = []
     source_reports: List[SourceReport] = []
     confidence:     float           = 0.0   # 0.0–1.0

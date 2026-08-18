@@ -75,6 +75,40 @@ class L2OperationalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.layer_evaluations["L3"].status, LayerStatus.SKIPPED)
         self.assertIn("warming up", state.layer_evaluations["L3"].skipped_reason or "")
 
+    async def test_prune_clears_all_per_aircraft_detector_state(self):
+        detector = AnomalyDetector()
+        state = self._state(t=100.0, velocity=400.0, heading=0.0)
+        state.nic, state.nac_p = 8, 10
+        detector.process(state)
+        detector._last_l2_access["ABC123"] = 0.0
+
+        self.assertEqual(detector.prune_l2_state(max_idle_seconds=0), 1)
+
+        self.assertNotIn("ABC123", detector.integrity.integrity_history)
+        self.assertNotIn("ABC123", detector.integrity._integrity_results)
+        self.assertNotIn("ABC123", detector.integrity.previous_states)
+        self.assertNotIn("ABC123", detector.lstm._sequences)
+        self.assertNotIn("ABC123", detector.scorer._last_scores)
+
+    async def test_restart_hydrates_prior_enriched_result_before_replay(self):
+        original = AnomalyDetector().process(
+            self._state(t=100.0, velocity=410.0, heading=20.0)
+        )
+        stored = AircraftBaseline()
+        stored.update(self._state(t=100.0, velocity=410.0, heading=20.0))
+        redis = AsyncMock()
+        redis.get.side_effect = [original.to_bytes(), orjson.dumps(stored.to_dict())]
+        restarted = AnomalyDetector()
+
+        await restarted.hydrate_last_result(redis, "ABC123")
+        await restarted.hydrate_l2_baseline(redis, "ABC123")
+        replay = restarted.process(self._state(t=100.0, velocity=410.0, heading=20.0))
+
+        self.assertEqual(
+            list(restarted.statistical.get_baseline("ABC123").velocities), [410.0]
+        )
+        self.assertEqual(replay.layer_evaluations["L2"].timestamp, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

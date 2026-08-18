@@ -131,7 +131,8 @@ class AdsbLolFallbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         _L1_CACHE.clear()
         records = [
             ("ac", {"icao": "ABC123", "lat": 39.95, "lon": -75.16,
-                    "src": "adsb_lol", "risk": 0, "anoms": []}),
+                    "src": "adsb_lol", "risk": 0, "anoms": [],
+                    "vel": 420.0, "hdg": 90.0, "ts": 1234.5}),
             ("sv", {"icao": "ABC123", "lat": 39.95, "lon": -75.16,
                     "src": "ADSB", "risk": 20, "band": "NORMAL", "anoms": [],
                     "layer_evaluations": {"L3": {"status": "EVALUATED"}}}),
@@ -146,9 +147,13 @@ class AdsbLolFallbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validator.validate_aircraft.await_count, 1)
         self.assertEqual(tracks[0]["l1"]["verdict"], "SPOOFED")
         self.assertEqual(tracks[0]["risk"], 80)
-        self.assertEqual(
-            [a["type"] for a in tracks[0]["anoms"]],
-            ["L1_POSITION_DISAGREEMENT"],
+        self.assertEqual(tracks[0]["anoms"], ["L1_POSITION_DISAGREEMENT"])
+        validator.validate_aircraft.assert_awaited_once_with(
+            "ABC123", 39.95, -75.16,
+            claimed_velocity_kts=420.0,
+            claimed_heading_deg=90.0,
+            claimed_observed_at=1234.5,
+            claimed_source="adsb_lol",
         )
 
     async def test_http_429_fallback_receives_l1_enrichment(self):
