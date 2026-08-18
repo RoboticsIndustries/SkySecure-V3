@@ -416,6 +416,48 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             [flag.detector for flag in result.anomalies],
         )
 
+    async def test_adsb_integrity_advances_against_adsb_time_not_newer_mlat_time(self):
+        state = StateVector(
+            icao24="ABC123",
+            last_seen=200.0,
+            nic=8,
+            nac_p=10,
+            source_reports=[
+                SourceReport(
+                    source=DataSource.ADSB,
+                    lat=40.0,
+                    lon=-75.0,
+                    timestamp=100.0,
+                ),
+                SourceReport(
+                    source=DataSource.MLAT,
+                    lat=40.1,
+                    lon=-75.1,
+                    timestamp=200.0,
+                ),
+            ],
+        )
+        redis = AsyncMock()
+        redis.get.return_value = state.to_bytes()
+        engine = FusionEngine(redis)
+        report = RawADSBMessage(
+            receiver_id="adsb_lol",
+            icao24="ABC123",
+            recv_time=150.0,
+            raw_message="",
+            msg_type=17,
+            lat=40.05,
+            lon=-75.05,
+            nic=2,
+            nac_p=3,
+        )
+
+        result = await engine.process_adsb(report)
+
+        self.assertEqual(result.nic, 2)
+        self.assertEqual(result.nac_p, 3)
+        self.assertEqual(result.last_seen, 200.0)
+
     async def test_current_adsb_report_without_integrity_clears_stale_metadata(self):
         now = time.time()
         existing = StateVector(

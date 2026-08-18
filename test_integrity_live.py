@@ -23,6 +23,47 @@ class LiveIntegrityWiringTests(unittest.TestCase):
         self.assertEqual(aircraft[0]["nic"], 8)
         self.assertEqual(aircraft[0]["nac_p"], 10)
 
+    def test_repeated_snapshot_timestamp_does_not_grow_detector_history(self):
+        api.anomaly_detector = EnhancedAnomalyDetector()
+        aircraft = {
+            "icao": "ABC123", "lat": 39.95, "lon": -75.16,
+            "alt": 12000, "vel": 400, "hdg": 90,
+            "nic": 8, "nac_p": 10, "ts": 100.0,
+            "risk": 0, "band": "NORMAL", "anoms": [],
+        }
+
+        api.run_l2_l3_detection([aircraft])
+        api.run_l2_l3_detection([aircraft])
+
+        self.assertEqual(len(api.anomaly_detector.integrity_history["ABC123"]), 1)
+        self.assertEqual(api.anomaly_detector.previous_states["ABC123"]["t"], 100.0)
+
+    def test_canonical_snapshot_is_not_resampled_by_api_detector(self):
+        api.anomaly_detector = EnhancedAnomalyDetector()
+        aircraft = {
+            "icao": "ABC123", "lat": 39.95, "lon": -75.16,
+            "nic": 8, "nac_p": 10, "ts": 100.0,
+            "layer_evaluations": {"L3": {"status": "EVALUATED"}},
+            "risk": 0, "band": "NORMAL", "anoms": [],
+        }
+
+        api.run_l2_l3_detection([aircraft])
+
+        self.assertNotIn("ABC123", api.anomaly_detector.integrity_history)
+        self.assertNotIn("fused", aircraft)
+
+    def test_layer_notes_match_canonical_l4_l5_taxonomy(self):
+        detector = EnhancedAnomalyDetector()
+        assessment = detector.assess(
+            icao="ABC123", lat=39.95, lon=-75.16, velocity=400,
+            observed_at=100.0,
+        )
+
+        notes = " ".join(assessment.notes)
+        self.assertNotIn("RF fingerprinting", notes)
+        self.assertNotIn("Galileo OSNMA", notes)
+        self.assertIn("upstream canonical pipeline", notes)
+
     def test_live_detection_receives_and_flags_integrity_degradation(self):
         api.anomaly_detector = EnhancedAnomalyDetector()
         stable = {

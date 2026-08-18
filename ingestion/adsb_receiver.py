@@ -192,6 +192,7 @@ async def run() -> None:
                             "vr":   int(float(s[11]) * 196.85) if s[11] else None,
                             "gnd":  bool(s[8]) if s[8] is not None else False,
                             "nic": nic, "nac_p": nac_p,
+                            "ts": recv_t,
                             "src":  source,
                             "risk": 0, "anoms": [], "cls": "CIVILIAN",
                             "conf": 0.85, "mil": 0.0, "band": "NORMAL", "trail": [],

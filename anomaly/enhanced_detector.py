@@ -9,8 +9,8 @@ LAYER NUMBERING (authoritative — matches README and the JSHS paper):
     L1  Multi-source position cross-validation   processing/cross_source_validator.py
     L2  Kinematic anomaly detection              THIS FILE
     L3  NIC/NACp integrity clustering            THIS FILE
-    L4  RF fingerprinting                        not implemented (hardware-gated)
-    L5  Galileo OSNMA                            not implemented
+    L4  Multi-sensor fusion                      processing/fusion_engine.py
+    L5  Identity and threat intelligence         upstream canonical pipeline
 
 An earlier version of this file used its own conflicting internal numbering
 (physics=L1, behavioral=L2, integrity=L3, TDOA=L4, ensemble=L5). That is gone.
@@ -167,6 +167,7 @@ class EnhancedAnomalyDetector:
     def __init__(self, history_len: int = 20):
         self.previous_states: Dict[str, dict] = {}
         self.integrity_history: Dict[str, List[tuple]] = {}
+        self._integrity_results: Dict[str, tuple[tuple[float, int], LayerResult]] = {}
         self.history_len = history_len
 
     # ── L2: Kinematic ────────────────────────────────────────────────────────
@@ -182,6 +183,7 @@ class EnhancedAnomalyDetector:
         vertical_rate: Optional[float],
         heading: Optional[float],
         observed_at: Optional[float] = None,
+        observation_sequence: int = 0,
     ) -> LayerResult:
         """
         L2 — kinematic plausibility.
@@ -225,7 +227,10 @@ class EnhancedAnomalyDetector:
 
         # (b) Differential checks against previous state.
         prev = self.previous_states.get(icao)
-        if prev is not None:
+        event_order = (now, observation_sequence)
+        if prev is not None and event_order > (
+            float(prev["t"]), int(prev.get("seq", 0))
+        ):
             dt = now - prev["t"]
             if MIN_DT_S <= dt <= MAX_DT_S:
                 dist_m = haversine_m(prev["lat"], prev["lon"], lat, lon)
@@ -253,11 +258,14 @@ class EnhancedAnomalyDetector:
                     if s_turn > 0:
                         drivers.append(f"turn rate {turn_rate:.1f}deg/s")
 
-        # Record state for next differential pass regardless of outcome.
-        self.previous_states[icao] = {
-            "lat": lat, "lon": lon, "hdg": heading,
-            "vel": velocity, "t": now,
-        }
+        # Replayed or delayed snapshots must not move detector state backward.
+        if prev is None or event_order > (
+            float(prev["t"]), int(prev.get("seq", 0))
+        ):
+            self.previous_states[icao] = {
+                "lat": lat, "lon": lon, "hdg": heading,
+                "vel": velocity, "t": now, "seq": observation_sequence,
+            }
 
         component_scores = [
             v for k, v in detail.items()
@@ -285,6 +293,8 @@ class EnhancedAnomalyDetector:
         icao: str,
         nic: Optional[int],
         nac_p: Optional[int],
+        observed_at: Optional[float] = None,
+        observation_sequence: int = 0,
     ) -> LayerResult:
         """
         L3 — NIC/NACp integrity clustering.
@@ -300,11 +310,19 @@ class EnhancedAnomalyDetector:
         do, so populating L3 on the live path means sourcing metadata from the
         L1 fetch rather than from OpenSky.
         """
+        now = observed_at if observed_at is not None else time.time()
+        event_order = (now, observation_sequence)
+        prior = self._integrity_results.get(icao)
+        if prior is not None and event_order <= prior[0]:
+            return prior[1]
+
         if nic is None and nac_p is None:
-            return LayerResult(
+            result = LayerResult(
                 name="l3_integrity", score=0.0, available=False,
                 reason="no NIC/NACp in feed (OpenSky /states/all omits these)",
             )
+            self._integrity_results[icao] = (event_order, result)
+            return result
 
         history = self.integrity_history.setdefault(icao, [])
         history.append((nic, nac_p))
@@ -344,10 +362,12 @@ class EnhancedAnomalyDetector:
             reason = f"integrity anomaly (NIC={nic}, NACp={nac_p})"
         else:
             reason = f"integrity nominal (NIC={nic}, NACp={nac_p})"
-        return LayerResult(
+        result = LayerResult(
             name="l3_integrity", score=score, available=True,
             reason=reason, detail=detail,
         )
+        self._integrity_results[icao] = (event_order, result)
+        return result
 
     # ── L1 adapter ───────────────────────────────────────────────────────────
 
@@ -409,6 +429,7 @@ class EnhancedAnomalyDetector:
         nac_p: Optional[int] = None,
         l1_result: Optional[dict] = None,
         observed_at: Optional[float] = None,
+        observation_sequence: int = 0,
     ) -> FusedAssessment:
         """
         Run L2 and L3, fold in L1, and produce a single fused assessment.
@@ -424,8 +445,11 @@ class EnhancedAnomalyDetector:
             "l2_kinematic": self.check_kinematics(
                 icao, lat, lon, alt_baro, alt_geo,
                 velocity, vertical_rate, heading, observed_at,
+                observation_sequence,
             ),
-            "l3_integrity": self.check_integrity(icao, nic, nac_p),
+            "l3_integrity": self.check_integrity(
+                icao, nic, nac_p, observed_at, observation_sequence
+            ),
         }
 
         notes: List[str] = []
@@ -463,7 +487,7 @@ class EnhancedAnomalyDetector:
         missing = [k for k, v in layers.items() if not v.available]
         if missing:
             notes.append("unavailable layers: " + ", ".join(missing))
-        notes.append("L4 (RF fingerprinting) and L5 (Galileo OSNMA) are not implemented")
+        notes.append("L4/L5 are evaluated by the upstream canonical pipeline, not this L1-L3 detector")
 
         if overall < 0.30:
             threat = "LOW"

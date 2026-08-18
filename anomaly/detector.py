@@ -570,6 +570,7 @@ class AnomalyDetector:
         self._hydrated_l2: set[str] = set()
         self._last_l2_persist: Dict[str, float] = {}
         self._last_l2_access: Dict[str, float] = {}
+        self._last_results: Dict[str, StateVector] = {}
 
     async def hydrate_l2_baseline(self, redis_client, icao: str) -> None:
         """Load a baseline once per process so detector state survives restarts."""
@@ -612,10 +613,24 @@ class AnomalyDetector:
             self._hydrated_l2.discard(icao)
             self._last_l2_persist.pop(icao, None)
             self._last_l2_access.pop(icao, None)
+            self._last_results.pop(icao, None)
         return len(stale)
 
     def process(self, sv: StateVector) -> StateVector:
         """Run all detection layers on a state vector, return enriched SV."""
+        prior_result = self._last_results.get(sv.icao24)
+        if prior_result is not None and (
+            sv.last_seen,
+            sv.update_count,
+        ) <= (
+            prior_result.last_seen,
+            prior_result.update_count,
+        ):
+            # Kafka is at-least-once. Return the already enriched result so a
+            # replay is side-effect-free and cannot overwrite Redis with an
+            # unprocessed or older state vector.
+            return StateVector.from_bytes(prior_result.to_bytes())
+
         all_flags: List[AnomalyFlag] = []
         # Replace prior detector-owned L2/L3 output while preserving fresh
         # upstream fusion/identity evidence and the fusion-owned L2 conflict.
@@ -653,7 +668,7 @@ class AnomalyDetector:
         # Canonical L3 combines trajectory behavior with ADS-B integrity
         # metadata when the selected source supplies NIC/NACp.
         integrity_result = self.integrity.check_integrity(
-            sv.icao24, sv.nic, sv.nac_p
+            sv.icao24, sv.nic, sv.nac_p, sv.last_seen, sv.update_count
         )
         integrity_flag = None
         if integrity_result.available and integrity_result.score >= 0.5:
@@ -707,6 +722,8 @@ class AnomalyDetector:
         # Compute risk score from every layer that triggered this update.
         sv.risk_score = self.scorer.compute(sv, sv.anomalies)
         sv.update_risk_band()
+
+        self._last_results[sv.icao24] = StateVector.from_bytes(sv.to_bytes())
 
         return sv
 

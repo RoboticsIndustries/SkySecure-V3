@@ -113,6 +113,7 @@ HEADERS = {
 def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
     """Normalize an adsb.lol point-feed response to the public API shape."""
     aircraft = []
+    received_at = time.time()
     for raw in data.get("ac") or []:
         icao = str(raw.get("hex") or "").upper().lstrip("~")
         lat, lon = raw.get("lat"), raw.get("lon")
@@ -144,6 +145,7 @@ def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
             "vr": number(raw.get("baro_rate"), integer=True),
             "nic": number(raw.get("nic"), integer=True),
             "nac_p": number(raw.get("nac_p"), integer=True),
+            "ts": received_at,
             "gnd": raw.get("alt_baro") == "ground",
             "src": "adsb_lol",
             "risk": 0,
@@ -292,10 +294,20 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
         icao = ac.get("icao")
         if not icao or ac.get("lat") is None or ac.get("lon") is None:
             continue
+        # Canonical state vectors already carry L2/L3 output from the anomaly
+        # service. Re-sampling them in every WebSocket snapshot would distort
+        # stateful histories; only raw live-feed records are assessed here.
+        if ac.get("layer_evaluations"):
+            continue
         cached_l1 = _L1_CACHE.get(_l1_cache_key(ac, now))
         l1_result = None
         if cached_l1 and now - cached_l1[0] <= _L1_CACHE_TTL:
             l1_result = cached_l1[1]
+        observed_at = ac.get("last_seen", ac.get("obs_ts", ac.get("ts", now)))
+        try:
+            observed_at = float(observed_at)
+        except (TypeError, ValueError):
+            observed_at = now
         try:
             assessment = anomaly_detector.assess(
                 icao=icao, lat=ac["lat"], lon=ac["lon"],
@@ -303,7 +315,8 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
                 velocity=ac.get("vel"), vertical_rate=ac.get("vr"),
                 heading=ac.get("hdg"), nic=ac.get("nic"),
                 nac_p=ac.get("nac_p"), l1_result=l1_result,
-                observed_at=now,
+                observed_at=observed_at,
+                observation_sequence=int(ac.get("update_count") or 0),
             )
         except Exception as exc:
             log.warning("L2/L3 assessment failed for %s: %s", icao, exc)
@@ -450,6 +463,7 @@ async def _fetch_live_aircraft(area: Optional[CoverageArea] = None) -> List[dict
                 "hdg":  float(s[10]) if s[10] else None,
                 "vr":   int(float(s[11]) * 196.85) if s[11] else None,
                 "gnd":  bool(s[8]), "src": "opensky",
+                "ts": float(s[4] or s[3] or time.time()),
                 "risk": 0, "anoms": [], "cls": "CIVILIAN",
                 "conf": 0.85, "mil": 0.0, "band": "NORMAL", "trail": [],
             }

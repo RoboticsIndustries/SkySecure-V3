@@ -324,5 +324,6 @@ class StateVector(BaseModel):
                 for key, value in self.layer_evaluations.items()
             },
             "ts":       self.last_seen,
+            "update_count": self.update_count,
             "trail":    self.position_history[-20:],  # last 20 for trail
         }

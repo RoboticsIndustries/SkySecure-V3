@@ -154,10 +154,17 @@ class FusionEngine:
             key=lambda report: report.timestamp,
             default=None,
         )
-        if latest_adsb is not None and msg.recv_time < latest_adsb.timestamp:
+        if latest_adsb is not None and msg.recv_time <= latest_adsb.timestamp:
             return None
         prior_last_seen = sv.last_seen
         is_current_event = msg.recv_time >= prior_last_seen
+        # ADS-B-owned metadata must advance against the latest ADS-B report,
+        # not against a newer unrelated MLAT event that moved global last_seen.
+        is_current_adsb_event = (
+            latest_adsb is None and is_current_event
+        ) or (
+            latest_adsb is not None and msg.recv_time > latest_adsb.timestamp
+        )
 
         # ADS-B processing owns these current-cycle checks; replace their prior
         # evidence rather than accumulating stale duplicate/conflict flags.
@@ -258,7 +265,7 @@ class FusionEngine:
         # Integrity metadata belongs to the current ADS-B report.  A current
         # source that omits NIC/NACp means "unavailable now", not "reuse an old
         # value".  Delayed reports must not clear newer metadata.
-        if is_current_event:
+        if is_current_adsb_event:
             sv.nic = msg.nic
             sv.nac_p = msg.nac_p
         if is_current_event and msg.callsign:
@@ -555,7 +562,13 @@ class DuplicateICAODetector:
             dist = haversine_nm(prev["lat"], prev["lon"], lat, lon)
             event_delta = event_time - float(prev.get("timestamp", event_time))
 
-            if 0 <= event_delta <= 10 and dist > settings.DUPLICATE_WINDOW_NM:
+            # Never let delayed delivery roll the detector's comparison point
+            # backward; doing so can make the next current report look like a
+            # geographically impossible duplicate.
+            if event_delta < 0:
+                return None
+
+            if event_delta <= 10 and dist > settings.DUPLICATE_WINDOW_NM:
                 return AnomalyFlag(
                     anomaly_type=AnomalyType.DUPLICATE_ICAO,
                     layer=DetectionLayer.L5,
