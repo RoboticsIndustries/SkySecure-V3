@@ -34,6 +34,7 @@ from models import (
     LayerEvaluation, LayerStatus, RiskBand,
 )
 from config import settings, KAFKA_CONSUMER_STABILITY
+from anomaly.enhanced_detector import EnhancedAnomalyDetector
 
 log = logging.getLogger(__name__)
 
@@ -563,6 +564,7 @@ class AnomalyDetector:
     def __init__(self) -> None:
         self.rule_engine  = RuleEngine()
         self.statistical  = StatisticalDetector()
+        self.integrity    = EnhancedAnomalyDetector()
         self.lstm         = LSTMTrajectoryPredictor()
         self.scorer       = ThreatScorer()
         self._hydrated_l2: set[str] = set()
@@ -648,7 +650,29 @@ class AnomalyDetector:
             timestamp=sv.last_seen,
         )
 
-        # Layer 3: LSTM
+        # Canonical L3 combines trajectory behavior with ADS-B integrity
+        # metadata when the selected source supplies NIC/NACp.
+        integrity_result = self.integrity.check_integrity(
+            sv.icao24, sv.nic, sv.nac_p
+        )
+        integrity_flag = None
+        if integrity_result.available and integrity_result.score >= 0.5:
+            integrity_flag = AnomalyFlag(
+                anomaly_type=AnomalyType.INTEGRITY_DEGRADATION,
+                layer=DetectionLayer.L3,
+                detector="integrity_metadata",
+                score_delta=min(20, round(integrity_result.score * 20)),
+                description=integrity_result.reason,
+                meta={
+                    "integrity_score": round(integrity_result.score, 3),
+                    "nic": sv.nic,
+                    "nac_p": sv.nac_p,
+                },
+                timestamp=sv.last_seen,
+            )
+            all_flags.append(integrity_flag)
+
+        # Layer 3: trajectory predictor
         lstm_flag = self.lstm.update_and_check(sv)
         trajectory_detector = "trajectory_lstm" if self.lstm._model_loaded else "trajectory_heuristic"
         sequence_ready = len(self.lstm._sequences.get(sv.icao24, ())) >= self.lstm.SEQ_LEN + 1
@@ -657,16 +681,22 @@ class AnomalyDetector:
             lstm_flag.detector = trajectory_detector
             lstm_flag.timestamp = sv.last_seen
             all_flags.append(lstm_flag)
+        l3_flags = [flag for flag in (integrity_flag, lstm_flag) if flag]
+        l3_detectors = []
+        if integrity_result.available:
+            l3_detectors.append("integrity_metadata")
+        if sequence_ready:
+            l3_detectors.append(trajectory_detector)
         sv.layer_evaluations[DetectionLayer.L3.value] = LayerEvaluation(
             layer=DetectionLayer.L3,
-            status=(LayerStatus.TRIGGERED if lstm_flag else
-                    LayerStatus.EVALUATED if sequence_ready else LayerStatus.SKIPPED),
-            detectors_evaluated=[trajectory_detector] if sequence_ready else [],
-            triggered_detectors=[lstm_flag.detector] if lstm_flag else [],
-            score_delta=lstm_flag.score_delta if lstm_flag else 0,
-            skipped_reason=None if sequence_ready else (
+            status=(LayerStatus.TRIGGERED if l3_flags else
+                    LayerStatus.EVALUATED if l3_detectors else LayerStatus.SKIPPED),
+            detectors_evaluated=l3_detectors,
+            triggered_detectors=[flag.detector for flag in l3_flags],
+            score_delta=sum(flag.score_delta for flag in l3_flags),
+            skipped_reason=None if l3_detectors else (
                 f"Trajectory history warming up ({len(self.lstm._sequences.get(sv.icao24, ()))}/"
-                f"{self.lstm.SEQ_LEN + 1} samples)"
+                f"{self.lstm.SEQ_LEN + 1} samples); no NIC/NACp metadata"
             ),
             timestamp=sv.last_seen,
         )
