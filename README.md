@@ -1,124 +1,107 @@
-# SkySecure v2
+# SkySecure V3
 
-**ADS-B Aviation Cybersecurity Platform — Spoofing Detection & Signal Authentication**
+Real-time ADS-B security research platform for canonical L1-L5 detection telemetry, replay, fusion, and operator visibility.
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-Backend-green?logo=fastapi)](https://fastapi.tiangolo.com)
-[![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active%20Development-orange)]()
+> Research status: the current public-feed deployment is an engineering prototype. It does not claim scientifically validated detection or false-positive rates, physical receiver TDOA, a trained production LSTM, or raw Mode-S irregularity detection.
 
----
+## Detection layers
 
-## Overview
-
-SkySecure v2 is a modular aviation cybersecurity platform targeting the growing threat of ADS-B signal spoofing. ADS-B (Automatic Dependent Surveillance–Broadcast) is the backbone of modern air traffic surveillance — but it transmits unauthenticated, unencrypted signals that any low-cost SDR can forge. SkySecure addresses this gap with a layered, real-time detection stack built on passive signal analysis.
-
-The platform is validated against live aircraft data from OpenSky Network and designed to scale from a research prototype to a multi-receiver hardware deployment.
-
----
-
-## Key Features
-
-- **TDOA Spoofing Detection** — Time Difference of Arrival analysis flags position inconsistencies across receivers that a spoofed signal cannot physically satisfy
-- **Simulation Environment** — Fully configurable spoofing and legitimate flight simulations for offline testing and algorithm development
-- **FastAPI Backend** — Clean REST API exposing detection results, aircraft state, and alert streams
-- **OpenSky Integration** — Live validation against real ADS-B traffic from the OpenSky Network
-- **Modular Architecture** — Detection layers are independently versioned and pluggable; the platform is built to expand
-
----
-
-## Detection Roadmap
-
-| Layer | Method | Status |
+| Layer | Purpose | Current implementation |
 |---|---|---|
-| v1 | TDOA Position Consistency | ✅ Complete |
-| v2 | ACARS Message Anomaly Detection | 🔧 In Development (Target: Aug 2026) |
-| v3 | ML-Based Trajectory Fingerprinting | 📋 Planned |
-| v4 | Multi-Receiver Sensor Fusion | 📋 Planned |
+| L1 | Position and source validation | Cross-validates independent public ADS-B aggregators. Aggregator agreement is not physical receiver TDOA. |
+| L2 | Kinematic and behavioral detection | Timestamp-aware acceleration, turn rate, vertical rate, ADS-B position conflict, and Redis-backed statistical baselines. |
+| L3 | Trajectory fingerprinting | Explicitly reports either a loaded trained model or the current heuristic fallback, with warm-up `SKIPPED` telemetry. |
+| L4 | Multi-sensor fusion | Event-time-aligned ADS-B/MLAT comparison when measurements fall within the configured window. ADS-B-only tracks are `SKIPPED`. |
+| L5 | Identity and threat intelligence | Duplicate-ICAO and identity evidence with non-ratcheting active-evidence scoring. |
 
----
+See `docs/detection-layers.md` for the telemetry contract, lifecycle semantics, and limitations.
 
 ## Architecture
 
-```
-SkySecure-v2/
-├── api/                   # FastAPI application & route handlers
-│   └── main.py
-├── detection/             # Detection layer modules
-│   ├── tdoa.py            # TDOA spoofing detection (v1)
-│   └── acars.py           # ACARS anomaly detection (v2, WIP)
-├── simulation/            # Spoofing + legitimate flight simulators
-│   ├── spoof_sim.py
-│   └── flight_sim.py
-├── data/                  # OpenSky integration & data pipeline
-│   └── opensky_feed.py
-├── tests/                 # Unit and integration tests
-└── README.md
+```text
+public ADS-B feeds ──> adsb-ingestor ──> Kafka raw.adsb
+                                          ├─> fusion-engine ──> Kafka fused.tracks
+physical receivers* ─> mlat-solver ───────┘                       │
+                                                                  v
+                                                        anomaly-detector
+                                                                  │
+                                                     Redis/PostgreSQL/Kafka
+                                                                  │
+                                                      FastAPI + dashboard
 ```
 
----
+`*` Physical synchronized receiver inputs are not part of the current public-feed deployment.
 
-## Quickstart
+Core services:
 
-### Prerequisites
+- Kafka and ZooKeeper for event transport.
+- Redis for live enriched state, fusion-owned source state, MLAT accumulator state, and L2 baselines.
+- PostgreSQL/PostGIS for track persistence.
+- FastAPI for health, aircraft, layer-summary, trigger, alert, and WebSocket APIs.
+- A static dashboard for map and L1-L5 telemetry views.
 
-- Python 3.10+
-- An OpenSky Network account (free) for live data feeds
+## Quick start
 
-### Installation
+Prerequisites:
+
+- Docker with Compose support.
+- An `.env` based on `.env.example`.
 
 ```bash
-git clone https://github.com/RoboticsIndustries/SkySecure-v2.git
-cd SkySecure-v2
-pip install -r requirements.txt
+cp .env.example .env
+# Fill in the required local values without committing secrets.
+docker compose up -d --build
 ```
 
-### Run the API
+Open:
+
+- Dashboard: `http://localhost:3000`
+- API docs: `http://localhost:8000/docs`
+- Health: `http://localhost:8000/healthz`
+
+### Change live coverage
+
+The dashboard's **Live Coverage** row can switch the running feed without a restart:
+
+- Choose one of the listed airports, then select **Monitor area**.
+- Or pan the map, select **Use map center**, choose a radius, and select **Monitor area**.
+- Radius is limited to 1–250 nautical miles by the current public point-feed provider.
+
+The selection is stored in Redis and is shared immediately by the API and ADS-B ingestor. Environment values in `.env` remain the fallback defaults after a fresh Redis deployment.
+
+The mutable API is intentionally bound to loopback by Compose and rate-limited. Put authentication in front of the API before exposing it beyond the host.
+
+Check the stack:
 
 ```bash
-uvicorn api.main:app --reload
+docker compose ps -a
+docker compose logs --since=5m api anomaly-detector fusion-engine mlat-solver
 ```
 
-The API will be available at `http://localhost:8000`. Interactive docs at `/docs`.
+## Verification
 
-### Run Simulations
+The repository test environment must contain the dependencies in `requirements.txt` plus `pytest`.
 
 ```bash
-# Simulate a spoofing scenario
-python simulation/spoof_sim.py
-
-# Simulate legitimate traffic
-python simulation/flight_sim.py
+python -m pytest -q
+python -m compileall -q api anomaly processing ingestion config.py coverage_area.py models.py
+cd frontend && npm run build
+cd .. && git diff --check
+docker compose config --quiet
 ```
 
----
+Deterministic replay and integration tests cover canonical telemetry, timestamp-aware L2 behavior, event-aligned L4 comparisons, stale-evidence lifecycle, upstream evidence preservation, persistent baselines, scoring stability, Kafka delivery ordering, and MLAT accumulator restoration.
 
-## Live Validation
+## Important limitations
 
-SkySecure v2 has been validated against real OpenSky Network aircraft data. The TDOA detection layer runs against live ADS-B feeds and flags statistically anomalous position reports in real time. Production metrics and detection performance benchmarks are documented in [`/results`](results/).
-
----
-
-## Why ADS-B Security Matters
-
-ADS-B mandates took effect in the US (2020) and are rolling out globally. Every commercial and private aircraft now broadcasts position, altitude, velocity, and identity — unencrypted and unauthenticated — on 1090 MHz. Spoofed ADS-B signals have been demonstrated in conflict zones (Ukraine, GPS jamming corridors near Iran/Iraq) and at civilian airports. Today there is no deployed, real-time system to detect these attacks at the receiver level.
-
-SkySecure is designed to be that system.
-
----
-
-
-## Contributing
-
-This project is in active research and development. If you're working on ADS-B security, SDR signal processing, or aviation cybersecurity and want to collaborate, open an issue or reach out directly.
-
-
----
+- Public aggregator cross-validation is not physical TDOA.
+- Aggregator feed disappearance is not evidence that an aircraft transponder stopped transmitting.
+- Physical transponder-loss evidence requires identified direct-receiver provenance.
+- L3 is a heuristic unless a trained and validated model is explicitly loaded.
+- Aggregated feeds do not currently supply raw Mode-S frames for raw-message irregularity checks.
+- Synthetic replay validates engineering behavior, not real-world accuracy.
+- Scientific performance claims require labeled real-world datasets and documented methodology.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-*Built by Aryan — CAP Chief Master Sergeant, Brandywine Cadet Squadron | JSHS 2026 Competitor*
+MIT License — see `LICENSE`.

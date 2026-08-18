@@ -10,21 +10,34 @@ transmission at each site. Without that hardware, there is no legitimate way
 to produce real TDOA — any "receive_times" dict is fabricated.
 
 What this module does instead, using only data you can pull right now:
-compares the SAME aircraft's position as independently computed by separate
-live ADS-B aggregator networks (OpenSky, adsb.lol, adsb.fi). Each network
-runs its own receivers and its own MLAT solver, so their position estimates
-are independent measurements of the same physical aircraft. Real disagreement
-between them — beyond what normal reporting latency/interpolation explains —
-is a genuine anomaly signal computed from live data.
+compares the SAME aircraft's position as reported by separate live ADS-B
+aggregators (OpenSky, adsb.lol, adsb.fi), and compares those reports against
+the supplied claimed position. These aggregators are separate delivery
+paths, but their coordinates may originate from the same aircraft broadcast;
+agreement is corroboration, not an independent physical measurement. A
+disagreement beyond normal latency/interpolation is an anomaly signal, not
+proof of spoofing.
 
-This is NOT TDOA. It has coarser resolution (positions are already fused by
-each network, not raw timing) and fewer independent "baselines" (2-3 networks
-vs 4+ receivers). Label it as such in any paper or pitch: "L1 — Multi-Source
-Position Cross-Validation (TDOA-equivalent; upgrades to true TDOA pending
-receiver hardware, see L4)".
+FIX (see CHANGELOG below): earlier versions only compared independent
+networks against EACH OTHER, never against the claimed position itself. That
+meant a spoofed self-report landing within the point APIs' search radius of
+the real aircraft would be invisible — the independent networks would just
+report the REAL position, agree with each other, and the spoof would pass as
+LEGITIMATE. The claimed position is now included as its own comparison point
+in every validation.
+
+This is NOT TDOA and is not TDOA-equivalent. Positions are already processed
+by third parties and source provenance is incomplete. Label it as "L1 —
+Multi-Aggregator Position Corroboration" until receiver hardware provides
+genuine raw-arrival-time measurements.
 
 When receivers exist: point processing/mlat_solver.py at real Beast-format
 feeds from your own RTL-SDR sites and retire this module for genuine TDOA.
+
+CHANGELOG:
+  - Added claimed_lat/claimed_lon as an explicit comparison point in
+    validate_reports(), not just a search center for the point APIs.
+    This is what actually lets L1 catch a spoofed self-report.
 """
 
 from __future__ import annotations
@@ -42,8 +55,8 @@ logger = logging.getLogger(__name__)
 
 EARTH_RADIUS_M = 6371000.0
 
-# Independent live networks. Each has its own receiver network + MLAT solver,
-# so they are genuinely independent measurements — not the same data twice.
+# Separate live aggregators. They are not assumed to be independent physical
+# measurements because they may redistribute the same ADS-B position report.
 SOURCES = {
     "opensky": {
         "url": "https://opensky-network.org/api/states/all",
@@ -93,10 +106,17 @@ class SourceReport:
     def project_to(self, t: float) -> "SourceReport":
         """Dead-reckon this report forward/backward to time t using its own
         velocity/heading, so two reports from different poll times can be
-        compared at a common instant. Straight-line approximation — fine
-        for the few seconds of typical cross-network skew, not for minutes."""
+        compared at a common instant. Straight-line approximation — accurate
+        for steady cruise over a couple of minutes, degrades for aircraft
+        that turn/climb/descend significantly within the window. Cutoff is
+        180s: below this, constant-heading dead-reckoning error stays small
+        relative to the 1500m/5000m disagreement thresholds; above it, we
+        give up on projecting rather than compound approximation error onto
+        a real trajectory change. (Was 30s originally, which was too tight —
+        it caused genuine straight-line motion during ordinary API round-trip
+        delay to read as false disagreement for later aircraft in a batch.)"""
         dt = t - self.observed_at
-        if self.velocity_kts is None or self.heading_deg is None or abs(dt) > 30:
+        if self.velocity_kts is None or self.heading_deg is None or abs(dt) > 180:
             return self
         speed_mps = self.velocity_kts * 0.514444
         dist_m = speed_mps * dt
@@ -145,8 +165,9 @@ class CrossValidationResult:
 
 class CrossSourceValidator:
     """
-    Pulls the same aircraft from independent live ADS-B networks and
-    cross-checks position agreement. Real data only — no fabricated
+    Pulls the same aircraft from separate live ADS-B aggregators and
+    cross-checks position agreement — against each other AND against the
+    aircraft's own claimed position. Real data only — no fabricated
     receive_times, no synthetic receivers.
     """
 
@@ -197,7 +218,13 @@ class CrossSourceValidator:
 
     async def _fetch_point_source(self, name: str, icao: str, near_lat: float, near_lon: float) -> Optional[SourceReport]:
         """adsb.lol / adsb.fi are point+radius APIs, not lookup-by-icao,
-        so we query around the aircraft's last known position and filter."""
+        so we query around the aircraft's last known/claimed position and
+        filter by ICAO. NOTE: because this radius is large (250nm/~463km),
+        a moderately-offset spoofed claim can still land within radius of
+        the REAL aircraft, so this source will report the real position
+        regardless of how far off the claim is. That's exactly why the
+        claimed position must ALSO be compared directly in
+        validate_reports() below, not just used to center this query."""
         try:
             url = SOURCES[name]["url"].format(lat=near_lat, lon=near_lon)
             async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -225,30 +252,93 @@ class CrossSourceValidator:
             logger.warning(f"{name} fetch failed for {icao}: {e}")
             return None
 
-    async def gather_reports(self, icao: str, approx_lat: float, approx_lon: float) -> List[SourceReport]:
-        """Query all independent networks concurrently for one aircraft."""
-        tasks = [
-            self._fetch_opensky(icao),
-            self._fetch_point_source("adsb_lol", icao, approx_lat, approx_lon),
-            self._fetch_point_source("adsb_fi", icao, approx_lat, approx_lon),
-        ]
+    async def gather_reports(
+        self, icao: str, approx_lat: float, approx_lon: float,
+        excluded_sources: Optional[set[str]] = None,
+    ) -> List[SourceReport]:
+        """Query all configured aggregators concurrently for one aircraft."""
+        excluded = excluded_sources or set()
+        tasks = []
+        if "opensky" not in excluded:
+            tasks.append(self._fetch_opensky(icao))
+        for source in ("adsb_lol", "adsb_fi"):
+            if source not in excluded:
+                tasks.append(self._fetch_point_source(source, icao, approx_lat, approx_lon))
         results = await asyncio.gather(*tasks, return_exceptions=False)
         return [r for r in results if r is not None]
 
     # ── Validation ────────────────────────────────────────────────────
 
-    def validate_reports(self, icao: str, reports: List[SourceReport]) -> CrossValidationResult:
-        if len(reports) < 2:
+    def validate_reports(
+        self, icao: str, reports: List[SourceReport],
+        claimed_lat: Optional[float] = None, claimed_lon: Optional[float] = None,
+        claimed_velocity_kts: Optional[float] = None, claimed_heading_deg: Optional[float] = None,
+        claimed_observed_at: Optional[float] = None,
+    ) -> CrossValidationResult:
+        # Without an explicit claim, at least two network reports are required
+        # for a real comparison. A single report has no pairwise evidence and
+        # must never become LEGITIMATE merely because disagreement defaults to 0.
+        has_claim = claimed_lat is not None and claimed_lon is not None
+        if len(reports) < 2 and not has_claim:
             return CrossValidationResult(
-                icao=icao, is_valid=True, max_disagreement_m=0.0, confidence=0.0,
+                icao=icao, is_valid=False, max_disagreement_m=0.0, confidence=0.0,
                 sources_used=[r.source for r in reports],
                 verdict="INSUFFICIENT_SOURCES",
             )
 
-        # Project every report to the most recent observed_at so we're
-        # comparing positions at a common instant, not raw poll-time snapshots.
+        # A single distinct aggregator report is still comparable against
+        # the claim (or, with 2+, against each other) — previously this bailed
+        # out to INSUFFICIENT_SOURCES with only 1 source, which meant a claim
+        # never got checked at all if OpenSky/adsb.lol/adsb.fi were rate-limited
+        # down to a single responder. One distinct source
+        # vs. a claimed position is exactly the "does self-report match reality"
+        # check L1 exists for, just lower-confidence than 2+ agreeing sources.
+        if not reports:
+            # No distinct aggregator responded at all, but we do have a claim.
+            # Nothing to cross-check it against.
+            return CrossValidationResult(
+                icao=icao, is_valid=False, max_disagreement_m=0.0, confidence=0.0,
+                sources_used=[],
+                verdict="INSUFFICIENT_SOURCES",
+            )
+
+        # Project every aggregator report to the most recent
+        # observed_at so we're comparing positions at a common instant,
+        # not raw poll-time snapshots.
         t_common = max(r.observed_at for r in reports)
         projected = [r.project_to(t_common) for r in reports]
+
+        # If no explicit claim was passed, default to using the OpenSky report
+        # (if one of the reports came from OpenSky) as the implicit
+        # claim. This eliminates a redundant extra OpenSky call entirely: the
+        # "claim" IS the live broadcast OpenSky's own per-ICAO lookup already
+        # returned, at the exact same instant as everything else — no staleness
+        # gap possible, since it's the same fetch, not a separate one made
+        # seconds or minutes apart.
+        if claimed_lat is None or claimed_lon is None:
+            opensky_report = next((r for r in reports if r.source == "opensky"), None)
+            if opensky_report:
+                claimed_lat, claimed_lon = opensky_report.lat, opensky_report.lon
+                claimed_velocity_kts = claimed_velocity_kts if claimed_velocity_kts is not None else opensky_report.velocity_kts
+                claimed_heading_deg = claimed_heading_deg if claimed_heading_deg is not None else opensky_report.heading_deg
+                claimed_observed_at = claimed_observed_at if claimed_observed_at is not None else opensky_report.observed_at
+
+        # The claimed position (what the aircraft itself is broadcasting, or
+        # what a spoof test is injecting) is a comparison point in its own
+        # right — NOT just a search center for the point APIs. Projected to
+        # t_common using its own velocity/heading if available, exactly like
+        # every other report, so ordinary straight-line motion between fetch
+        # and validation doesn't read as false disagreement.
+        if claimed_lat is not None and claimed_lon is not None:
+            claimed_report = SourceReport(
+                source="claimed", icao=icao,
+                lat=claimed_lat, lon=claimed_lon,
+                alt_ft=None,
+                velocity_kts=claimed_velocity_kts,
+                heading_deg=claimed_heading_deg,
+                observed_at=claimed_observed_at if claimed_observed_at is not None else t_common,
+            )
+            projected.append(claimed_report.project_to(t_common))
 
         per_pair: Dict[str, float] = {}
         max_disagreement = 0.0
@@ -259,28 +349,73 @@ class CrossSourceValidator:
                 per_pair[f"{a.source}-{b.source}"] = dist
                 max_disagreement = max(max_disagreement, dist)
 
+        # Fewer distinct aggregators = lower ceiling on confidence, since
+        # agreement/disagreement with only 1 network is less conclusive
+        # than 2-3 aggregators agreeing. This is still not physical independence.
+        n_reports = len(reports)
+        confidence_ceiling = 1.0 if n_reports >= 2 else 0.75
+
         if max_disagreement < DISAGREEMENT_UNCERTAIN_M:
             verdict = "LEGITIMATE"
-            confidence = max(0.7, 1.0 - (max_disagreement / DISAGREEMENT_UNCERTAIN_M) * 0.3)
+            confidence = max(0.5, confidence_ceiling - (max_disagreement / DISAGREEMENT_UNCERTAIN_M) * 0.3)
             is_valid = True
         elif max_disagreement < DISAGREEMENT_SPOOFED_M:
             verdict = "UNCERTAIN"
             span = DISAGREEMENT_SPOOFED_M - DISAGREEMENT_UNCERTAIN_M
-            confidence = max(0.3, 0.7 - ((max_disagreement - DISAGREEMENT_UNCERTAIN_M) / span) * 0.4)
+            confidence = max(0.3, (confidence_ceiling * 0.7) - ((max_disagreement - DISAGREEMENT_UNCERTAIN_M) / span) * 0.4)
             is_valid = False
         else:
             verdict = "SPOOFED"
-            confidence = min(0.95, 0.3 + (max_disagreement - DISAGREEMENT_SPOOFED_M) / DISAGREEMENT_SPOOFED_M * 0.65)
+            confidence = min(confidence_ceiling * 0.95, 0.3 + (max_disagreement - DISAGREEMENT_SPOOFED_M) / DISAGREEMENT_SPOOFED_M * 0.65)
             is_valid = False
 
         return CrossValidationResult(
             icao=icao, is_valid=is_valid, max_disagreement_m=max_disagreement,
-            confidence=confidence, sources_used=[r.source for r in reports],
+            confidence=confidence,
+            # "claimed" is excluded from sources_used — it's not an
+            # distinct aggregator, just the value under test.
+            sources_used=[r.source for r in reports],
             verdict=verdict, per_pair_m=per_pair,
         )
 
-    async def validate_aircraft(self, icao: str, approx_lat: float, approx_lon: float) -> CrossValidationResult:
-        reports = await self.gather_reports(icao, approx_lat, approx_lon)
+    async def validate_aircraft(
+        self, icao: str, approx_lat: float, approx_lon: float,
+        claimed_velocity_kts: Optional[float] = None,
+        claimed_heading_deg: Optional[float] = None,
+        claimed_observed_at: Optional[float] = None,
+        use_explicit_claim: bool = True,
+        claimed_source: Optional[str] = None,
+    ) -> CrossValidationResult:
+        """
+        approx_lat/approx_lon serves DOUBLE duty:
+          1. Search center for the point-radius APIs (adsb.lol/adsb.fi)
+          2. The claimed position — BUT only used as the actual claim if
+             use_explicit_claim=True (spoof testing: you're deliberately
+             injecting/offsetting a position and want exactly that value
+             compared, not whatever OpenSky reports).
+
+        If use_explicit_claim=False (legacy implicit-claim mode),
+        the claim is instead taken from OpenSky's own per-ICAO report inside
+        this same call (see validate_reports), which is the actual live
+        broadcast at the exact same instant as the aggregator
+        check — no separate fetch, no staleness gap possible.
+        """
+        reports = await self.gather_reports(
+            icao, approx_lat, approx_lon,
+            excluded_sources={claimed_source} if claimed_source else None,
+        )
+        if claimed_source:
+            # A source cannot corroborate the exact record from which the claim
+            # originated; doing so would count one rebroadcast twice.
+            reports = [r for r in reports if r.source != claimed_source]
+        if use_explicit_claim:
+            return self.validate_reports(
+                icao, reports,
+                claimed_lat=approx_lat, claimed_lon=approx_lon,
+                claimed_velocity_kts=claimed_velocity_kts,
+                claimed_heading_deg=claimed_heading_deg,
+                claimed_observed_at=claimed_observed_at,
+            )
         return self.validate_reports(icao, reports)
 
 
@@ -289,8 +424,8 @@ class CrossSourceValidator:
 # outbound network access to opensky-network.org / adsb.lol / adsb.fi.
 async def _smoke_test():
     logging.basicConfig(level=logging.INFO)
-    icao = "a4f7c1"       # replace with a real live ICAO24 near you
-    lat, lon = 39.95, -75.6   # approx last-known position, for the point APIs
+    icao = "aaf47d"       # replace with a currently live ICAO24
+    lat, lon = 39.9526, -75.1652   # approximate last-known/claimed position
     async with CrossSourceValidator() as validator:
         result = await validator.validate_aircraft(icao, lat, lon)
         print(result.to_dict())

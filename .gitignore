@@ -1,9 +1,21 @@
-.env
-**/.env
-__pycache__/
-*.pyc
-.pytest_cache/
+# Local environments and Python artifacts
 .venv/
 venv/
-env/
-SkySecure-v2/.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend dependencies and builds
+frontend/node_modules/
+frontend/dist/
+
+# IDE/OS artifacts
+.vscode/
+.idea/
+.DS_Store

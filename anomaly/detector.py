@@ -1,13 +1,11 @@
 """
 anomaly/detector.py
 ───────────────────
-Three-layer anomaly detection pipeline:
+Canonical L1-L5 anomaly pipeline component.
 
-  Layer 1 — Rule-based:   Fast deterministic checks (physics violations,
-                           spoofing patterns, airspace rules)
-  Layer 2 — Statistical:  Per-aircraft baseline deviation (z-score)
-  Layer 3 — ML:           LSTM sequence predictor — large prediction error
-                           indicates anomalous trajectory
+This service owns L2 kinematic/behavioral rules and persistent statistical
+baselines plus the L3 trajectory model/heuristic fallback. It preserves L1,
+L4, and L5 evidence produced upstream and includes that evidence in risk.
 
 Consumes: fused.tracks
 Produces: alerts.anomaly  (high-score events only)
@@ -24,14 +22,18 @@ from collections import defaultdict, deque
 from typing import Dict, List, Optional, Deque
 
 import numpy as np
+import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import redis.asyncio as aioredis
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from models import StateVector, AnomalyFlag, AnomalyType, RiskBand
-from config import settings
+from models import (
+    StateVector, AnomalyFlag, AnomalyType, DataSource, DetectionLayer,
+    LayerEvaluation, LayerStatus, RiskBand,
+)
+from config import settings, KAFKA_CONSUMER_STABILITY
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +69,8 @@ class RuleEngine:
         ]:
             flag = rule(sv)
             if flag:
+                flag.layer = DetectionLayer.L2
+                flag.detector = rule.__name__.removeprefix("_check_")
                 flags.append(flag)
         return flags
 
@@ -167,6 +171,20 @@ class RuleEngine:
         """
         if sv.on_ground:
             return None
+        # Aggregator dropouts mean an aircraft left a third-party feed or its
+        # coverage area; they are not evidence that a transponder was switched off.
+        latest_adsb = next(
+            (report for report in reversed(sv.source_reports)
+             if report.source == DataSource.ADSB),
+            None,
+        )
+        aggregator_ids = {"opensky", "adsb_lol", "adsb.lol", "adsbfi", "adsb.fi"}
+        if (
+            latest_adsb is None
+            or not latest_adsb.receiver_id
+            or latest_adsb.receiver_id.lower() in aggregator_ids
+        ):
+            return None
         stale_threshold = settings.FUSION_STALE_THRESHOLD * 2   # 60s
         age = time.time() - sv.last_seen
         if age > stale_threshold and sv.altitude_baro and sv.altitude_baro > 2000:
@@ -186,21 +204,63 @@ class RuleEngine:
 # ─── Layer 2: Statistical Detector ────────────────────────────────────────────
 
 class AircraftBaseline:
-    """Per-aircraft rolling statistics for velocity and altitude."""
+    """Serializable per-aircraft rolling statistics and latest observation."""
     WINDOW = 300   # samples
 
     def __init__(self) -> None:
         self.velocities: Deque[float] = deque(maxlen=self.WINDOW)
         self.altitudes:  Deque[float] = deque(maxlen=self.WINDOW)
         self.vrates:     Deque[float] = deque(maxlen=self.WINDOW)
+        self.last_observation: Optional[dict] = None
 
-    def update(self, sv: StateVector) -> None:
-        if sv.velocity is not None:
-            self.velocities.append(sv.velocity)
+    def update(
+        self,
+        sv: StateVector,
+        *,
+        fresh_velocity: bool = True,
+        fresh_heading: bool = True,
+        fresh_vertical_rate: bool = True,
+    ) -> None:
+        observation = dict(self.last_observation or {})
+        if fresh_velocity and sv.velocity is not None:
+            self.velocities.append(float(sv.velocity))
+            observation["velocity"] = float(sv.velocity)
+            observation["velocity_timestamp"] = float(sv.last_seen)
         if sv.altitude_baro is not None:
             self.altitudes.append(float(sv.altitude_baro))
-        if sv.vertical_rate is not None:
+        if fresh_vertical_rate and sv.vertical_rate is not None:
             self.vrates.append(float(sv.vertical_rate))
+            observation["vertical_rate"] = float(sv.vertical_rate)
+            observation["vertical_rate_timestamp"] = float(sv.last_seen)
+        if fresh_heading and sv.heading is not None:
+            observation["heading"] = float(sv.heading)
+            observation["heading_timestamp"] = float(sv.last_seen)
+        if observation:
+            # Keep the legacy key for baselines serialized by older versions.
+            observation["timestamp"] = max(
+                observation.get("velocity_timestamp", 0.0),
+                observation.get("heading_timestamp", 0.0),
+                observation.get("vertical_rate_timestamp", 0.0),
+                float(observation.get("timestamp", 0.0)),
+            )
+            self.last_observation = observation
+
+    def to_dict(self) -> dict:
+        return {
+            "velocities": list(self.velocities),
+            "altitudes": list(self.altitudes),
+            "vrates": list(self.vrates),
+            "last_observation": self.last_observation,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "AircraftBaseline":
+        baseline = cls()
+        baseline.velocities.extend(float(v) for v in payload.get("velocities", []))
+        baseline.altitudes.extend(float(v) for v in payload.get("altitudes", []))
+        baseline.vrates.extend(float(v) for v in payload.get("vrates", []))
+        baseline.last_observation = payload.get("last_observation")
+        return baseline
 
     def z_score(self, value: float, data: Deque[float]) -> float:
         if len(data) < 30:
@@ -209,8 +269,8 @@ class AircraftBaseline:
         mu = arr.mean()
         sigma = arr.std()
         if sigma < 1e-6:
-            return 0.0
-        return abs((value - mu) / sigma)
+            return 0.0 if abs(value - mu) < 1e-6 else 999.0
+        return float(abs((value - mu) / sigma))
 
 
 class StatisticalDetector:
@@ -221,35 +281,102 @@ class StatisticalDetector:
     def __init__(self) -> None:
         self._baselines: Dict[str, AircraftBaseline] = {}
 
+    def get_baseline(self, icao: str) -> AircraftBaseline:
+        return self._baselines.setdefault(icao, AircraftBaseline())
+
+    def set_baseline(self, icao: str, baseline: AircraftBaseline) -> None:
+        self._baselines[icao] = baseline
+
+    @staticmethod
+    def _fresh_kinematic_fields(sv: StateVector) -> tuple[bool, bool, bool]:
+        """Return whether velocity, heading, and vertical rate were measured now."""
+        if not sv.source_reports:
+            # Direct/legacy state vectors have no source provenance.
+            return True, True, True
+        report = sv.source_reports[-1]
+        same_event = abs(float(report.timestamp) - float(sv.last_seen)) <= 0.001
+        adsb_event = same_event and report.source == DataSource.ADSB
+        return (
+            adsb_event and report.velocity is not None,
+            adsb_event and report.heading is not None,
+            adsb_event and report.vertical_rate is not None,
+        )
+
     def check(self, sv: StateVector) -> List[AnomalyFlag]:
         icao = sv.icao24
-        if icao not in self._baselines:
-            self._baselines[icao] = AircraftBaseline()
-
-        baseline = self._baselines[icao]
+        baseline = self.get_baseline(icao)
         flags = []
+        fresh_velocity, fresh_heading, fresh_vertical_rate = self._fresh_kinematic_fields(sv)
 
-        if sv.velocity is not None and len(baseline.velocities) >= 30:
+        previous = baseline.last_observation
+        if previous:
+            previous_velocity = previous.get("velocity")
+            velocity_time = float(previous.get(
+                "velocity_timestamp", previous.get("timestamp", sv.last_seen)
+            ))
+            velocity_dt = float(sv.last_seen) - velocity_time
+            if fresh_velocity and 0.1 <= velocity_dt <= 300.0:
+                if sv.velocity is not None and previous_velocity is not None:
+                    acceleration = abs(float(sv.velocity) - float(previous_velocity)) / velocity_dt
+                    if acceleration > 20.0:
+                        flags.append(AnomalyFlag(
+                            anomaly_type=AnomalyType.ABNORMAL_ACCELERATION,
+                            layer=DetectionLayer.L2,
+                            detector="acceleration_rate",
+                            score_delta=min(30, int(acceleration / 2)),
+                            description=f"Acceleration {acceleration:.1f} knots/s exceeds threshold",
+                            meta={"knots_per_second": acceleration, "dt_seconds": velocity_dt},
+                        ))
+
+            previous_heading = previous.get("heading")
+            heading_time = float(previous.get(
+                "heading_timestamp", previous.get("timestamp", sv.last_seen)
+            ))
+            heading_dt = float(sv.last_seen) - heading_time
+            if fresh_heading and 0.1 <= heading_dt <= 300.0:
+                if sv.heading is not None and previous_heading is not None:
+                    heading_delta = abs((float(sv.heading) - float(previous_heading) + 180.0) % 360.0 - 180.0)
+                    turn_rate = heading_delta / heading_dt
+                    if turn_rate > 10.0:
+                        flags.append(AnomalyFlag(
+                            anomaly_type=AnomalyType.ABNORMAL_TURN_RATE,
+                            layer=DetectionLayer.L2,
+                            detector="turn_rate",
+                            score_delta=min(25, int(turn_rate)),
+                            description=f"Turn rate {turn_rate:.1f} degrees/s exceeds threshold",
+                            meta={"degrees_per_second": turn_rate, "dt_seconds": heading_dt},
+                        ))
+
+        if fresh_velocity and sv.velocity is not None and len(baseline.velocities) >= 30:
             z = baseline.z_score(sv.velocity, baseline.velocities)
             if z > 4.0:
                 flags.append(AnomalyFlag(
                     anomaly_type=AnomalyType.IMPOSSIBLE_SPEED,
+                    layer=DetectionLayer.L2,
+                    detector="velocity_baseline",
                     score_delta=min(30, int(z * 5)),
                     description=f"Velocity {sv.velocity:.0f} kts is {z:.1f}σ from aircraft baseline",
                     meta={"z_score": z, "velocity": sv.velocity},
                 ))
 
-        if sv.vertical_rate is not None and len(baseline.vrates) >= 30:
+        if fresh_vertical_rate and sv.vertical_rate is not None and len(baseline.vrates) >= 30:
             z = baseline.z_score(float(sv.vertical_rate), baseline.vrates)
             if z > 5.0:
                 flags.append(AnomalyFlag(
-                    anomaly_type=AnomalyType.IMPOSSIBLE_ALTITUDE,
+                    anomaly_type=AnomalyType.ABNORMAL_CLIMB_RATE,
+                    layer=DetectionLayer.L2,
+                    detector="vertical_rate_baseline",
                     score_delta=min(20, int(z * 3)),
                     description=f"Vertical rate {sv.vertical_rate} fpm is {z:.1f}σ from baseline",
                     meta={"z_score": z, "vrate": sv.vertical_rate},
                 ))
 
-        baseline.update(sv)
+        baseline.update(
+            sv,
+            fresh_velocity=fresh_velocity,
+            fresh_heading=fresh_heading,
+            fresh_vertical_rate=fresh_vertical_rate,
+        )
         return flags
 
 
@@ -385,13 +512,15 @@ class LSTMTrajectoryPredictor:
 
 class ThreatScorer:
     """
-    Combines anomaly flags from all three layers into a single 0–100 risk score.
+    Combines active anomaly flags across canonical layers into a 0–100 risk score.
 
-    Score is additive but capped, with decay over time (score fades if no new anomalies).
+    Active detector contributions are additive across unique detectors, not
+    across repeated messages. Historical risk decays over time.
     """
 
     DECAY_RATE = 2.0   # points/minute
-    _last_scores: Dict[str, dict] = {}
+    def __init__(self) -> None:
+        self._last_scores: Dict[str, dict] = {}
 
     def compute(self, sv: StateVector, new_flags: List[AnomalyFlag]) -> int:
         """
@@ -407,16 +536,24 @@ class ThreatScorer:
         # Decay prior score
         decayed = max(0, prior["score"] - elapsed_min * self.DECAY_RATE)
 
-        # Add new flag deltas
-        new_delta = sum(f.score_delta for f in new_flags)
+        # A persistent detector contributes once to current risk regardless of
+        # message frequency. Multiple layers/detectors still combine.
+        active_detectors: Dict[tuple[str, str], int] = {}
+        for flag in new_flags:
+            key = (flag.layer.value, flag.detector)
+            active_detectors[key] = max(
+                active_detectors.get(key, 0), flag.score_delta
+            )
+        active_delta = sum(active_detectors.values())
 
         # Military classification bonus
         mil_bonus = int(sv.military_score * 20)
 
-        final = min(100, int(decayed + new_delta + mil_bonus))
+        current_evidence = active_delta + mil_bonus
+        raw_final = min(100.0, max(decayed, float(current_evidence)))
 
-        self._last_scores[icao] = {"score": final, "t": now}
-        return final
+        self._last_scores[icao] = {"score": raw_final, "t": now}
+        return int(raw_final)
 
 
 # ─── Full Detector Pipeline ───────────────────────────────────────────────────
@@ -428,27 +565,117 @@ class AnomalyDetector:
         self.statistical  = StatisticalDetector()
         self.lstm         = LSTMTrajectoryPredictor()
         self.scorer       = ThreatScorer()
+        self._hydrated_l2: set[str] = set()
+        self._last_l2_persist: Dict[str, float] = {}
+        self._last_l2_access: Dict[str, float] = {}
+
+    async def hydrate_l2_baseline(self, redis_client, icao: str) -> None:
+        """Load a baseline once per process so detector state survives restarts."""
+        self._last_l2_access[icao] = time.monotonic()
+        if icao in self._hydrated_l2:
+            return
+        raw = await redis_client.get(f"baseline:l2:{icao}")
+        if raw:
+            try:
+                self.statistical.set_baseline(icao, AircraftBaseline.from_dict(orjson.loads(raw)))
+            except Exception as exc:
+                log.warning("Discarding invalid L2 baseline for %s: %s", icao, exc)
+        self._hydrated_l2.add(icao)
+
+    async def persist_l2_baseline(
+        self,
+        redis_client,
+        icao: str,
+        ttl: int = 86_400,
+        min_interval: float = 10.0,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_l2_persist.get(icao, 0.0) < min_interval:
+            return
+        baseline = self.statistical.get_baseline(icao)
+        await redis_client.setex(
+            f"baseline:l2:{icao}", ttl, orjson.dumps(baseline.to_dict())
+        )
+        self._last_l2_persist[icao] = now
+
+    def prune_l2_state(self, max_idle_seconds: float = 86_400.0) -> int:
+        """Bound process-local detector state; Redis remains the durable copy."""
+        cutoff = time.monotonic() - max_idle_seconds
+        stale = [
+            icao for icao, accessed in self._last_l2_access.items()
+            if accessed < cutoff
+        ]
+        for icao in stale:
+            self.statistical._baselines.pop(icao, None)
+            self._hydrated_l2.discard(icao)
+            self._last_l2_persist.pop(icao, None)
+            self._last_l2_access.pop(icao, None)
+        return len(stale)
 
     def process(self, sv: StateVector) -> StateVector:
         """Run all detection layers on a state vector, return enriched SV."""
         all_flags: List[AnomalyFlag] = []
+        # Replace prior detector-owned L2/L3 output while preserving fresh
+        # upstream fusion/identity evidence and the fusion-owned L2 conflict.
+        upstream_flags = [
+            flag for flag in sv.anomalies
+            if flag.layer not in (DetectionLayer.L2, DetectionLayer.L3)
+            or (flag.layer == DetectionLayer.L2 and flag.detector == "adsb_position_conflict")
+        ]
 
-        # Layer 1: Rules
-        all_flags.extend(self.rule_engine.check_all(sv))
+        # Canonical L2: deterministic kinematic rules + statistical baselines.
+        l2_flags = self.rule_engine.check_all(sv)
 
         # Layer 2: Statistics
-        all_flags.extend(self.statistical.check(sv))
+        l2_flags.extend(self.statistical.check(sv))
+        for flag in l2_flags:
+            flag.timestamp = sv.last_seen
+        all_flags.extend(l2_flags)
+        evaluated_l2_flags = [
+            flag for flag in upstream_flags if flag.layer == DetectionLayer.L2
+        ] + l2_flags
+
+        sv.layer_evaluations[DetectionLayer.L2.value] = LayerEvaluation(
+            layer=DetectionLayer.L2,
+            status=LayerStatus.TRIGGERED if evaluated_l2_flags else LayerStatus.EVALUATED,
+            detectors_evaluated=[
+                "impossible_speed", "altitude_jump", "baro_geo_delta",
+                "teleportation", "transponder_loss", "velocity_baseline",
+                "vertical_rate_baseline", "acceleration_rate", "turn_rate",
+            ],
+            triggered_detectors=sorted({flag.detector for flag in evaluated_l2_flags}),
+            score_delta=sum(flag.score_delta for flag in evaluated_l2_flags),
+            timestamp=sv.last_seen,
+        )
 
         # Layer 3: LSTM
         lstm_flag = self.lstm.update_and_check(sv)
+        trajectory_detector = "trajectory_lstm" if self.lstm._model_loaded else "trajectory_heuristic"
+        sequence_ready = len(self.lstm._sequences.get(sv.icao24, ())) >= self.lstm.SEQ_LEN + 1
         if lstm_flag:
+            lstm_flag.layer = DetectionLayer.L3
+            lstm_flag.detector = trajectory_detector
+            lstm_flag.timestamp = sv.last_seen
             all_flags.append(lstm_flag)
+        sv.layer_evaluations[DetectionLayer.L3.value] = LayerEvaluation(
+            layer=DetectionLayer.L3,
+            status=(LayerStatus.TRIGGERED if lstm_flag else
+                    LayerStatus.EVALUATED if sequence_ready else LayerStatus.SKIPPED),
+            detectors_evaluated=[trajectory_detector] if sequence_ready else [],
+            triggered_detectors=[lstm_flag.detector] if lstm_flag else [],
+            score_delta=lstm_flag.score_delta if lstm_flag else 0,
+            skipped_reason=None if sequence_ready else (
+                f"Trajectory history warming up ({len(self.lstm._sequences.get(sv.icao24, ()))}/"
+                f"{self.lstm.SEQ_LEN + 1} samples)"
+            ),
+            timestamp=sv.last_seen,
+        )
 
-        # Merge into state vector
-        sv.anomalies.extend(all_flags)
+        # Merge upstream fusion/identity flags with detector results.
+        sv.anomalies = upstream_flags + all_flags
 
-        # Compute risk score
-        sv.risk_score = self.scorer.compute(sv, all_flags)
+        # Compute risk score from every layer that triggered this update.
+        sv.risk_score = self.scorer.compute(sv, sv.anomalies)
         sv.update_risk_band()
 
         return sv
@@ -470,6 +697,7 @@ async def run() -> None:
         value_deserializer=lambda v: v,
         auto_offset_reset="latest",
         fetch_max_bytes=10_485_760,
+        **KAFKA_CONSUMER_STABILITY,
     )
 
     alert_producer = AIOKafkaProducer(
@@ -485,7 +713,9 @@ async def run() -> None:
         async for msg in consumer:
             try:
                 sv = StateVector.from_bytes(msg.value)
+                await detector.hydrate_l2_baseline(redis_client, sv.icao24)
                 sv = detector.process(sv)
+                await detector.persist_l2_baseline(redis_client, sv.icao24)
 
                 # Write enriched SV back to Redis
                 key = f"sv:{sv.icao24}"
@@ -493,18 +723,26 @@ async def run() -> None:
 
                 # Publish alerts for ALERT/CRITICAL band
                 if sv.risk_band in (RiskBand.ALERT, RiskBand.CRITICAL):
-                    await alert_producer.send(
+                    await alert_producer.send_and_wait(
                         topic=settings.TOPIC_ALERTS_ANOMALY,
                         key=sv.icao24.encode(),
                         value=sv.to_bytes(),
                     )
 
+                await consumer.commit()
+
                 count += 1
                 if count % 10_000 == 0:
-                    log.info("Anomaly detector: processed %d state vectors", count)
+                    pruned = detector.prune_l2_state()
+                    log.info(
+                        "Anomaly detector: processed %d state vectors; pruned %d idle L2 baselines",
+                        count,
+                        pruned,
+                    )
 
             except Exception as e:
                 log.error("Anomaly detection error: %s", e)
+                raise
 
     finally:
         await consumer.stop()

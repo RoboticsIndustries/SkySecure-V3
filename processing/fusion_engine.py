@@ -23,10 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
-from typing import Optional, List
+import weakref
+from typing import List, Optional
 
 import redis.asyncio as aioredis
+import asyncpg
 import orjson
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
@@ -36,9 +39,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from models import (
     RawADSBMessage, RawMLATReport, RawACARSMessage,
     StateVector, SourceReport, AnomalyFlag,
-    DataSource, Classification, AnomalyType, RiskBand
+    DataSource, Classification, AnomalyType, DetectionLayer,
+    LayerEvaluation, LayerStatus, RiskBand
 )
-from config import settings
+from config import settings, KAFKA_CONSUMER_STABILITY
 
 log = logging.getLogger(__name__)
 
@@ -129,82 +133,180 @@ def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 class FusionEngine:
 
-    def __init__(self, redis_client: aioredis.Redis) -> None:
+    def __init__(self, redis_client: aioredis.Redis, postgres_pool=None) -> None:
         self.redis = redis_client
+        self.postgres = postgres_pool
         # In-memory Kalman state per aircraft (lat, lon, alt)
         # Cleared on restart (Redis carries position state)
         self._kalman: dict = {}   # icao24 → {lat: KF, lon: KF, alt: KF}
+        self._aircraft_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _aircraft_lock(self, icao24: str) -> asyncio.Lock:
+        return self._aircraft_locks.setdefault(icao24.upper(), asyncio.Lock())
 
     async def process_adsb(self, msg: RawADSBMessage) -> Optional[StateVector]:
         sv = await self._load_or_create(msg.icao24)
+        latest_adsb = max(
+            (report for report in sv.source_reports
+             if report.source == DataSource.ADSB),
+            key=lambda report: report.timestamp,
+            default=None,
+        )
+        if latest_adsb is not None and msg.recv_time < latest_adsb.timestamp:
+            return None
+        prior_last_seen = sv.last_seen
+        is_current_event = msg.recv_time >= prior_last_seen
+
+        # ADS-B processing owns these current-cycle checks; replace their prior
+        # evidence rather than accumulating stale duplicate/conflict flags.
+        expired_l4 = any(
+            flag.layer == DetectionLayer.L4
+            and msg.recv_time - flag.timestamp > settings.FUSION_TRIGGER_TTL_SEC
+            for flag in sv.anomalies
+        )
+        sv.anomalies = [
+            flag for flag in sv.anomalies
+            if not (
+                flag.layer == DetectionLayer.L5
+                and flag.detector == "duplicate_icao"
+            )
+            and not (
+                flag.layer == DetectionLayer.L2
+                and flag.detector == "adsb_position_conflict"
+            )
+            and not (
+                flag.layer == DetectionLayer.L4
+                and msg.recv_time - flag.timestamp > settings.FUSION_TRIGGER_TTL_SEC
+            )
+        ]
+        active_l4 = any(flag.layer == DetectionLayer.L4 for flag in sv.anomalies)
+        current_l4_evaluation = sv.layer_evaluations.get(DetectionLayer.L4.value)
+        evaluation_is_current = (
+            current_l4_evaluation is None
+            or msg.recv_time >= current_l4_evaluation.timestamp
+        )
+        if (expired_l4 or not active_l4) and evaluation_is_current:
+            sv.layer_evaluations[DetectionLayer.L4.value] = LayerEvaluation(
+                layer=DetectionLayer.L4,
+                status=LayerStatus.SKIPPED,
+                skipped_reason="No MLAT report available for multi-sensor comparison",
+                timestamp=msg.recv_time,
+            )
+        elif DetectionLayer.L4.value not in sv.layer_evaluations:
+            l4_flags = [flag for flag in sv.anomalies if flag.layer == DetectionLayer.L4]
+            sv.layer_evaluations[DetectionLayer.L4.value] = LayerEvaluation(
+                layer=DetectionLayer.L4,
+                status=LayerStatus.TRIGGERED,
+                triggered_detectors=sorted({flag.detector for flag in l4_flags}),
+                score_delta=sum(flag.score_delta for flag in l4_flags),
+                timestamp=max(flag.timestamp for flag in l4_flags),
+            )
 
         source_report = SourceReport(
             source=DataSource.ADSB,
+            receiver_id=msg.receiver_id,
             lat=msg.lat,
             lon=msg.lon,
             altitude=msg.altitude_baro,
             velocity=msg.velocity,
             heading=msg.heading,
+            vertical_rate=msg.vertical_rate,
             weight=confidence_for_source(DataSource.ADSB),
             confidence=confidence_for_source(DataSource.ADSB),
             timestamp=msg.recv_time,
         )
 
         # Conflict detection with existing position
-        if sv.lat and sv.lon and msg.lat and msg.lon:
-            dist = haversine_nm(sv.lat, sv.lon, msg.lat, msg.lon)
-            dt = msg.recv_time - sv.last_seen
+        if (
+            latest_adsb is not None
+            and latest_adsb.lat is not None and latest_adsb.lon is not None
+            and msg.lat is not None and msg.lon is not None
+        ):
+            dist = haversine_nm(latest_adsb.lat, latest_adsb.lon, msg.lat, msg.lon)
+            dt = msg.recv_time - latest_adsb.timestamp
             # Allow for aircraft movement: max ~1200 kts = 20 NM/min
             max_dist = max(settings.FUSION_CONFLICT_NM, (dt / 60.0) * 25.0)
             if dist > max_dist:
                 sv.anomalies.append(AnomalyFlag(
                     anomaly_type=AnomalyType.GNSS_SPOOF,
+                    layer=DetectionLayer.L2,
+                    detector="adsb_position_conflict",
                     score_delta=35,
                     description=f"ADS-B position conflicts with last known by {dist:.1f} NM",
                     meta={"dist_nm": dist, "dt_sec": dt},
+                    timestamp=msg.recv_time,
                 ))
 
         # Update state
-        if msg.lat is not None:
+        if is_current_event and msg.lat is not None:
             sv.lat = self._smooth_position(msg.icao24, "lat", msg.lat, msg.recv_time)
-        if msg.lon is not None:
+        if is_current_event and msg.lon is not None:
             sv.lon = self._smooth_position(msg.icao24, "lon", msg.lon, msg.recv_time)
-        if msg.altitude_baro is not None:
+        if is_current_event and msg.altitude_baro is not None:
             sv.altitude_baro = int(self._smooth_position(
                 msg.icao24, "alt", float(msg.altitude_baro), msg.recv_time))
-        if msg.altitude_geo is not None:
+        if is_current_event and msg.altitude_geo is not None:
             sv.altitude_geo = msg.altitude_geo
-        if msg.velocity is not None:
+        if is_current_event and msg.velocity is not None:
             sv.velocity = msg.velocity
-        if msg.heading is not None:
+        if is_current_event and msg.heading is not None:
             sv.heading = msg.heading
-        if msg.vertical_rate is not None:
+        if is_current_event and msg.vertical_rate is not None:
             sv.vertical_rate = msg.vertical_rate
-        if msg.nic is not None:
+        if is_current_event and msg.nic is not None:
             sv.nic = msg.nic
-        if msg.nac_p is not None:
+        if is_current_event and msg.nac_p is not None:
             sv.nac_p = msg.nac_p
-        if msg.callsign:
+        if is_current_event and msg.callsign:
             sv.callsign = msg.callsign
-        if msg.on_ground is not None:
+        if is_current_event and msg.on_ground is not None:
             sv.on_ground = msg.on_ground
 
-        sv.primary_source = DataSource.ADSB
+        if is_current_event:
+            sv.primary_source = DataSource.ADSB
         if DataSource.ADSB not in sv.sources:
             sv.sources.append(DataSource.ADSB)
 
         sv.source_reports.append(source_report)
-        sv.source_reports = sv.source_reports[-10:]   # keep last 10
+        sv.source_reports = sorted(
+            sv.source_reports, key=lambda report: report.timestamp
+        )[-10:]
 
-        sv.confidence = confidence_for_source(DataSource.ADSB)
-        sv.last_seen = msg.recv_time
+        if is_current_event:
+            sv.confidence = confidence_for_source(DataSource.ADSB)
+        sv.last_seen = max(prior_last_seen, msg.recv_time)
         sv.update_count += 1
-        sv.add_position_history()
+        if is_current_event:
+            sv.add_position_history()
 
         return sv
 
     async def process_mlat(self, report: RawMLATReport) -> Optional[StateVector]:
         sv = await self._load_or_create(report.icao24)
+        latest_mlat = max(
+            (source for source in sv.source_reports
+             if source.source == DataSource.MLAT),
+            key=lambda source: source.timestamp,
+            default=None,
+        )
+        if latest_mlat is not None and report.solve_time < latest_mlat.timestamp:
+            return None
+        current_l4_evaluation = sv.layer_evaluations.get(DetectionLayer.L4.value)
+        latest_l4_event = max(
+            [flag.timestamp for flag in sv.anomalies if flag.layer == DetectionLayer.L4]
+            + ([current_l4_evaluation.timestamp] if current_l4_evaluation else []),
+            default=float("-inf"),
+        )
+        if report.solve_time < latest_l4_event:
+            return None
+        prior_last_seen = sv.last_seen
+        # A new MLAT report supersedes the previous L4 comparison evidence.
+        sv.anomalies = [
+            flag for flag in sv.anomalies if flag.layer != DetectionLayer.L4
+        ]
+        l4_flags: List[AnomalyFlag] = []
 
         # MLAT confidence scales with number of receivers and residual
         receiver_bonus = min(1.0, report.num_receivers / 6.0)
@@ -221,43 +323,80 @@ class FusionEngine:
             timestamp=report.solve_time,
         )
 
-        # If ADS-B and MLAT disagree significantly → spoofing candidate
-        if sv.lat and sv.lon and DataSource.ADSB in sv.sources:
-            dist = haversine_nm(sv.lat, sv.lon, report.lat, report.lon)
+        latest_adsb = max(
+            (source for source in sv.source_reports
+             if source.source == DataSource.ADSB
+             and source.lat is not None and source.lon is not None
+             and abs(report.solve_time - source.timestamp)
+                 <= settings.FUSION_COMPARISON_WINDOW_SEC),
+            key=lambda source: source.timestamp,
+            default=None,
+        )
+        aligned_adsb = latest_adsb is not None
+
+        # Compare only measurements aligned in event time; the fused current
+        # position may represent a newer event and is not valid evidence here.
+        if aligned_adsb and latest_adsb is not None:
+            assert latest_adsb.lat is not None and latest_adsb.lon is not None
+            dist = haversine_nm(
+                latest_adsb.lat, latest_adsb.lon, report.lat, report.lon
+            )
             if dist > settings.GHOST_MLAT_CONFIRM_NM:
-                sv.anomalies.append(AnomalyFlag(
+                flag = AnomalyFlag(
                     anomaly_type=AnomalyType.GHOST_AIRCRAFT,
+                    layer=DetectionLayer.L4,
+                    detector="adsb_mlat_disagreement",
                     score_delta=25,
                     description=f"ADS-B and MLAT positions differ by {dist:.1f} NM",
                     meta={"dist_nm": dist, "mlat_receivers": report.num_receivers},
-                ))
+                    timestamp=report.solve_time,
+                )
+                sv.anomalies.append(flag)
+                l4_flags.append(flag)
+
+        has_adsb = aligned_adsb
+        sv.layer_evaluations[DetectionLayer.L4.value] = LayerEvaluation(
+            layer=DetectionLayer.L4,
+            status=(LayerStatus.TRIGGERED if l4_flags else
+                    LayerStatus.EVALUATED if has_adsb else LayerStatus.SKIPPED),
+            detectors_evaluated=["adsb_mlat_disagreement"] if has_adsb else [],
+            triggered_detectors=[flag.detector for flag in l4_flags],
+            score_delta=sum(flag.score_delta for flag in l4_flags),
+            skipped_reason=(None if has_adsb else
+                            "No temporally aligned ADS-B position available for comparison"),
+            timestamp=report.solve_time,
+        )
 
         # MLAT-only aircraft (no ADS-B) → dark/unknown classification
         if DataSource.ADSB not in sv.sources and sv.classification == Classification.UNKNOWN:
             sv.classification = Classification.DARK_AIRCRAFT
 
         # Weighted position merge if we have both ADS-B and MLAT
-        if DataSource.ADSB in sv.sources and sv.lat and sv.lon:
+        if aligned_adsb and latest_adsb is not None and report.solve_time >= prior_last_seen:
+            assert latest_adsb.lat is not None and latest_adsb.lon is not None
             adsb_w = SOURCE_WEIGHTS[DataSource.ADSB]
             mlat_w = mlat_conf
             total_w = adsb_w + mlat_w
-            sv.lat = (sv.lat * adsb_w + report.lat * mlat_w) / total_w
-            sv.lon = (sv.lon * adsb_w + report.lon * mlat_w) / total_w
-        else:
+            sv.lat = (latest_adsb.lat * adsb_w + report.lat * mlat_w) / total_w
+            sv.lon = (latest_adsb.lon * adsb_w + report.lon * mlat_w) / total_w
+        elif report.solve_time >= prior_last_seen:
             sv.lat = report.lat
             sv.lon = report.lon
 
-        if report.altitude_baro:
+        if report.altitude_baro and report.solve_time >= prior_last_seen:
             sv.altitude_baro = report.altitude_baro
 
         if DataSource.MLAT not in sv.sources:
             sv.sources.append(DataSource.MLAT)
         sv.source_reports.append(source_report)
-        sv.source_reports = sv.source_reports[-10:]
+        sv.source_reports = sorted(
+            sv.source_reports, key=lambda source: source.timestamp
+        )[-10:]
         sv.confidence = max(sv.confidence, mlat_conf)
-        sv.last_seen = report.solve_time
+        sv.last_seen = max(prior_last_seen, report.solve_time)
         sv.update_count += 1
-        sv.add_position_history()
+        if report.solve_time >= prior_last_seen:
+            sv.add_position_history()
 
         return sv
 
@@ -278,29 +417,93 @@ class FusionEngine:
         sv.last_seen = msg.recv_time
         return sv
 
+    async def handle_adsb(self, msg, producer, duplicate_detector) -> bool:
+        """Serialize the complete ADS-B read/modify/write transaction per aircraft."""
+        async with self._aircraft_lock(msg.icao24):
+            sv = await self.process_adsb(msg)
+            if sv is None:
+                return False
+            dup_flag = None
+            if msg.lat is not None and msg.lon is not None:
+                dup_flag = await duplicate_detector.check(
+                    msg.icao24, msg.lat, msg.lon, msg.recv_time
+                )
+            if dup_flag:
+                sv.anomalies.append(dup_flag)
+            sv.layer_evaluations[DetectionLayer.L5.value] = LayerEvaluation(
+                layer=DetectionLayer.L5,
+                status=LayerStatus.TRIGGERED if dup_flag else LayerStatus.EVALUATED,
+                detectors_evaluated=["duplicate_icao"],
+                triggered_detectors=["duplicate_icao"] if dup_flag else [],
+                score_delta=dup_flag.score_delta if dup_flag else 0,
+                timestamp=msg.recv_time,
+            )
+            await self.save(sv, producer)
+            return True
+
+    async def handle_mlat(self, report, producer) -> bool:
+        """Serialize the complete MLAT read/modify/write transaction per aircraft."""
+        async with self._aircraft_lock(report.icao24):
+            sv = await self.process_mlat(report)
+            if sv is None:
+                return False
+            await self.save(sv, producer)
+            return True
+
     async def _load_or_create(self, icao24: str) -> StateVector:
-        key = f"sv:{icao24.upper()}"
+        key = f"fusion:sv:{icao24.upper()}"
         raw = await self.redis.get(key)
 
         if raw:
             try:
-                sv = StateVector.from_bytes(raw)
-                # Reset ephemeral anomaly list on each cycle (re-computed by anomaly detector)
-                sv.anomalies = []
-                return sv
+                return StateVector.from_bytes(raw)
             except Exception:
                 pass
 
         return StateVector(icao24=icao24.upper(), first_seen=time.time())
 
     async def save(self, sv: StateVector, producer: AIOKafkaProducer) -> None:
-        key = f"sv:{sv.icao24}"
-        await self.redis.setex(key, settings.REDIS_TTL_STATE_VECTOR, sv.to_bytes())
-        await producer.send(
+        key = f"fusion:sv:{sv.icao24}"
+        payload = sv.to_bytes()
+        await producer.send_and_wait(
             topic=settings.TOPIC_FUSED_TRACKS,
             key=sv.icao24.encode(),
-            value=sv.to_bytes(),
+            value=payload,
         )
+        await self.redis.setex(key, settings.REDIS_TTL_STATE_VECTOR, payload)
+        if self.postgres is not None:
+            try:
+                await self.postgres.execute(
+                    """
+                    INSERT INTO track_points (
+                        time, icao24, callsign, lat, lon, altitude_baro,
+                        altitude_geo, velocity, heading, vertical_rate,
+                        source, confidence, risk_score, classification,
+                        raw_icao, on_ground
+                    ) VALUES (
+                        to_timestamp($1), $2, $3, $4, $5, $6, $7, $8,
+                        $9, $10, $11, $12, $13, $14, $15, $16
+                    )
+                    """,
+                    sv.last_seen,
+                    sv.icao24,
+                    sv.callsign,
+                    sv.lat,
+                    sv.lon,
+                    sv.altitude_baro,
+                    sv.altitude_geo,
+                    sv.velocity,
+                    sv.heading,
+                    sv.vertical_rate,
+                    sv.primary_source.value,
+                    sv.confidence,
+                    sv.risk_score,
+                    sv.classification.value,
+                    int(sv.icao24, 16),
+                    sv.on_ground,
+                )
+            except Exception as exc:
+                log.error("PostgreSQL track persistence failed for %s: %s", sv.icao24, exc)
 
     async def _lookup_icao_by_registration(self, registration: Optional[str]) -> Optional[str]:
         if not registration:
@@ -339,24 +542,32 @@ class DuplicateICAODetector:
     def __init__(self, redis_client: aioredis.Redis) -> None:
         self.redis = redis_client
 
-    async def check(self, icao24: str, lat: float, lon: float) -> Optional[AnomalyFlag]:
+    async def check(
+        self, icao24: str, lat: float, lon: float, event_time: float
+    ) -> Optional[AnomalyFlag]:
         key = f"pos_check:{icao24}"
         raw = await self.redis.get(key)
 
         if raw:
             prev = orjson.loads(raw)
-            from processing.mlat_solver import haversine_nm as hnm
             dist = haversine_nm(prev["lat"], prev["lon"], lat, lon)
+            event_delta = event_time - float(prev.get("timestamp", event_time))
 
-            if dist > settings.DUPLICATE_WINDOW_NM:
+            if 0 <= event_delta <= 10 and dist > settings.DUPLICATE_WINDOW_NM:
                 return AnomalyFlag(
                     anomaly_type=AnomalyType.DUPLICATE_ICAO,
+                    layer=DetectionLayer.L5,
+                    detector="duplicate_icao",
                     score_delta=60,
                     description=f"ICAO {icao24} reported at two locations {dist:.0f} NM apart",
                     meta={"dist_nm": dist, "prev_lat": prev["lat"], "prev_lon": prev["lon"]},
+                    timestamp=event_time,
                 )
 
-        await self.redis.setex(key, 10, orjson.dumps({"lat": lat, "lon": lon}))
+        await self.redis.setex(
+            key, 10,
+            orjson.dumps({"lat": lat, "lon": lon, "timestamp": event_time}),
+        )
         return None
 
 
@@ -367,7 +578,13 @@ async def run() -> None:
     log.info("Starting fusion engine")
 
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
-    engine = FusionEngine(redis_client)
+    postgres_pool = await asyncpg.create_pool(
+        settings.POSTGRES_DSN,
+        min_size=1,
+        max_size=4,
+        command_timeout=10,
+    )
+    engine = FusionEngine(redis_client, postgres_pool=postgres_pool)
     dup_detector = DuplicateICAODetector(redis_client)
 
     consumer_adsb = AIOKafkaConsumer(
@@ -377,6 +594,7 @@ async def run() -> None:
         value_deserializer=lambda v: v,
         auto_offset_reset="latest",
         fetch_max_bytes=10_485_760,
+        **KAFKA_CONSUMER_STABILITY,
     )
 
     consumer_mlat = AIOKafkaConsumer(
@@ -385,6 +603,7 @@ async def run() -> None:
         group_id=f"{settings.KAFKA_GROUP_PREFIX}.fusion-mlat",
         value_deserializer=lambda v: v,
         auto_offset_reset="latest",
+        **KAFKA_CONSUMER_STABILITY,
     )
 
     producer = AIOKafkaProducer(
@@ -402,31 +621,25 @@ async def run() -> None:
         async for msg in consumer_adsb:
             try:
                 adsb = RawADSBMessage.from_bytes(msg.value)
-
-                # Check for duplicate ICAO at different position
-                if adsb.lat and adsb.lon:
-                    dup_flag = await dup_detector.check(adsb.icao24, adsb.lat, adsb.lon)
-
-                sv = await engine.process_adsb(adsb)
-                if sv:
-                    if dup_flag:
-                        sv.anomalies.append(dup_flag)
-                    await engine.save(sv, producer)
+                accepted = await engine.handle_adsb(adsb, producer, dup_detector)
+                if accepted:
                     count += 1
                     if count % 5000 == 0:
                         log.info("Fusion: processed %d ADS-B messages", count)
+                await consumer_adsb.commit()
             except Exception as e:
                 log.error("ADS-B fusion error: %s", e)
+                raise
 
     async def process_mlat_stream():
         async for msg in consumer_mlat:
             try:
                 report = RawMLATReport.from_bytes(msg.value)
-                sv = await engine.process_mlat(report)
-                if sv:
-                    await engine.save(sv, producer)
+                await engine.handle_mlat(report, producer)
+                await consumer_mlat.commit()
             except Exception as e:
                 log.error("MLAT fusion error: %s", e)
+                raise
 
     try:
         await asyncio.gather(process_adsb_stream(), process_mlat_stream())
@@ -434,6 +647,8 @@ async def run() -> None:
         await consumer_adsb.stop()
         await consumer_mlat.stop()
         await producer.stop()
+        if postgres_pool is not None:
+            await postgres_pool.close()
         await redis_client.close()
 
 
