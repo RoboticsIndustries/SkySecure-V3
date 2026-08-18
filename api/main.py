@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Optional, List, Dict, Any
 
@@ -164,8 +165,9 @@ def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
 # Per-claim result cache so we don't re-query the same aircraft every
 # broadcast tick. External free-tier APIs will rate-limit/ban aggressive
 # per-aircraft polling, so this is not optional.
-_L1_CACHE: Dict[tuple[str, str, float, float, int], tuple] = {}
+_L1_CACHE: Dict[tuple[str, str], tuple] = {}
 _L1_CACHE_TTL = 60  # seconds
+_L1_CACHE_BREAK_DISTANCE_M = 20_000
 
 # Hard cap on live cross-validation calls per broadcast cycle. The global
 # feed carries thousands of aircraft; adsb.lol/adsb.fi/OpenSky cannot take
@@ -177,20 +179,37 @@ _L1_MAX_PER_CYCLE = 20
 def _l1_cache_key(
     ac: dict,
     now: Optional[float] = None,
-) -> tuple[str, str, float, float, int]:
-    """Bind a cached L1 verdict to the position and time it validated."""
-    current_time = time.time() if now is None else now
-    observed_at = ac.get("obs_ts", ac.get("last_seen", current_time))
-    try:
-        observation_bucket = int(float(observed_at) // _L1_CACHE_TTL)
-    except (TypeError, ValueError):
-        observation_bucket = int(current_time // _L1_CACHE_TTL)
+) -> tuple[str, str]:
+    """Bind a verdict to a source claim without defeating its insertion TTL.
+
+    Validated coordinates are stored in the cache entry and a discontinuous
+    position jump invalidates it early. Normal motion remains covered by the
+    insertion TTL instead of creating a new external request every second.
+    ``now`` is retained for call-site compatibility and deterministic tests.
+    """
     return (
         ac["icao"],
         str(ac.get("src") or "unknown").lower(),
-        round(float(ac["lat"]), 5),
-        round(float(ac["lon"]), 5),
-        observation_bucket,
+    )
+
+
+def _l1_claim_displacement_m(ac: dict, cached: tuple) -> float:
+    """Great-circle distance from the coordinates validated in a cache entry."""
+    if len(cached) < 4:
+        return float("inf")
+    lat1, lon1 = map(math.radians, (float(ac["lat"]), float(ac["lon"])))
+    lat2, lon2 = map(math.radians, (float(cached[2]), float(cached[3])))
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 6_371_000 * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1 - value)))
+
+
+def _l1_cache_is_fresh(ac: dict, now: float) -> bool:
+    cached = _L1_CACHE.get(_l1_cache_key(ac, now))
+    return bool(
+        cached
+        and now - cached[0] <= _L1_CACHE_TTL
+        and _l1_claim_displacement_m(ac, cached) <= _L1_CACHE_BREAK_DISTANCE_M
     )
 
 
@@ -207,8 +226,7 @@ def _select_l1_candidates(
         ac for ac in aircraft_list
         if ac.get("icao") and ac.get("lat") is not None and ac.get("lon") is not None
         and str(ac.get("src") or "").lower() in {"opensky", "adsb_lol", "adsb_fi"}
-        and (_l1_cache_key(ac, now) not in _L1_CACHE
-             or now - _L1_CACHE[_l1_cache_key(ac, now)][0] > _L1_CACHE_TTL)
+        and not _l1_cache_is_fresh(ac, now)
     ]
     fresh_candidates.sort(key=lambda ac: ac.get("risk", 0), reverse=True)
     return fresh_candidates[:_L1_MAX_PER_CYCLE]
@@ -245,12 +263,14 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
             if isinstance(result, BaseException):
                 log.warning(f"L1 cross-validation failed for {ac.get('icao')}: {result}")
                 continue
-            _L1_CACHE[_l1_cache_key(ac, now)] = (now, result.to_dict())
+            _L1_CACHE[_l1_cache_key(ac, now)] = (
+                now, result.to_dict(), float(ac["lat"]), float(ac["lon"])
+            )
 
     # Apply cache (fresh this cycle or still within TTL) to every aircraft
     for ac in aircraft_list:
         cached = _L1_CACHE.get(_l1_cache_key(ac, now))
-        if not cached or now - cached[0] > _L1_CACHE_TTL:
+        if cached is None or not _l1_cache_is_fresh(ac, now):
             continue
         result = cached[1]
         ac["l1"] = {
@@ -1048,6 +1068,46 @@ def _deduplicate_track_records(records: List[tuple[str, dict]]) -> List[dict]:
     return [record[1] for record in selected.values()]
 
 
+def _select_l1_claim_records(records: List[tuple[str, dict]]) -> List[dict]:
+    """Keep one raw aggregator claim per ICAO for external L1 validation."""
+    selected: Dict[str, dict] = {}
+    allowed_sources = {"opensky", "adsb_lol", "adsb_fi"}
+    for namespace, track in records:
+        icao = str(track.get("icao") or "").upper()
+        source = str(track.get("src") or "").lower()
+        if (
+            namespace != "ac" or not icao or source not in allowed_sources
+            or track.get("lat") is None or track.get("lon") is None
+        ):
+            continue
+        existing = selected.get(icao)
+        if existing is None or float(track.get("ts") or 0) >= float(existing.get("ts") or 0):
+            selected[icao] = track
+    return list(selected.values())
+
+
+def _merge_l1_results(tracks: List[dict], claims: List[dict]) -> None:
+    """Transfer raw-claim L1 evidence onto the preferred canonical record."""
+    targets = {str(track.get("icao") or "").upper(): track for track in tracks}
+    for claim in claims:
+        target = targets.get(str(claim.get("icao") or "").upper())
+        if target is None or "l1" not in claim:
+            continue
+        target["l1"] = dict(claim["l1"])
+        if claim.get("risk", 0) > target.get("risk", 0):
+            target["risk"] = claim["risk"]
+            target["band"] = claim.get("band", target.get("band"))
+        anomalies = target.setdefault("anoms", [])
+        existing_types = {
+            item.get("type") for item in anomalies if isinstance(item, dict)
+        }
+        for item in claim.get("anoms", []):
+            if not isinstance(item, dict) or item.get("type") not in existing_types:
+                anomalies.append(item)
+                if isinstance(item, dict):
+                    existing_types.add(item.get("type"))
+
+
 async def broadcast_loop() -> None:
     """Broadcast all aircraft with TDOA validation to WebSocket clients."""
     global _track_snapshot
@@ -1086,14 +1146,17 @@ async def broadcast_loop() -> None:
                         continue
 
             tracks = _deduplicate_track_records(records)
+            l1_claims = _select_l1_claim_records(records)
 
             area = await load_coverage_area(redis_client)
             tracks = [track for track in tracks if _track_in_coverage(track, area)]
+            l1_claims = [claim for claim in l1_claims if _track_in_coverage(claim, area)]
 
             # L1 cross-validation runs once per broadcast tick on the whole
             # snapshot (internally bounded/cached), not per-track
             if TDOA_AVAILABLE and cross_validator:
-                await run_l1_cross_validation(tracks)
+                await run_l1_cross_validation(l1_claims)
+                _merge_l1_results(tracks, l1_claims)
             run_l2_l3_detection(tracks)
 
             await _publish_track_snapshot(tracks)

@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, patch
 from api.main import (
     _L1_CACHE,
     _deduplicate_track_records,
+    _merge_l1_results,
+    _select_l1_claim_records,
     _fetch_live_aircraft,
     _select_l1_candidates,
     _parse_adsb_lol_aircraft,
@@ -100,6 +102,55 @@ class _FakeSession:
 
 
 class AdsbLolFallbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_l1_cache_survives_small_movement_and_minute_boundary(self):
+        validator = AsyncMock()
+        validator.validate_aircraft.return_value = CrossValidationResult(
+            icao="ABC123", is_valid=True, max_disagreement_m=0,
+            confidence=0.9, sources_used=["adsb_lol"], verdict="VALIDATED",
+        )
+        _L1_CACHE.clear()
+        first = [{"icao": "ABC123", "lat": 39.95000, "lon": -75.16000, "src": "adsb_lol"}]
+        moved_one_metre = [{"icao": "ABC123", "lat": 39.950009, "lon": -75.16000, "src": "adsb_lol"}]
+
+        with (
+            patch("api.main.cross_validator", validator),
+            patch("api.main.time.time", side_effect=[59.0, 61.0]),
+        ):
+            await run_l1_cross_validation(first)
+            await run_l1_cross_validation(moved_one_metre)
+
+        self.assertEqual(validator.validate_aircraft.await_count, 1)
+        self.assertEqual(moved_one_metre[0]["l1"]["verdict"], "VALIDATED")
+
+    async def test_raw_claim_l1_result_is_merged_into_canonical_track(self):
+        validator = AsyncMock()
+        validator.validate_aircraft.return_value = CrossValidationResult(
+            icao="ABC123", is_valid=False, max_disagreement_m=9000,
+            confidence=0.95, sources_used=["adsb_lol", "adsb_fi"], verdict="SPOOFED",
+        )
+        _L1_CACHE.clear()
+        records = [
+            ("ac", {"icao": "ABC123", "lat": 39.95, "lon": -75.16,
+                    "src": "adsb_lol", "risk": 0, "anoms": []}),
+            ("sv", {"icao": "ABC123", "lat": 39.95, "lon": -75.16,
+                    "src": "ADSB", "risk": 20, "band": "NORMAL", "anoms": [],
+                    "layer_evaluations": {"L3": {"status": "EVALUATED"}}}),
+        ]
+        tracks = _deduplicate_track_records(records)
+        claims = _select_l1_claim_records(records)
+
+        with patch("api.main.cross_validator", validator):
+            await run_l1_cross_validation(claims)
+        _merge_l1_results(tracks, claims)
+
+        self.assertEqual(validator.validate_aircraft.await_count, 1)
+        self.assertEqual(tracks[0]["l1"]["verdict"], "SPOOFED")
+        self.assertEqual(tracks[0]["risk"], 80)
+        self.assertEqual(
+            [a["type"] for a in tracks[0]["anoms"]],
+            ["L1_POSITION_DISAGREEMENT"],
+        )
+
     async def test_http_429_fallback_receives_l1_enrichment(self):
         fallback_payload = {
             "ac": [{"hex": "a1b2c3", "lat": 39.95, "lon": -75.16}]
@@ -150,7 +201,7 @@ class AdsbLolFallbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         _L1_CACHE.clear()
         first = [{"icao": "ABC123", "lat": 39.9500, "lon": -75.1600, "src": "opensky"}]
-        moved = [{"icao": "ABC123", "lat": 39.9600, "lon": -75.1700, "src": "opensky"}]
+        moved = [{"icao": "ABC123", "lat": 40.9600, "lon": -76.1700, "src": "opensky"}]
 
         with patch("api.main.cross_validator", validator):
             await run_l1_cross_validation(first)
