@@ -509,6 +509,7 @@ class EnhancedAnomalyDetector:
         """Drop per-aircraft history (call when a track ages out)."""
         self.previous_states.pop(icao, None)
         self.integrity_history.pop(icao, None)
+        self._integrity_results.pop(icao, None)
 
 
 if __name__ == "__main__":

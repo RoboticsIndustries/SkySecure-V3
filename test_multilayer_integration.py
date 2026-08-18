@@ -20,6 +20,36 @@ from processing.fusion_engine import FusionEngine
 
 
 class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_mlat_replay_is_ignored(self):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        engine = FusionEngine(redis)
+        report = RawMLATReport(
+            session_id="replay-test",
+            solve_time=100.0,
+            icao24="ABC123",
+            lat=40.0,
+            lon=-75.0,
+            altitude_baro=12000,
+            num_receivers=4,
+            tdoa_residual=50.0,
+            cep90=100.0,
+        )
+
+        first = await engine.process_mlat(report)
+        self.assertIsNotNone(first)
+        assert first is not None
+        redis.get.return_value = first.to_bytes()
+
+        replay = await engine.process_mlat(report)
+
+        self.assertIsNone(replay)
+        self.assertEqual(first.update_count, 1)
+        self.assertEqual(
+            len([r for r in first.source_reports if r.source == DataSource.MLAT]),
+            1,
+        )
+
     async def test_adsb_only_track_marks_l4_skipped(self):
         redis = AsyncMock()
         redis.get.return_value = None

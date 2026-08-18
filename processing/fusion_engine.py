@@ -300,7 +300,7 @@ class FusionEngine:
             key=lambda source: source.timestamp,
             default=None,
         )
-        if latest_mlat is not None and report.solve_time < latest_mlat.timestamp:
+        if latest_mlat is not None and report.solve_time <= latest_mlat.timestamp:
             return None
         current_l4_evaluation = sv.layer_evaluations.get(DetectionLayer.L4.value)
         latest_l4_event = max(

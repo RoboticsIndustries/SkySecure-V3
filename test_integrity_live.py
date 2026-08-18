@@ -5,6 +5,19 @@ from anomaly.enhanced_detector import EnhancedAnomalyDetector
 
 
 class LiveIntegrityWiringTests(unittest.TestCase):
+    def test_forget_clears_integrity_result_cache_for_reacquisition(self):
+        detector = EnhancedAnomalyDetector()
+        for timestamp in (100.0, 110.0, 120.0):
+            detector.check_integrity("ABC123", 8, 10, timestamp)
+        degraded = detector.check_integrity("ABC123", 0, 0, 130.0)
+        self.assertGreaterEqual(degraded.score, 0.5)
+
+        detector.forget("ABC123")
+        reacquired = detector.check_integrity("ABC123", 8, 10, 50.0)
+
+        self.assertLess(reacquired.score, degraded.score)
+        self.assertEqual(detector.integrity_history["ABC123"], [(8, 10)])
+
     def tearDown(self):
         api.anomaly_detector = None
         api._L1_CACHE.clear()
