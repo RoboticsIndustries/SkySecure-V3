@@ -69,6 +69,7 @@ class LayerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(l2["skipped"], 0)
         self.assertEqual(l2["trigger_count"], 1)
         self.assertEqual(l2["detectors"]["turn_rate"], 1)
+        self.assertIn("NIC/NACp", payload["layers"]["L3"]["description"])
 
     async def test_layer_trigger_endpoint_returns_evidence(self):
         with patch("api.main.redis_client", self._redis(self._vectors())):

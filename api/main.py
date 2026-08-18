@@ -690,7 +690,7 @@ def _empty_layer_summary() -> Dict[str, Dict[str, Any]]:
     descriptions = {
         "L1": "Position and source cross-validation",
         "L2": "Kinematic and behavioral anomaly detection",
-        "L3": "Learned trajectory models",
+        "L3": "Trajectory models and ADS-B NIC/NACp integrity",
         "L4": "Multi-sensor fusion",
         "L5": "Identity and threat intelligence",
     }
