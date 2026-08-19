@@ -4,6 +4,9 @@ services:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    volumes:
+      - zookeeperdata:/var/lib/zookeeper/data
+      - zookeeperlog:/var/lib/zookeeper/log
     restart: unless-stopped
     networks: [skysecure]
 
@@ -28,6 +31,8 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    volumes:
+      - kafkadata:/var/lib/kafka/data
     networks: [skysecure]
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
@@ -84,6 +89,19 @@ services:
       timeout: 3s
       retries: 10
 
+  postgres-migrate:
+    platform: linux/amd64
+    image: postgis/postgis:15-3.3
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./scripts/migrations/001_fusion_event_commits.sql:/migration.sql:ro
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-h", "postgres", "-U", "skysecure", "-d", "skysecure", "-f", "/migration.sql"]
+    networks: [skysecure]
+
   adsb-ingestor:
     build:
       context: .
@@ -116,6 +134,12 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
       REDIS_URL: redis://redis:6379/0
+      MLAT_RECEIVER_API_KEYS: '${MLAT_RECEIVER_API_KEYS:?Set MLAT_RECEIVER_API_KEYS in .env}'
+      MLAT_SOLVER_SIGNING_KEY: '${MLAT_SOLVER_SIGNING_KEY:?Set MLAT_SOLVER_SIGNING_KEY in .env}'
+      MLAT_RECEIVER_LOCATIONS: '{"receiver-london":[51.5074,-0.1278,15.0],"receiver-paris":[48.8566,2.3522,35.0],"receiver-brussels":[50.8503,4.3517,20.0],"receiver-amsterdam":[52.3676,4.9041,5.0]}'
+      MLAT_MIN_RECEIVERS: 4
+      MLAT_MIN_BASELINE_M: 1000
+      MLAT_MIN_GEOMETRY_RATIO: 0.05
     depends_on:
       kafka:
         condition: service_healthy
@@ -135,6 +159,11 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://skysecure:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/skysecure
+      MLAT_SOLVER_SIGNING_KEY: '${MLAT_SOLVER_SIGNING_KEY:?Set MLAT_SOLVER_SIGNING_KEY in .env}'
+      MLAT_RECEIVER_LOCATIONS: '{"receiver-london":[51.5074,-0.1278,15.0],"receiver-paris":[48.8566,2.3522,35.0],"receiver-brussels":[50.8503,4.3517,20.0],"receiver-amsterdam":[52.3676,4.9041,5.0]}'
+      MLAT_MIN_RECEIVERS: 4
+      MLAT_MIN_BASELINE_M: 1000
+      MLAT_MIN_GEOMETRY_RATIO: 0.05
     depends_on:
       kafka:
         condition: service_healthy
@@ -144,6 +173,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
     networks: [skysecure]
 
@@ -179,6 +210,12 @@ services:
       ADSB_FALLBACK_LAT: ${ADSB_FALLBACK_LAT:-39.9526}
       ADSB_FALLBACK_LON: ${ADSB_FALLBACK_LON:--75.1652}
       ADSB_FALLBACK_RADIUS_NM: ${ADSB_FALLBACK_RADIUS_NM:-250}
+      OPERATOR_API_KEY: ${OPERATOR_API_KEY:-}
+      MLAT_RECEIVER_API_KEYS: '${MLAT_RECEIVER_API_KEYS:?Set MLAT_RECEIVER_API_KEYS in .env}'
+      MLAT_RECEIVER_LOCATIONS: '{"receiver-london":[51.5074,-0.1278,15.0],"receiver-paris":[48.8566,2.3522,35.0],"receiver-brussels":[50.8503,4.3517,20.0],"receiver-amsterdam":[52.3676,4.9041,5.0]}'
+      MLAT_MIN_RECEIVERS: 4
+      MLAT_MIN_BASELINE_M: 1000
+      MLAT_MIN_GEOMETRY_RATIO: 0.05
     depends_on:
       kafka:
         condition: service_healthy
@@ -211,6 +248,9 @@ services:
 volumes:
   pgdata:
   redisdata:
+  kafkadata:
+  zookeeperdata:
+  zookeeperlog:
 
 networks:
   skysecure:

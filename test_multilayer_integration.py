@@ -1,9 +1,10 @@
 import asyncio
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from anomaly.detector import AnomalyDetector, RuleEngine
+from config import settings
 from models import (
     AnomalyFlag,
     AnomalyType,
@@ -19,14 +20,99 @@ from models import (
 from processing.fusion_engine import FusionEngine
 
 
+def make_mlat_report(**values):
+    count = values.get("num_receivers", 4)
+    trusted = ["receiver-london", "receiver-paris", "receiver-brussels", "receiver-amsterdam"]
+    values.setdefault("receiver_ids", trusted[:count])
+    values.setdefault("source_event_ids", [f"{i:064x}" for i in range(count)])
+    return RawMLATReport(**values)
+
+
 class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fusion_rejects_unknown_or_unsafe_mlat_receiver_geometry(self):
+        redis = AsyncMock()
+        engine = FusionEngine(redis)
+        base = dict(
+            session_id="registry", solve_time=time.time(), icao24="ABC123",
+            lat=40.0, lon=-75.0, altitude_baro=10000, num_receivers=4,
+            tdoa_residual=10.0, cep90=100.0,
+            source_event_ids=[f"{i:064x}" for i in range(4)],
+        )
+
+        self.assertIsNone(await engine.process_mlat(RawMLATReport(
+            **base, receiver_ids=["unknown-a", "unknown-b", "unknown-c", "unknown-d"]
+        )))
+
+        unsafe = {
+            "receiver-london": [40.0, -75.0, 10.0],
+            "receiver-paris": [40.0, -75.0, 10.0],
+            "receiver-brussels": [40.0, -75.0, 10.0],
+            "receiver-amsterdam": [40.0, -75.0, 10.0],
+        }
+        with patch.object(settings, "MLAT_RECEIVER_LOCATIONS", unsafe):
+            self.assertIsNone(await engine.process_mlat(RawMLATReport(
+                **base,
+                receiver_ids=["receiver-london", "receiver-paris",
+                              "receiver-brussels", "receiver-amsterdam"],
+            )))
+
+        redis.get.assert_not_awaited()
+
+    async def test_fusion_rejects_stale_and_future_source_event_times_before_state_load(self):
+        now = time.time()
+        redis = AsyncMock()
+        engine = FusionEngine(redis)
+        adsb_base = dict(
+            icao24="ABC123", lat=40.0, lon=-75.0, receiver_id="feed",
+            raw_message="8DABC123", msg_type=17,
+        )
+        mlat_base = dict(
+            session_id="clock", icao24="ABC123", lat=40.0, lon=-75.0,
+            altitude_baro=10000, num_receivers=4, tdoa_residual=10.0,
+            cep90=100.0,
+            receiver_ids=["receiver-london", "receiver-paris",
+                          "receiver-brussels", "receiver-amsterdam"],
+            source_event_ids=[f"{i:064x}" for i in range(4)],
+        )
+
+        for timestamp in (now - 301.0, now + 6.0):
+            with self.subTest(source="adsb", timestamp=timestamp):
+                self.assertIsNone(await engine.process_adsb(
+                    RawADSBMessage(**adsb_base, recv_time=timestamp)
+                ))
+            with self.subTest(source="mlat", timestamp=timestamp):
+                self.assertIsNone(await engine.process_mlat(
+                    RawMLATReport(**mlat_base, solve_time=timestamp)
+                ))
+
+        redis.get.assert_not_awaited()
+
+    async def test_fusion_rejects_operationally_unacceptable_mlat_quality(self):
+        redis = AsyncMock()
+        engine = FusionEngine(redis)
+        base = dict(
+            session_id="quality", solve_time=time.time(), icao24="ABC123",
+            lat=40.0, lon=-75.0, altitude_baro=10000, num_receivers=4,
+            receiver_ids=["receiver-london", "receiver-paris",
+                          "receiver-brussels", "receiver-amsterdam"],
+        )
+        for override in (
+            {"tdoa_residual": 501.0, "cep90": 100.0},
+            {"tdoa_residual": 10.0, "cep90": 10_001.0},
+        ):
+            with self.subTest(override=override):
+                self.assertIsNone(await engine.process_mlat(
+                    RawMLATReport.model_construct(**(base | override))
+                ))
+        redis.get.assert_not_awaited()
+
     async def test_exact_mlat_replay_is_ignored(self):
         redis = AsyncMock()
         redis.get.return_value = None
         engine = FusionEngine(redis)
-        report = RawMLATReport(
+        report = make_mlat_report(
             session_id="replay-test",
-            solve_time=100.0,
+            solve_time=time.time(),
             icao24="ABC123",
             lat=40.0,
             lon=-75.0,
@@ -96,7 +182,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         redis = AsyncMock()
         redis.get.return_value = existing.to_bytes()
         engine = FusionEngine(redis)
-        report = RawMLATReport(
+        report = make_mlat_report(
             session_id="test",
             solve_time=event_time,
             icao24="ABC123",
@@ -136,7 +222,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         redis = AsyncMock()
         redis.get.return_value = existing.to_bytes()
-        report = RawMLATReport(
+        report = make_mlat_report(
             session_id="delayed",
             solve_time=now - 20,
             icao24="ABC123",
@@ -148,7 +234,6 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             num_receivers=4,
             tdoa_residual=100.0,
             cep90=50.0,
-            receiver_ids=["r1", "r2", "r3", "r4"],
         )
 
         result = await FusionEngine(redis).process_mlat(report)
@@ -163,45 +248,47 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mlat_selects_latest_event_time_aligned_adsb_report(self):
         redis = AsyncMock()
+        now = time.time()
         state = StateVector(
             icao24="ABC123",
-            last_seen=120.0,
+            last_seen=now,
             source_reports=[
                 SourceReport(
-                    source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=100.0
+                    source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=now - 20
                 ),
                 SourceReport(
-                    source=DataSource.ADSB, lat=10.0, lon=10.0, timestamp=120.0
+                    source=DataSource.ADSB, lat=10.0, lon=10.0, timestamp=now
                 ),
             ],
         )
         redis.get.return_value = state.to_bytes()
         engine = FusionEngine(redis)
 
-        result = await engine.process_mlat(RawMLATReport(
-            session_id="aligned", solve_time=102.0, icao24="ABC123",
+        result = await engine.process_mlat(make_mlat_report(
+            session_id="aligned", solve_time=now - 18, icao24="ABC123",
             lat=41.0, lon=-75.0, altitude_baro=30000,
             num_receivers=4, tdoa_residual=10.0, cep90=10.0,
         ))
 
         self.assertEqual(result.layer_evaluations["L4"].status, LayerStatus.TRIGGERED)
-        self.assertEqual(result.layer_evaluations["L4"].timestamp, 102.0)
+        self.assertEqual(result.layer_evaluations["L4"].timestamp, now - 18)
 
     async def test_slightly_delayed_mlat_can_compare_with_newer_adsb(self):
         redis = AsyncMock()
+        now = time.time()
         state = StateVector(
-            icao24="ABC123", last_seen=200.0,
+            icao24="ABC123", last_seen=now,
             source_reports=[SourceReport(
-                source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=200.0
+                source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=now
             )],
             layer_evaluations={"L4": LayerEvaluation(
-                layer=DetectionLayer.L4, status=LayerStatus.SKIPPED, timestamp=200.0
+                layer=DetectionLayer.L4, status=LayerStatus.SKIPPED, timestamp=now
             )},
         )
         redis.get.return_value = state.to_bytes()
 
-        result = await FusionEngine(redis).process_mlat(RawMLATReport(
-            session_id="late-aligned", solve_time=199.0, icao24="ABC123",
+        result = await FusionEngine(redis).process_mlat(make_mlat_report(
+            session_id="late-aligned", solve_time=now - 1, icao24="ABC123",
             lat=40.0, lon=-75.0, altitude_baro=10000,
             num_receivers=4, tdoa_residual=10.0, cep90=10.0,
         ))
@@ -210,7 +297,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert result is not None
         self.assertEqual(result.last_update_source, DataSource.MLAT)
         self.assertEqual(result.layer_evaluations["L4"].status, LayerStatus.EVALUATED)
-        self.assertEqual(result.layer_evaluations["L4"].timestamp, 199.0)
+        self.assertEqual(result.layer_evaluations["L4"].timestamp, now - 1)
 
     async def test_delayed_mlat_cannot_overwrite_newer_l4_lifecycle(self):
         redis = AsyncMock()
@@ -233,7 +320,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         redis.get.return_value = state.to_bytes()
         engine = FusionEngine(redis)
 
-        result = await engine.process_mlat(RawMLATReport(
+        result = await engine.process_mlat(make_mlat_report(
             session_id="old", solve_time=110.0, icao24="ABC123",
             lat=0.0, lon=0.0, altitude_baro=10000,
             num_receivers=4, tdoa_residual=10.0, cep90=10.0,
@@ -261,7 +348,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             sequence.append("mlat-process")
             return StateVector(icao24="ABC123")
 
-        async def save(state, _producer):
+        async def save(state, _producer, **_event):
             sequence.append(f"save-{state.primary_source.value}")
 
         engine.process_adsb = AsyncMock(side_effect=adsb_process)
@@ -271,7 +358,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             receiver_id="opensky", recv_time=100.0, icao24="ABC123",
             raw_message="", msg_type=17, lat=0.0, lon=0.0,
         )
-        mlat = RawMLATReport(
+        mlat = make_mlat_report(
             session_id="same", solve_time=100.0, icao24="ABC123",
             lat=0.0, lon=0.0, altitude_baro=10000,
             num_receivers=4, tdoa_residual=10.0, cep90=10.0,
@@ -472,9 +559,10 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_adsb_integrity_advances_against_adsb_time_not_newer_mlat_time(self):
+        now = time.time()
         state = StateVector(
             icao24="ABC123",
-            last_seen=200.0,
+            last_seen=now,
             nic=8,
             nac_p=10,
             source_reports=[
@@ -482,13 +570,13 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     source=DataSource.ADSB,
                     lat=40.0,
                     lon=-75.0,
-                    timestamp=100.0,
+                    timestamp=now - 100,
                 ),
                 SourceReport(
                     source=DataSource.MLAT,
                     lat=40.1,
                     lon=-75.1,
-                    timestamp=200.0,
+                    timestamp=now,
                 ),
             ],
         )
@@ -498,7 +586,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         report = RawADSBMessage(
             receiver_id="adsb_lol",
             icao24="ABC123",
-            recv_time=150.0,
+            recv_time=now - 50,
             raw_message="",
             msg_type=17,
             lat=40.05,
@@ -511,7 +599,7 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.nic, 2)
         self.assertEqual(result.nac_p, 3)
-        self.assertEqual(result.last_seen, 200.0)
+        self.assertEqual(result.last_seen, now)
 
     async def test_current_adsb_report_without_integrity_clears_stale_metadata(self):
         now = time.time()

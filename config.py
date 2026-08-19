@@ -4,6 +4,7 @@ config.py — Centralised configuration via environment variables.
 from __future__ import annotations
 from functools import lru_cache
 from typing import List, Dict, Any
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     KAFKA_GROUP_PREFIX:      str   = "skysecure"
 
     TOPIC_RAW_ADSB:          str   = "raw.adsb"
+    TOPIC_MLAT_RECEPTIONS:   str   = "raw.mlat.receptions"
     TOPIC_RAW_MLAT:          str   = "raw.mlat"
     TOPIC_RAW_ACARS:         str   = "raw.acars"
     TOPIC_FUSED_TRACKS:      str   = "fused.tracks"
@@ -44,8 +46,20 @@ class Settings(BaseSettings):
 
     # ─── Receiver Network (for MLAT) ───────────────────────────
     RECEIVER_TIMEOUT_SEC:    int   = 60
-    MLAT_MIN_RECEIVERS:      int   = 3
+    MLAT_MIN_RECEIVERS:      int   = Field(default=4, ge=4, le=64)
     MLAT_MAX_TDOA_RESIDUAL:  float = 500.0        # nanoseconds
+    MLAT_MAX_CEP90_M:        float = 10_000.0
+    MLAT_TIMESTAMP_NOISE_NS: float = Field(default=50.0, gt=0, le=10_000)
+    MLAT_MIN_BASELINE_M:     float = 1_000.0
+    MLAT_MIN_GEOMETRY_RATIO: float = 0.05
+    MLAT_RECEIVER_LOCATIONS: Dict[str, List[float]] = {
+        "receiver-london": [51.5074, -0.1278, 15.0],
+        "receiver-paris": [48.8566, 2.3522, 35.0],
+        "receiver-brussels": [50.8503, 4.3517, 20.0],
+        "receiver-amsterdam": [52.3676, 4.9041, 5.0],
+    }
+    SOURCE_EVENT_MAX_AGE_SEC: float = 300.0
+    SOURCE_EVENT_FUTURE_SKEW_SEC: float = 5.0
 
     # ─── Fusion ────────────────────────────────────────────────
     FUSION_CONFLICT_NM:      float = 5.0          # NM discrepancy → flag
@@ -71,6 +85,9 @@ class Settings(BaseSettings):
     # ─── API ───────────────────────────────────────────────────
     API_HOST:                str   = "0.0.0.0"
     API_PORT:                int   = 8000
+    OPERATOR_API_KEY:        str   = ""
+    MLAT_RECEIVER_API_KEYS:  Dict[str, str] = Field(default_factory=dict)
+    MLAT_SOLVER_SIGNING_KEY: str = ""
     API_CORS_ORIGINS:        List[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",

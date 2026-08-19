@@ -84,10 +84,10 @@ class LiveIntegrityWiringTests(unittest.TestCase):
             "alt": 12000, "vel": 400, "hdg": 90,
             "nic": 8, "nac_p": 10, "risk": 0, "band": "NORMAL", "anoms": [],
         }
-        for _ in range(3):
-            api.run_l2_l3_detection([dict(stable)])
+        for observed_at in (100.0, 101.0, 102.0):
+            api.run_l2_l3_detection([dict(stable, ts=observed_at)])
 
-        degraded = dict(stable, nic=2, nac_p=2, anoms=[])
+        degraded = dict(stable, nic=2, nac_p=2, anoms=[], ts=103.0)
         api.run_l2_l3_detection([degraded])
 
         self.assertIn("l3_integrity", degraded["fused"]["layers_available"])

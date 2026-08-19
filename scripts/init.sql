@@ -28,6 +28,29 @@ CREATE INDEX IF NOT EXISTS idx_track_geo ON track_points USING GIST (
     ST_SetSRID(ST_MakePoint(lon, lat), 4326)
 );
 
+CREATE TABLE IF NOT EXISTS fusion_event_commits (
+    event_id      TEXT PRIMARY KEY,
+    event_time    TIMESTAMPTZ NOT NULL,
+    icao24        CHAR(6) NOT NULL,
+    source        VARCHAR(16) NOT NULL,
+    raw_event     BYTEA NOT NULL,
+    raw_event_sha256 TEXT NOT NULL,
+    committed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fusion_outbox (
+    event_id     TEXT PRIMARY KEY REFERENCES fusion_event_commits(event_id),
+    topic        TEXT NOT NULL,
+    message_key  BYTEA NOT NULL,
+    payload      BYTEA NOT NULL,
+    delivered_at TIMESTAMPTZ,
+    lease_owner  TEXT,
+    lease_until  TIMESTAMPTZ,
+    attempts     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_fusion_outbox_pending
+    ON fusion_outbox (event_id) WHERE delivered_at IS NULL;
+
 -- ─── Anomaly events ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS anomaly_events (
     id              BIGSERIAL       PRIMARY KEY,

@@ -7,11 +7,42 @@ Uses Pydantic v2 for validation + fast serialization via orjson.
 
 from __future__ import annotations
 
+import math
 import time
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import orjson
+
+
+def normalize_icao24(value: str) -> str:
+    """Return canonical six-hex ICAO identity or reject the record."""
+    if not isinstance(value, str):
+        raise ValueError("ICAO24 must be a string")
+    normalized = value.strip().upper()
+    if len(normalized) != 6 or any(char not in "0123456789ABCDEF" for char in normalized):
+        raise ValueError("ICAO24 must contain exactly six hexadecimal characters")
+    return normalized
+
+
+class FiniteBaseModel(BaseModel):
+    """Canonical telemetry models reject NaN/Infinity at deserialization."""
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_nested_nonfinite(cls, value):
+        def walk(item):
+            if isinstance(item, float) and not math.isfinite(item):
+                raise ValueError("non-finite numeric value")
+            if isinstance(item, dict):
+                for nested in item.values():
+                    walk(nested)
+            elif isinstance(item, (list, tuple)):
+                for nested in item:
+                    walk(nested)
+        walk(value)
+        return value
 
 
 # ─── Enumerations ──────────────────────────────────────────────────────────────
@@ -79,7 +110,7 @@ class RiskBand(str, Enum):
 
 # ─── Raw Message Models ────────────────────────────────────────────────────────
 
-class RawADSBMessage(BaseModel):
+class RawADSBMessage(FiniteBaseModel):
     """
     Decoded ADS-B / Mode S message as received from an edge receiver.
     Timestamps are Unix epoch with microsecond precision.
@@ -91,24 +122,24 @@ class RawADSBMessage(BaseModel):
     msg_type:      int             = Field(ge=0, le=31, description="DF (Downlink Format)")
 
     # Decoded fields (may be None depending on message type)
-    callsign:      Optional[str]   = None
+    callsign:      Optional[str]   = Field(None, max_length=8)
     lat:           Optional[float] = Field(None, ge=-90, le=90)
     lon:           Optional[float] = Field(None, ge=-180, le=180)
-    altitude_baro: Optional[int]   = Field(None, description="Barometric altitude, feet")
-    altitude_geo:  Optional[int]   = Field(None, description="GNSS altitude, feet")
-    velocity:      Optional[float] = Field(None, ge=0, description="Ground speed, knots")
+    altitude_baro: Optional[int]   = Field(None, ge=-(2**31), le=2**31 - 1, description="Barometric altitude, feet")
+    altitude_geo:  Optional[int]   = Field(None, ge=-(2**31), le=2**31 - 1, description="GNSS altitude, feet")
+    velocity:      Optional[float] = Field(None, ge=0, le=2000, description="Ground speed, knots")
     heading:       Optional[float] = Field(None, ge=0, lt=360)
-    vertical_rate: Optional[int]   = Field(None, description="ft/min, positive=climb")
+    vertical_rate: Optional[int]   = Field(None, ge=-(2**31), le=2**31 - 1, description="ft/min, positive=climb")
     on_ground:     Optional[bool]  = None
-    squawk:        Optional[str]   = None
-    nic:           Optional[int]   = Field(None, description="Navigation Integrity Category")
-    nac_p:         Optional[int]   = Field(None, description="Navigation Accuracy Category - Position")
+    squawk:        Optional[str]   = Field(None, max_length=4)
+    nic:           Optional[int]   = Field(None, ge=0, le=15, description="Navigation Integrity Category")
+    nac_p:         Optional[int]   = Field(None, ge=0, le=15, description="Navigation Accuracy Category - Position")
     raim:          Optional[bool]   = Field(None, description="RAIM flag from GNSS")
 
     @field_validator("icao24")
     @classmethod
     def icao_uppercase(cls, v: str) -> str:
-        return v.upper()
+        return normalize_icao24(v)
 
     def to_bytes(self) -> bytes:
         return orjson.dumps(self.model_dump())
@@ -118,7 +149,7 @@ class RawADSBMessage(BaseModel):
         return cls(**orjson.loads(data))
 
 
-class RawMLATReport(BaseModel):
+class RawMLATReport(FiniteBaseModel):
     """
     Position estimate from the MLAT solver.
     """
@@ -127,13 +158,39 @@ class RawMLATReport(BaseModel):
     icao24:        str
     lat:           float  = Field(ge=-90, le=90)
     lon:           float  = Field(ge=-180, le=180)
-    altitude_baro: int
-    velocity:      Optional[float] = None
-    heading:       Optional[float] = None
-    num_receivers: int             = Field(ge=2, description="Receivers used in solve")
-    tdoa_residual: float           = Field(description="RMS TDOA residual (ns)")
-    cep90:         float           = Field(description="90% circular error probable, meters")
-    receiver_ids:  List[str]       = []
+    altitude_baro: int    = Field(ge=-(2**31), le=2**31 - 1)
+    velocity:      Optional[float] = Field(None, ge=0, le=2000)
+    heading:       Optional[float] = Field(None, ge=0, lt=360)
+    num_receivers: int             = Field(ge=4, le=64, description="Receivers used in solve")
+    tdoa_residual: float           = Field(ge=0, le=500, description="RMS TDOA residual (ns)")
+    cep90:         float           = Field(ge=0, le=10_000, description="90% circular error probable, meters")
+    receiver_ids:  List[str]       = Field(default_factory=list, min_length=4, max_length=64)
+    source_event_ids: List[str]    = Field(min_length=4, max_length=64)
+    auth_tag:       Optional[str]   = Field(None, min_length=64, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_receiver_identity(self):
+        if len(self.receiver_ids) != self.num_receivers:
+            raise ValueError("receiver_ids count must equal num_receivers")
+        if len(set(self.receiver_ids)) != len(self.receiver_ids):
+            raise ValueError("receiver_ids must be unique")
+        if len(self.source_event_ids) != self.num_receivers:
+            raise ValueError("source_event_ids count must equal num_receivers")
+        if len(set(self.source_event_ids)) != len(self.source_event_ids):
+            raise ValueError("source_event_ids must be unique")
+        if any(
+            len(event_id) != 64
+            or event_id != event_id.lower()
+            or any(char not in "0123456789abcdef" for char in event_id)
+            for event_id in self.source_event_ids
+        ):
+            raise ValueError("source_event_ids must be lowercase SHA-256 hex")
+        return self
+
+    @field_validator("icao24")
+    @classmethod
+    def validate_icao24(cls, value: str) -> str:
+        return normalize_icao24(value)
 
     def to_bytes(self) -> bytes:
         return orjson.dumps(self.model_dump())
@@ -163,7 +220,7 @@ class RawACARSMessage(BaseModel):
 
 # ─── Fused State Vector ────────────────────────────────────────────────────────
 
-class SourceReport(BaseModel):
+class SourceReport(FiniteBaseModel):
     """One source's contribution to the fused state."""
     source:     DataSource
     receiver_id: Optional[str] = None
@@ -178,7 +235,7 @@ class SourceReport(BaseModel):
     timestamp:  float           = Field(default_factory=time.time)
 
 
-class AnomalyFlag(BaseModel):
+class AnomalyFlag(FiniteBaseModel):
     anomaly_type: AnomalyType
     # Defaults preserve compatibility with state vectors written before layer
     # telemetry existed. New detectors always set these fields explicitly.
@@ -201,7 +258,7 @@ class AnomalyFlag(BaseModel):
         }
 
 
-class LayerEvaluation(BaseModel):
+class LayerEvaluation(FiniteBaseModel):
     layer:                 DetectionLayer
     status:                LayerStatus = LayerStatus.EVALUATED
     detectors_evaluated:   List[str] = []
@@ -211,7 +268,7 @@ class LayerEvaluation(BaseModel):
     timestamp:             float = Field(default_factory=time.time)
 
 
-class StateVector(BaseModel):
+class StateVector(FiniteBaseModel):
     """
     The canonical, unified representation of a single aircraft.
     This is the primary output of the fusion engine and the input
@@ -238,6 +295,8 @@ class StateVector(BaseModel):
     # Data provenance
     primary_source: DataSource      = DataSource.UNKNOWN
     last_update_source: DataSource  = DataSource.UNKNOWN
+    last_update_timestamp: Optional[float] = None
+    source_event_id: Optional[str] = None
     sources:        List[DataSource] = []
     source_reports: List[SourceReport] = []
     confidence:     float           = 0.0   # 0.0–1.0
@@ -260,6 +319,11 @@ class StateVector(BaseModel):
     # History (last N positions for trajectory display)
     position_history: List[Dict[str, Any]] = []
     MAX_HISTORY:    int             = 120   # ~2 min at 1Hz
+
+    @field_validator("icao24")
+    @classmethod
+    def validate_icao24(cls, value: str) -> str:
+        return normalize_icao24(value)
 
     def update_risk_band(self) -> None:
         if self.risk_score <= 20:

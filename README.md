@@ -49,9 +49,21 @@ Prerequisites:
 
 ```bash
 cp .env.example .env
-# Fill in the required local values without committing secrets.
+# Replace every placeholder, including all four distinct receiver credentials
+# and the independent solver-signing secret. Never commit .env.
+# Fresh installation only:
 docker compose up -d --build
 ```
+
+For an existing installation, never use the unrestricted command above. Preserve PostgreSQL, Redis, Kafka, ZooKeeper, and their volumes:
+
+```bash
+docker compose build fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+docker compose exec -T postgres psql -U skysecure -d skysecure -v ON_ERROR_STOP=1 < scripts/migrations/001_fusion_event_commits.sql
+docker compose up -d --no-deps --force-recreate fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+```
+
+The migration must succeed before application recreation. Do not use `docker compose down -v`, and do not include infrastructure services in the application update command.
 
 Open:
 

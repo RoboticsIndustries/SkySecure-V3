@@ -3,6 +3,7 @@ set -euo pipefail
 
 for spec in \
   raw.adsb:8 \
+  raw.mlat.receptions:8 \
   raw.mlat:4 \
   raw.acars:4 \
   fused.tracks:8 \

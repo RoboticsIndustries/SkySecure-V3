@@ -8,7 +8,7 @@ Also publishes to Kafka for the anomaly detection pipeline.
 """
 
 from __future__ import annotations
-import asyncio, time, logging, json
+import asyncio, time, logging, json, math
 from typing import Any, Optional
 
 import aiohttp
@@ -17,7 +17,7 @@ from aiokafka import AIOKafkaProducer
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from models import RawADSBMessage
+from models import RawADSBMessage, normalize_icao24
 from config import settings
 from coverage_area import COVERAGE_LOCK_KEY, coverage_url, load_coverage_area, load_coverage_area_record, within_coverage_area
 
@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 15   # seconds — stay well within OpenSky rate limits
 REDIS_TTL     = 60   # seconds — aircraft expire if not refreshed
+MAX_PROVIDER_RECORDS = 10_000
+REDIS_PIPELINE_CHUNK = 500
 
 def adsb_lol_fallback_url(
     lat: float | None = None,
@@ -43,11 +45,27 @@ async def current_coverage_url(redis_client: Any) -> str:
     return coverage_url(await load_coverage_area(redis_client))
 
 
-def _parse_adsb_lol_states(data: dict) -> list[list[Any]]:
+def _finite_number(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_adsb_lol_states(data: dict, received_at: Optional[float] = None) -> list[list[Any]]:
     """Convert adsb.lol records into the subset of OpenSky's state shape used here."""
     states = []
+    if not isinstance(data, dict) or not isinstance(data.get("ac") or [], list):
+        return states
+    received_at = time.time() if received_at is None else received_at
     for raw in data.get("ac") or []:
-        icao = str(raw.get("hex") or "").upper().lstrip("~")
+        if not isinstance(raw, dict):
+            continue
+        try:
+            icao = normalize_icao24(str(raw.get("hex") or "").lstrip("~"))
+        except ValueError:
+            continue
         lat, lon = raw.get("lat"), raw.get("lon")
         if len(icao) != 6 or lat is None or lon is None:
             continue
@@ -58,33 +76,34 @@ def _parse_adsb_lol_states(data: dict) -> list[list[Any]]:
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             continue
 
-        def number(value):
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        alt_ft = number(raw.get("alt_baro"))
-        speed_kts = number(raw.get("gs"))
-        vertical_fpm = number(raw.get("baro_rate"))
+        alt_ft = _finite_number(raw.get("alt_baro"))
+        speed_kts = _finite_number(raw.get("gs"))
+        vertical_fpm = _finite_number(raw.get("baro_rate"))
         # Preserve the 17-field OpenSky layout and append integrity metadata
         # supplied by adsb.lol. OpenSky leaves these extension slots absent.
         state: list[Any] = [None] * 19
         state[0] = icao
         state[1] = str(raw.get("flight") or "").strip() or None
+        age = _finite_number(raw.get("seen_pos"))
+        if age is not None:
+            event_time = received_at - max(0.0, age)
+            state[3] = event_time
+            state[4] = event_time
         state[5], state[6] = lon, lat
         state[7] = alt_ft / 3.28084 if alt_ft is not None else None
         state[8] = str(raw.get("alt_baro") or "").lower() == "ground"
         state[9] = speed_kts / 1.944 if speed_kts is not None else None
-        state[10] = number(raw.get("track"))
+        state[10] = _finite_number(raw.get("track"))
         state[11] = vertical_fpm / 196.85 if vertical_fpm is not None else None
-        state[17] = int(raw["nic"]) if number(raw.get("nic")) is not None else None
-        state[18] = int(raw["nac_p"]) if number(raw.get("nac_p")) is not None else None
+        nic = _finite_number(raw.get("nic"))
+        nac_p = _finite_number(raw.get("nac_p"))
+        state[17] = int(nic) if nic is not None else None
+        state[18] = int(nac_p) if nac_p is not None else None
         states.append(state)
     return states
 
 
-def _integrity_from_state(state: list[Any]) -> tuple[Optional[int], Optional[int]]:
+def _integrity_from_state(state: list[Any] | tuple[Any, ...]) -> tuple[Optional[int], Optional[int]]:
     """Read optional NIC/NACp extension fields without breaking OpenSky rows."""
     def optional_int(index: int) -> Optional[int]:
         if len(state) <= index or state[index] is None:
@@ -95,6 +114,60 @@ def _integrity_from_state(state: list[Any]) -> tuple[Optional[int], Optional[int
             return None
 
     return optional_int(17), optional_int(18)
+
+
+def _parse_feed_state(
+    state: Any,
+    source: str,
+    fallback_time: float,
+) -> Optional[tuple[dict[str, Any], RawADSBMessage]]:
+    """Validate one OpenSky-shaped row before any Redis/Kafka side effect."""
+    if not isinstance(state, (list, tuple)) or len(state) < 12:
+        return None
+    try:
+        icao = normalize_icao24(state[0])
+    except (TypeError, ValueError):
+        return None
+    lat, lon = _finite_number(state[6]), _finite_number(state[5])
+    if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    event_time = _finite_number(state[4])
+    if event_time is None:
+        event_time = _finite_number(state[3])
+    if event_time is None or event_time < 0:
+        return None
+    receipt_time = _finite_number(fallback_time)
+    if receipt_time is None or not (
+        receipt_time - settings.SOURCE_EVENT_MAX_AGE_SEC
+        <= event_time
+        <= receipt_time + settings.SOURCE_EVENT_FUTURE_SKEW_SEC
+    ):
+        return None
+    altitude_m = _finite_number(state[7])
+    velocity_ms = _finite_number(state[9])
+    heading = _finite_number(state[10])
+    vertical_ms = _finite_number(state[11])
+    altitude = int(altitude_m * 3.28084) if altitude_m is not None else None
+    velocity = int(velocity_ms * 1.944) if velocity_ms is not None else None
+    vertical_rate = int(vertical_ms * 196.85) if vertical_ms is not None else None
+    callsign = state[1].strip().upper() if isinstance(state[1], str) else None
+    nic, nac_p = _integrity_from_state(state)
+    message = RawADSBMessage(
+        receiver_id=source, recv_time=event_time, icao24=icao,
+        raw_message="", msg_type=17, callsign=callsign or None,
+        lat=lat, lon=lon, altitude_baro=altitude, velocity=velocity,
+        heading=heading, vertical_rate=vertical_rate,
+        on_ground=state[8] is True, nic=nic, nac_p=nac_p,
+    )
+    aircraft = {
+        "icao": icao, "cs": callsign or None, "lat": lat, "lon": lon,
+        "alt": altitude, "vel": velocity, "hdg": heading,
+        "vr": vertical_rate, "gnd": state[8] is True,
+        "nic": nic, "nac_p": nac_p, "ts": event_time, "src": source,
+        "risk": 0, "anoms": [], "cls": "CIVILIAN", "conf": 0.85,
+        "mil": 0.0, "band": "NORMAL", "trail": [],
+    }
+    return aircraft, message
 
 
 async def run() -> None:
@@ -146,8 +219,11 @@ async def run() -> None:
                         continue
                     else:
                         data = await resp.json(content_type=None)
-                        states = data.get("states") or []
-                        recv_t = float(data.get("time", time.time()))
+                        states = data.get("states") or [] if isinstance(data, dict) else []
+                        if not isinstance(states, list):
+                            states = []
+                        recv_t = _finite_number(data.get("time")) if isinstance(data, dict) else None
+                        recv_t = time.time() if recv_t is None else recv_t
                         log.info("OpenSky returned %d states", len(states))
 
                     _, current_token = await load_coverage_area_record(redis_client)
@@ -155,74 +231,29 @@ async def run() -> None:
                         log.info("Coverage changed during fetch; discarding stale batch")
                         continue
 
-                    pipe = redis_client.pipeline()
                     kafka_messages = []
                     published = 0
 
-                    for s in states:
-                        if not s or s[0] is None or s[5] is None or s[6] is None:
-                            continue
-                        icao = s[0].upper().strip()
-                        if len(icao) != 6:
-                            continue
-                        try:
-                            lat, lon = float(s[6]), float(s[5])
-                        except (TypeError, ValueError):
-                            continue
-                        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                            continue
-                        if not within_coverage_area(lat, lon, area):
-                            continue
-                        nic, nac_p = _integrity_from_state(s)
-
-                        def ft(m):
-                            try: return int(float(m) * 3.28084) if m else None
-                            except: return None
-                        def kts(ms):
-                            try: return int(float(ms) * 1.944) if ms else None
-                            except: return None
-
-                        # Compact aircraft dict written directly to Redis
-                        ac = {
-                            "icao": icao,
-                            "cs":   (s[1] or "").strip() or None,
-                            "lat":  lat, "lon": lon,
-                            "alt":  ft(s[7]), "vel": kts(s[9]),
-                            "hdg":  float(s[10]) if s[10] else None,
-                            "vr":   int(float(s[11]) * 196.85) if s[11] else None,
-                            "gnd":  bool(s[8]) if s[8] is not None else False,
-                            "nic": nic, "nac_p": nac_p,
-                            "ts": recv_t,
-                            "src":  source,
-                            "risk": 0, "anoms": [], "cls": "CIVILIAN",
-                            "conf": 0.85, "mil": 0.0, "band": "NORMAL", "trail": [],
-                        }
-
-                        # Write to Redis directly — instantly visible to API
-                        pipe.setex(
-                            f"ac:{icao}",
-                            REDIS_TTL,
-                            json.dumps(ac).encode(),
+                    if not isinstance(states, list):
+                        states = []
+                    if len(states) > MAX_PROVIDER_RECORDS:
+                        log.warning(
+                            "Provider batch capped from %d to %d records",
+                            len(states), MAX_PROVIDER_RECORDS,
                         )
-
-                        # Also publish to Kafka for anomaly detection pipeline
+                    for state in states[:MAX_PROVIDER_RECORDS]:
                         try:
-                            msg = RawADSBMessage(
-                                receiver_id=source, recv_time=recv_t,
-                                icao24=icao, raw_message="", msg_type=17,
-                                callsign=ac["cs"], lat=lat, lon=lon,
-                                altitude_baro=ft(s[7]),
-                                velocity=kts(s[9]),
-                                heading=float(s[10]) if s[10] else None,
-                                vertical_rate=int(float(s[11]) * 196.85) if s[11] else None,
-                                on_ground=bool(s[8]) if s[8] is not None else False,
-                                nic=nic, nac_p=nac_p,
-                            )
-                            kafka_messages.append((icao.encode(), msg.to_bytes()))
-                        except Exception:
-                            pass  # Kafka failure doesn't block display
-
-                        published += 1
+                            parsed = _parse_feed_state(state, source, recv_t)
+                        except Exception as exc:
+                            log.warning("Skipping malformed %s row: %s", source, exc)
+                            continue
+                        if parsed is None:
+                            continue
+                        ac, msg = parsed
+                        if not within_coverage_area(ac["lat"], ac["lon"], area):
+                            continue
+                        icao = ac["icao"]
+                        kafka_messages.append((icao.encode(), msg.to_bytes(), ac))
 
                     lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
                     async with lock:
@@ -230,23 +261,45 @@ async def run() -> None:
                         if final_token != coverage_token:
                             log.info("Coverage changed during processing; discarding stale batch")
                             continue
-                        for key, value in kafka_messages:
+                        redis_batch = []
+                        for key, value, ac in kafka_messages:
                             await lock.extend(30, replace_ttl=True)
                             try:
                                 await asyncio.wait_for(
-                                    producer.send(
+                                    producer.send_and_wait(
                                         topic=settings.TOPIC_RAW_ADSB,
                                         key=key,
                                         value=value,
                                     ),
                                     timeout=2.0,
                                 )
+                                redis_batch.append(ac)
+                                published += 1
+                                if len(redis_batch) >= REDIS_PIPELINE_CHUNK:
+                                    pipe = redis_client.pipeline()
+                                    for pending in redis_batch:
+                                        pipe.setex(
+                                            f"ac:{pending['icao']}", REDIS_TTL,
+                                            json.dumps(pending).encode(),
+                                        )
+                                    await asyncio.wait_for(pipe.execute(), timeout=5.0)
+                                    redis_batch.clear()
                             except asyncio.TimeoutError:
                                 log.warning("Kafka send timed out for %s", key.decode(errors="ignore"))
-                            except Exception:
-                                pass  # Kafka failure does not block direct Redis display
-                        await lock.extend(30, replace_ttl=True)
-                        await asyncio.wait_for(pipe.execute(), timeout=5.0)
+                            except Exception as exc:
+                                log.warning(
+                                    "Kafka send failed for %s: %s",
+                                    key.decode(errors="ignore"), exc,
+                                )
+                        if redis_batch:
+                            await lock.extend(30, replace_ttl=True)
+                            pipe = redis_client.pipeline()
+                            for pending in redis_batch:
+                                pipe.setex(
+                                    f"ac:{pending['icao']}", REDIS_TTL,
+                                    json.dumps(pending).encode(),
+                                )
+                            await asyncio.wait_for(pipe.execute(), timeout=5.0)
                     log.info("Wrote %d aircraft to Redis (ac:*)", published)
 
             except Exception as e:

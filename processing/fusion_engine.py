@@ -22,8 +22,10 @@ Conflict detection:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
+import secrets
 import time
 import weakref
 from typing import List, Optional
@@ -43,6 +45,11 @@ from models import (
     LayerEvaluation, LayerStatus, RiskBand
 )
 from config import settings, KAFKA_CONSUMER_STABILITY
+from kafka_offsets import commit_record
+from processing.mlat_solver import (
+    geodetic_to_ecef, receiver_geometry_is_safe, validate_receiver_configuration,
+    verify_mlat_report,
+)
 
 log = logging.getLogger(__name__)
 
@@ -146,7 +153,19 @@ class FusionEngine:
     def _aircraft_lock(self, icao24: str) -> asyncio.Lock:
         return self._aircraft_locks.setdefault(icao24.upper(), asyncio.Lock())
 
+    @staticmethod
+    def _source_event_time_is_acceptable(timestamp: float) -> bool:
+        now = time.time()
+        return (
+            now - settings.SOURCE_EVENT_MAX_AGE_SEC
+            <= timestamp
+            <= now + settings.SOURCE_EVENT_FUTURE_SKEW_SEC
+        )
+
     async def process_adsb(self, msg: RawADSBMessage) -> Optional[StateVector]:
+        if not self._source_event_time_is_acceptable(msg.recv_time):
+            log.warning("Rejecting stale/future ADS-B event time %s", msg.recv_time)
+            return None
         sv = await self._load_or_create(msg.icao24)
         latest_adsb = max(
             (report for report in sv.source_reports
@@ -287,6 +306,7 @@ class FusionEngine:
             sv.confidence = confidence_for_source(DataSource.ADSB)
         sv.last_seen = max(prior_last_seen, msg.recv_time)
         sv.last_update_source = DataSource.ADSB
+        sv.last_update_timestamp = msg.recv_time
         sv.update_count += 1
         if is_current_event:
             sv.add_position_history()
@@ -294,6 +314,28 @@ class FusionEngine:
         return sv
 
     async def process_mlat(self, report: RawMLATReport) -> Optional[StateVector]:
+        if not self._source_event_time_is_acceptable(report.solve_time):
+            log.warning("Rejecting stale/future MLAT event time %s", report.solve_time)
+            return None
+        if (
+            report.tdoa_residual > settings.MLAT_MAX_TDOA_RESIDUAL
+            or report.cep90 > settings.MLAT_MAX_CEP90_M
+        ):
+            log.warning(
+                "Rejecting operationally invalid MLAT report %s: residual=%s cep90=%s",
+                report.session_id, report.tdoa_residual, report.cep90,
+            )
+            return None
+        try:
+            receiver_positions = [
+                geodetic_to_ecef(*settings.MLAT_RECEIVER_LOCATIONS[receiver_id])
+                for receiver_id in report.receiver_ids
+            ]
+        except (KeyError, TypeError, ValueError):
+            log.warning("Rejecting MLAT report with unknown receiver identity")
+            return None
+        if not receiver_geometry_is_safe(receiver_positions):
+            return None
         sv = await self._load_or_create(report.icao24)
         latest_mlat = max(
             (source for source in sv.source_reports
@@ -409,6 +451,7 @@ class FusionEngine:
         sv.confidence = max(sv.confidence, mlat_conf)
         sv.last_seen = max(prior_last_seen, report.solve_time)
         sv.last_update_source = DataSource.MLAT
+        sv.last_update_timestamp = report.solve_time
         sv.update_count += 1
         if report.solve_time >= prior_last_seen:
             sv.add_position_history()
@@ -453,7 +496,11 @@ class FusionEngine:
                 score_delta=dup_flag.score_delta if dup_flag else 0,
                 timestamp=msg.recv_time,
             )
-            await self.save(sv, producer)
+            await self.save(
+                sv, producer, event=msg,
+                duplicate_position=(msg.lat, msg.lon, msg.recv_time)
+                if msg.lat is not None and msg.lon is not None else None,
+            )
             return True
 
     async def handle_mlat(self, report, producer) -> bool:
@@ -462,7 +509,9 @@ class FusionEngine:
             sv = await self.process_mlat(report)
             if sv is None:
                 return False
-            await self.save(sv, producer)
+            await self.save(
+                sv, producer, event=report,
+            )
             return True
 
     async def _load_or_create(self, icao24: str) -> StateVector:
@@ -471,54 +520,216 @@ class FusionEngine:
 
         if raw:
             try:
-                return StateVector.from_bytes(raw)
+                sv = StateVector.from_bytes(raw)
+                if sv.icao24 == icao24.upper():
+                    return sv
+                log.error("Ignoring identity-mismatched state at %s", key)
             except Exception:
                 pass
 
         return StateVector(icao24=icao24.upper(), first_seen=time.time())
 
-    async def save(self, sv: StateVector, producer: AIOKafkaProducer) -> None:
-        key = f"fusion:sv:{sv.icao24}"
-        payload = sv.to_bytes()
-        await producer.send_and_wait(
-            topic=settings.TOPIC_FUSED_TRACKS,
-            key=sv.icao24.encode(),
-            value=payload,
+    async def deliver_outbox_event(self, event_id: str, producer) -> bytes:
+        """Lease, acknowledge, and conditionally mark one durable outbox row."""
+        if self.postgres is None:
+            raise RuntimeError("PostgreSQL is required for fusion outbox delivery")
+        token = secrets.token_hex(16)
+        row = await self.postgres.fetchrow(
+            """
+            UPDATE fusion_outbox
+            SET lease_owner=$2, lease_until=NOW() + INTERVAL '30 seconds',
+                attempts=attempts + 1
+            WHERE event_id=$1 AND delivered_at IS NULL
+              AND (lease_until IS NULL OR lease_until < NOW())
+            RETURNING topic, message_key, payload
+            """,
+            event_id, token,
         )
-        await self.redis.setex(key, settings.REDIS_TTL_STATE_VECTOR, payload)
+        if row is None:
+            existing = await self.postgres.fetchrow(
+                "SELECT payload, delivered_at FROM fusion_outbox WHERE event_id=$1",
+                event_id,
+            )
+            if existing is None:
+                raise RuntimeError("Fusion outbox row is missing")
+            if existing["delivered_at"] is None:
+                raise RuntimeError("Fusion outbox row is leased by another worker")
+            return bytes(existing["payload"])
+
+        payload = bytes(row["payload"])
+        try:
+            await producer.send_and_wait(
+                topic=row["topic"], key=bytes(row["message_key"]), value=payload,
+            )
+            result = await self.postgres.execute(
+                """
+                UPDATE fusion_outbox
+                SET delivered_at=NOW(), lease_owner=NULL, lease_until=NULL
+                WHERE event_id=$1 AND lease_owner=$2 AND delivered_at IS NULL
+                """,
+                event_id, token,
+            )
+            if result != "UPDATE 1":
+                raise RuntimeError("Lost fusion outbox lease before delivery mark")
+        except BaseException:
+            await self.postgres.execute(
+                """
+                UPDATE fusion_outbox SET lease_owner=NULL, lease_until=NULL
+                WHERE event_id=$1 AND lease_owner=$2 AND delivered_at IS NULL
+                """,
+                event_id, token,
+            )
+            raise
+        return payload
+
+    async def save(
+        self,
+        sv: StateVector,
+        producer: AIOKafkaProducer,
+        *,
+        event: Optional[RawADSBMessage | RawMLATReport] = None,
+        duplicate_position: Optional[tuple[float, float, float]] = None,
+    ) -> None:
+        if self.postgres is not None and event is None:
+            raise ValueError("PostgreSQL persistence requires an immutable source event")
+        if event is not None and sv.icao24 != event.icao24:
+            raise ValueError("Fused state and source event identities do not match")
+        persisted_icao24 = event.icao24 if event is not None else sv.icao24
+        key = f"fusion:sv:{persisted_icao24}"
+        payload = sv.to_bytes()
+        raw_event = b""
+        raw_event_sha256 = ""
+        if isinstance(event, RawADSBMessage):
+            source_value = DataSource.ADSB.value
+            persisted_event_time = event.recv_time
+            raw_event = event.to_bytes()
+            raw_event_sha256 = hashlib.sha256(raw_event).hexdigest()
+            persisted_event_id = hashlib.sha256(
+                b"ADSB:" + raw_event
+            ).hexdigest()
+            record = (
+                event.callsign, event.lat, event.lon, event.altitude_baro,
+                event.altitude_geo, event.velocity, event.heading,
+                event.vertical_rate, confidence_for_source(DataSource.ADSB),
+                0, Classification.UNKNOWN.value, event.on_ground,
+            )
+        elif isinstance(event, RawMLATReport):
+            source_value = DataSource.MLAT.value
+            persisted_event_time = event.solve_time
+            raw_event = event.to_bytes()
+            raw_event_sha256 = hashlib.sha256(raw_event).hexdigest()
+            persisted_event_id = hashlib.sha256(
+                b"MLAT:" + raw_event
+            ).hexdigest()
+            receiver_bonus = min(1.0, event.num_receivers / 6.0)
+            residual_penalty = max(
+                0.0,
+                1.0 - event.tdoa_residual / settings.MLAT_MAX_TDOA_RESIDUAL,
+            )
+            event_confidence = (
+                confidence_for_source(DataSource.MLAT)
+                * receiver_bonus
+                * residual_penalty
+            )
+            record = (
+                None, event.lat, event.lon, event.altitude_baro, None,
+                event.velocity, event.heading, None, event_confidence,
+                0, Classification.UNKNOWN.value, None,
+            )
+        else:
+            source = sv.last_update_source or sv.primary_source
+            source_value = source.value
+            persisted_event_time = sv.last_seen
+            persisted_event_id = hashlib.sha256(
+                source_value.encode() + b":" + payload
+            ).hexdigest()
+            record = (
+                sv.callsign, sv.lat, sv.lon, sv.altitude_baro,
+                sv.altitude_geo, sv.velocity, sv.heading, sv.vertical_rate,
+                sv.confidence, sv.risk_score, sv.classification.value,
+                sv.on_ground,
+            )
+        (
+            event_callsign, event_lat, event_lon, event_altitude_baro,
+            event_altitude_geo, event_velocity, event_heading,
+            event_vertical_rate, event_confidence, event_risk_score,
+            event_classification, event_on_ground,
+        ) = record
+        sv.source_event_id = persisted_event_id
+        payload = sv.to_bytes()
+        # Persist first. The event claim makes replay after a later Kafka/Redis
+        # failure idempotent while distinct delayed source events retain rows.
         if self.postgres is not None:
-            try:
-                await self.postgres.execute(
-                    """
-                    INSERT INTO track_points (
-                        time, icao24, callsign, lat, lon, altitude_baro,
-                        altitude_geo, velocity, heading, vertical_rate,
-                        source, confidence, risk_score, classification,
-                        raw_icao, on_ground
-                    ) VALUES (
-                        to_timestamp($1), $2, $3, $4, $5, $6, $7, $8,
-                        $9, $10, $11, $12, $13, $14, $15, $16
-                    )
-                    """,
-                    sv.last_seen,
-                    sv.icao24,
-                    sv.callsign,
-                    sv.lat,
-                    sv.lon,
-                    sv.altitude_baro,
-                    sv.altitude_geo,
-                    sv.velocity,
-                    sv.heading,
-                    sv.vertical_rate,
-                    sv.primary_source.value,
-                    sv.confidence,
-                    sv.risk_score,
-                    sv.classification.value,
-                    int(sv.icao24, 16),
-                    sv.on_ground,
+            await self.postgres.execute(
+                """
+                WITH claimed AS (
+                    INSERT INTO fusion_event_commits (
+                        event_id, event_time, icao24, source,
+                        raw_event, raw_event_sha256
+                    ) VALUES ($1, to_timestamp($2), $3, $4, $18, $19)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING 1
                 )
-            except Exception as exc:
-                log.error("PostgreSQL track persistence failed for %s: %s", sv.icao24, exc)
+                , inserted_track AS (
+                INSERT INTO track_points (
+                    time, icao24, callsign, lat, lon, altitude_baro,
+                    altitude_geo, velocity, heading, vertical_rate,
+                    source, confidence, risk_score, classification,
+                    raw_icao, on_ground
+                )
+                SELECT
+                    to_timestamp($2), $3, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $4, $13, $14, $15, $16, $17
+                FROM claimed
+                RETURNING 1
+                )
+                INSERT INTO fusion_outbox (
+                    event_id, topic, message_key, payload
+                )
+                SELECT $1, $20, $21, $22 FROM claimed
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                persisted_event_id,
+                persisted_event_time,
+                persisted_icao24,
+                source_value,
+                event_callsign,
+                event_lat,
+                event_lon,
+                event_altitude_baro,
+                event_altitude_geo,
+                event_velocity,
+                event_heading,
+                event_vertical_rate,
+                event_confidence,
+                event_risk_score,
+                event_classification,
+                int(persisted_icao24, 16),
+                event_on_ground,
+                raw_event,
+                raw_event_sha256,
+                settings.TOPIC_FUSED_TRACKS,
+                persisted_icao24.encode(),
+                payload,
+            )
+            payload = await self.deliver_outbox_event(persisted_event_id, producer)
+        else:
+            await producer.send_and_wait(
+                topic=settings.TOPIC_FUSED_TRACKS,
+                key=persisted_icao24.encode(),
+                value=payload,
+            )
+        if duplicate_position is None:
+            await self.redis.setex(key, settings.REDIS_TTL_STATE_VECTOR, payload)
+        else:
+            lat, lon, event_time = duplicate_position
+            pipeline = self.redis.pipeline(transaction=True)
+            pipeline.setex(key, settings.REDIS_TTL_STATE_VECTOR, payload)
+            pipeline.setex(
+                f"pos_check:{persisted_icao24}", 10,
+                orjson.dumps({"lat": lat, "lon": lon, "timestamp": event_time}),
+            )
+            await pipeline.execute()
 
     async def _lookup_icao_by_registration(self, registration: Optional[str]) -> Optional[str]:
         if not registration:
@@ -585,19 +796,68 @@ class DuplicateICAODetector:
                     timestamp=event_time,
                 )
 
+        return None
+
+    async def record(
+        self, icao24: str, lat: float, lon: float, event_time: float
+    ) -> None:
+        key = f"pos_check:{icao24}"
         await self.redis.setex(
             key, 10,
             orjson.dumps({"lat": lat, "lon": lon, "timestamp": event_time}),
         )
-        return None
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
+
+async def drain_fusion_outbox_periodically(
+    engine: FusionEngine, producer, *, batch_size: int = 100, interval: float = 2.0,
+) -> None:
+    """Boundedly recover pending PostgreSQL outbox rows independent of source replay."""
+    if engine.postgres is None:
+        raise RuntimeError("PostgreSQL is required for fusion outbox recovery")
+    while True:
+        rows = await engine.postgres.fetch(
+            """
+            SELECT o.event_id FROM fusion_outbox AS o
+            JOIN fusion_event_commits AS c USING (event_id)
+            WHERE o.delivered_at IS NULL
+              AND c.committed_at < NOW() - INTERVAL '5 seconds'
+              AND (o.lease_until IS NULL OR o.lease_until < NOW())
+            ORDER BY o.event_id LIMIT $1
+            """,
+            batch_size,
+        )
+        failed = False
+        for row in rows:
+            try:
+                await engine.deliver_outbox_event(row["event_id"], producer)
+            except Exception as exc:
+                failed = True
+                log.warning("Fusion outbox recovery failed for %s: %s", row["event_id"], exc)
+        await asyncio.sleep(interval if failed or len(rows) < batch_size else 0)
+
+
+async def supervise_fusion_tasks(*coroutines) -> None:
+    """Fail the service if any consumer or outbox recovery task stops."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        raise RuntimeError("A supervised fusion task stopped unexpectedly")
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 async def run() -> None:
     logging.basicConfig(level=settings.LOG_LEVEL)
     log.info("Starting fusion engine")
 
+    validate_receiver_configuration()
+    if not settings.MLAT_SOLVER_SIGNING_KEY:
+        raise ValueError("MLAT solver signing key is required")
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
     postgres_pool = await asyncpg.create_pool(
         settings.POSTGRES_DSN,
@@ -642,12 +902,17 @@ async def run() -> None:
         async for msg in consumer_adsb:
             try:
                 adsb = RawADSBMessage.from_bytes(msg.value)
+            except Exception as exc:
+                log.error("Discarding malformed ADS-B record: %s", exc)
+                await commit_record(consumer_adsb, msg)
+                continue
+            try:
                 accepted = await engine.handle_adsb(adsb, producer, dup_detector)
                 if accepted:
                     count += 1
                     if count % 5000 == 0:
                         log.info("Fusion: processed %d ADS-B messages", count)
-                await consumer_adsb.commit()
+                await commit_record(consumer_adsb, msg)
             except Exception as e:
                 log.error("ADS-B fusion error: %s", e)
                 raise
@@ -656,14 +921,27 @@ async def run() -> None:
         async for msg in consumer_mlat:
             try:
                 report = RawMLATReport.from_bytes(msg.value)
+            except Exception as exc:
+                log.error("Discarding malformed MLAT record: %s", exc)
+                await commit_record(consumer_mlat, msg)
+                continue
+            if not verify_mlat_report(report, settings.MLAT_SOLVER_SIGNING_KEY):
+                log.error("Discarding unauthenticated solver MLAT report")
+                await commit_record(consumer_mlat, msg)
+                continue
+            try:
                 await engine.handle_mlat(report, producer)
-                await consumer_mlat.commit()
+                await commit_record(consumer_mlat, msg)
             except Exception as e:
                 log.error("MLAT fusion error: %s", e)
                 raise
 
     try:
-        await asyncio.gather(process_adsb_stream(), process_mlat_stream())
+        await supervise_fusion_tasks(
+            process_adsb_stream(),
+            process_mlat_stream(),
+            drain_fusion_outbox_periodically(engine, producer),
+        )
     finally:
         await consumer_adsb.stop()
         await consumer_mlat.stop()

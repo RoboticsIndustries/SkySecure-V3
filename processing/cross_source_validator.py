@@ -204,13 +204,16 @@ class CrossSourceValidator:
                 s = states[0]
                 if s[6] is None or s[5] is None:
                     return None
+                observed_at = s[4] if s[4] is not None else s[3]
+                if observed_at is None:
+                    return None
                 return SourceReport(
                     source="opensky", icao=icao,
                     lat=float(s[6]), lon=float(s[5]),
                     alt_ft=float(s[7]) * 3.28084 if s[7] else None,
                     velocity_kts=float(s[9]) * 1.94384 if s[9] else None,
                     heading_deg=float(s[10]) if s[10] else None,
-                    observed_at=float(s[3] or s[4] or data.get("time", time.time())),
+                    observed_at=float(observed_at),
                 )
         except Exception as e:
             logger.warning(f"OpenSky fetch failed for {icao}: {e}")
@@ -239,13 +242,16 @@ class CrossSourceValidator:
                     lat, lon = a.get("lat"), a.get("lon")
                     if lat is None or lon is None:
                         continue
+                    seen = a.get("seen_pos", a.get("seen"))
+                    if seen is None:
+                        continue
                     return SourceReport(
                         source=name, icao=icao,
                         lat=float(lat), lon=float(lon),
                         alt_ft=a.get("alt_baro") if isinstance(a.get("alt_baro"), (int, float)) else None,
                         velocity_kts=a.get("gs"),
                         heading_deg=a.get("track"),
-                        observed_at=time.time() - float(a.get("seen", 0) or 0),
+                        observed_at=time.time() - max(0.0, float(seen)),
                     )
                 return None
         except Exception as e:
@@ -275,6 +281,39 @@ class CrossSourceValidator:
         claimed_velocity_kts: Optional[float] = None, claimed_heading_deg: Optional[float] = None,
         claimed_observed_at: Optional[float] = None,
     ) -> CrossValidationResult:
+        def finite(value: Optional[float]) -> bool:
+            return value is not None and math.isfinite(value)
+
+        reports = [
+            report for report in reports
+            if finite(report.lat) and -90 <= report.lat <= 90
+            and finite(report.lon) and -180 <= report.lon <= 180
+            and finite(report.observed_at) and report.observed_at >= 0
+            and (report.velocity_kts is None or (
+                finite(report.velocity_kts) and report.velocity_kts >= 0
+            ))
+            and (report.heading_deg is None or (
+                finite(report.heading_deg) and 0 <= report.heading_deg < 360
+            ))
+            and (report.alt_ft is None or finite(report.alt_ft))
+        ]
+        if not (finite(claimed_lat) and -90 <= claimed_lat <= 90):
+            claimed_lat = None
+        if not (finite(claimed_lon) and -180 <= claimed_lon <= 180):
+            claimed_lon = None
+        if claimed_velocity_kts is not None and not (
+            finite(claimed_velocity_kts) and claimed_velocity_kts >= 0
+        ):
+            claimed_velocity_kts = None
+        if claimed_heading_deg is not None and not (
+            finite(claimed_heading_deg) and 0 <= claimed_heading_deg < 360
+        ):
+            claimed_heading_deg = None
+        if claimed_observed_at is not None and not (
+            finite(claimed_observed_at) and claimed_observed_at >= 0
+        ):
+            claimed_observed_at = None
+
         # Without an explicit claim, at least two network reports are required
         # for a real comparison. A single report has no pairwise evidence and
         # must never become LEGITIMATE merely because disagreement defaults to 0.

@@ -11,7 +11,7 @@ The intersection of ≥3 such surfaces gives the aircraft position.
 Architecture:
   - Consumes raw Beast-format messages from Kafka (keyed by receiver_id)
   - Groups messages by ICAO24 + time window
-  - When ≥3 receivers see the same message, runs the TDOA solver
+  - When ≥4 receivers see the same message, runs the unconstrained 3D TDOA solver
   - Publishes RawMLATReport to Kafka topic: raw.mlat
 
 Math:
@@ -25,7 +25,11 @@ Math:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
+import math
+import re
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -42,11 +46,52 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models import RawADSBMessage, RawMLATReport
 from config import settings, KAFKA_CONSUMER_STABILITY
+from kafka_offsets import commit_record
+from receiver_auth import validate_receiver_credentials
 
 log = logging.getLogger(__name__)
 
 # Speed of light in m/s
 C = 299_792_458.0
+
+
+def physical_reception_key(reception: RawADSBMessage, receiver_secret: str) -> bytes:
+    signature = hmac.new(
+        receiver_secret.encode(), reception.to_bytes(), hashlib.sha256
+    ).hexdigest()
+    return f"{reception.receiver_id}:{signature}".encode()
+
+
+def covariance_variance(
+    cost: float, residual_count: int, parameter_count: int, noise_ns: float
+) -> float:
+    dof = residual_count - parameter_count
+    residual_variance = (2.0 * cost / dof) if dof > 0 else 0.0
+    range_noise_m = C * noise_ns * 1e-9
+    return max(residual_variance, range_noise_m * range_noise_m)
+
+
+def physical_reception_is_valid(reception: RawADSBMessage) -> bool:
+    return (
+        reception.receiver_id in settings.MLAT_RECEIVER_LOCATIONS
+        and reception.msg_type in (11, 17, 18, 20, 21)
+        and re.fullmatch(r"(?:[0-9A-F]{14}|[0-9A-F]{28})", reception.raw_message)
+        is not None
+    )
+
+
+def sign_mlat_report(report: RawMLATReport, secret: str) -> str:
+    payload = orjson.dumps(
+        report.model_dump(exclude={"auth_tag"}), option=orjson.OPT_SORT_KEYS
+    )
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def verify_mlat_report(report: RawMLATReport, secret: str) -> bool:
+    return bool(
+        secret and report.auth_tag
+        and hmac.compare_digest(report.auth_tag, sign_mlat_report(report, secret))
+    )
 
 # ECEF ↔ geodetic transformer
 _ecef_to_wgs84 = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
@@ -67,6 +112,25 @@ def ecef_to_geodetic(xyz: np.ndarray) -> Tuple[float, float, float]:
     return lat, lon, alt
 
 
+def horizontal_cep90(position_ecef: np.ndarray, covariance_ecef: np.ndarray) -> float:
+    """Conservative CEP90 from covariance projected into local East/North."""
+    lat_deg, lon_deg, _ = ecef_to_geodetic(position_ecef)
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    east = np.array([-math.sin(lon), math.cos(lon), 0.0])
+    north = np.array([
+        -math.sin(lat) * math.cos(lon),
+        -math.sin(lat) * math.sin(lon),
+        math.cos(lat),
+    ])
+    projection = np.vstack((east, north))
+    horizontal_covariance = projection @ covariance_ecef @ projection.T
+    eigenvalues = np.linalg.eigvalsh(horizontal_covariance)
+    if not np.all(np.isfinite(eigenvalues)) or float(eigenvalues[-1]) < 0:
+        raise ValueError("Invalid horizontal covariance")
+    return 2.146 * math.sqrt(max(0.0, float(eigenvalues[-1])))
+
+
 def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in nautical miles."""
     R = 3440.065  # Earth radius in NM
@@ -75,6 +139,77 @@ def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlambda = np.radians(lon2 - lon1)
     a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
     return R * 2 * np.arcsin(np.sqrt(a))
+
+
+def receiver_geometry_is_safe(receiver_positions: List[np.ndarray]) -> bool:
+    """Require useful horizontal baseline and cross-track spread in local ENU."""
+    if len(receiver_positions) < 4:
+        return False
+    points = np.vstack(receiver_positions)
+    origin = np.mean(points, axis=0)
+    origin_norm = float(np.linalg.norm(origin))
+    if origin_norm <= 0:
+        return False
+    up = origin / origin_norm
+    east = np.cross(np.array([0.0, 0.0, 1.0]), up)
+    east_norm = float(np.linalg.norm(east))
+    if east_norm <= 1e-12:
+        east = np.cross(np.array([1.0, 0.0, 0.0]), up)
+        east_norm = float(np.linalg.norm(east))
+    if east_norm <= 1e-12:
+        return False
+    east /= east_norm
+    north = np.cross(up, east)
+    offsets = points - origin
+    horizontal = np.column_stack((offsets @ east, offsets @ north))
+    max_baseline = max(
+        np.linalg.norm(horizontal[i] - horizontal[j])
+        for i in range(len(horizontal))
+        for j in range(i + 1, len(horizontal))
+    )
+    centered = horizontal - np.mean(horizontal, axis=0)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    geometry_ratio = (
+        float(singular_values[1] / singular_values[0])
+        if len(singular_values) > 1 and singular_values[0] > 0
+        else 0.0
+    )
+    safe = (
+        max_baseline >= settings.MLAT_MIN_BASELINE_M
+        and geometry_ratio >= settings.MLAT_MIN_GEOMETRY_RATIO
+    )
+    if not safe:
+        log.warning(
+            "MLAT rejected: unsafe horizontal receiver geometry baseline=%.1fm ratio=%.4f",
+            max_baseline, geometry_ratio,
+        )
+    return safe
+
+
+def validate_receiver_configuration(
+    locations=None,
+    min_receivers: Optional[int] = None,
+) -> dict[str, np.ndarray]:
+    """Validate the complete receiver trust configuration before I/O starts."""
+    locations = settings.MLAT_RECEIVER_LOCATIONS if locations is None else locations
+    minimum = settings.MLAT_MIN_RECEIVERS if min_receivers is None else min_receivers
+    if not isinstance(locations, dict) or len(locations) < max(4, minimum):
+        raise ValueError("At least four configured MLAT receivers are required")
+    positions: dict[str, np.ndarray] = {}
+    for receiver_id, location in locations.items():
+        if not isinstance(receiver_id, str) or not receiver_id.strip():
+            raise ValueError("MLAT receiver identities must be nonempty strings")
+        if not isinstance(location, (list, tuple)) or len(location) != 3:
+            raise ValueError(f"Invalid location for MLAT receiver {receiver_id}")
+        lat, lon, altitude = (float(value) for value in location)
+        if not all(math.isfinite(value) for value in (lat, lon, altitude)):
+            raise ValueError(f"Nonfinite location for MLAT receiver {receiver_id}")
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180 and -500 <= altitude <= 20_000):
+            raise ValueError(f"Out-of-range location for MLAT receiver {receiver_id}")
+        positions[receiver_id] = geodetic_to_ecef(lat, lon, altitude)
+    if not receiver_geometry_is_safe(list(positions.values())):
+        raise ValueError("Unsafe configured MLAT receiver geometry")
+    return positions
 
 
 # ─── Receiver Registry ─────────────────────────────────────────────────────────
@@ -121,7 +256,7 @@ class TDOAFrame:
     def add_reception(self, receiver_id: str, timestamp: float) -> None:
         self.receptions.append((receiver_id, timestamp))
 
-    def is_solvable(self, min_receivers: int = 3) -> bool:
+    def is_solvable(self, min_receivers: int = 4) -> bool:
         return len(self.receptions) >= min_receivers
 
     def age(self) -> float:
@@ -157,7 +292,7 @@ class MLATSolver:
         n = len(receiver_positions)
         assert n == len(timestamps), "Position/timestamp count mismatch"
 
-        if n < 3:
+        if n < 4:
             return None
 
         # Use first receiver as reference; compute TDOAs relative to it
@@ -220,9 +355,13 @@ class MLATSolver:
         # CEP90 approximation from Jacobian covariance
         try:
             J = result.jac
-            cov = np.linalg.inv(J.T @ J) * (result.cost / max(len(result.fun) - 3, 1))
-            sigma_h = float(np.sqrt(cov[0, 0] + cov[1, 1]))
-            cep90 = sigma_h * 2.146   # approx 90th percentile factor for 2D Gaussian
+            if np.linalg.matrix_rank(J) < 3:
+                raise ValueError("Rank-deficient MLAT geometry")
+            variance = covariance_variance(
+                result.cost, len(result.fun), 3, settings.MLAT_TIMESTAMP_NOISE_NS
+            )
+            cov = np.linalg.inv(J.T @ J) * variance
+            cep90 = horizontal_cep90(pos, cov)
         except Exception:
             cep90 = 9999.0
 
@@ -244,7 +383,9 @@ class FrameAccumulator:
     Accumulates TDOA frames and solves when enough receivers have reported.
     Frames expire after WINDOW_SEC if unsolvable.
     """
-    WINDOW_SEC = 0.5     # messages within 500ms are considered same transmission
+    TRANSMISSION_WINDOW_SEC = 0.01
+    FRAME_TTL_SEC = 2.0
+    WINDOW_SEC = TRANSMISSION_WINDOW_SEC
 
     def __init__(self, registry: ReceiverRegistry, solver: MLATSolver) -> None:
         self.registry = registry
@@ -293,8 +434,46 @@ class FrameAccumulator:
         if recv_pos is None:
             return None  # Unknown receiver
 
-        # Key: ICAO + raw message hash (same transmission across receivers)
-        key = f"{msg.icao24}:{msg.raw_message}"
+        # Repeated Mode-S payloads are distinct transmissions. Associate only
+        # receptions whose physical event times fit the same narrow window.
+        base_key = f"{msg.icao24}:{msg.raw_message}"
+        compatible: list[tuple[float, str]] = []
+        for candidate_key, candidate in self._frames.items():
+            if not (candidate_key == base_key or candidate_key.startswith(base_key + ":")) \
+                    or not candidate.receptions:
+                continue
+            candidate_times = [ts for _, ts in candidate.receptions]
+            times = candidate_times + [msg.recv_time]
+            if max(times) - min(times) > self.TRANSMISSION_WINDOW_SEC:
+                continue
+            if msg.receiver_id in {rid for rid, _ in candidate.receptions}:
+                log.warning(
+                    "Rejecting duplicate MLAT receiver %s across compatible frames for %s",
+                    msg.receiver_id, msg.icao24,
+                )
+                return None
+            distance = abs(msg.recv_time - float(np.median(candidate_times)))
+            compatible.append((distance, candidate_key))
+
+        key = ""
+        if compatible:
+            compatible.sort(key=lambda item: (item[0], item[1]))
+            if (
+                len(compatible) > 1
+                and math.isclose(
+                    compatible[0][0], compatible[1][0],
+                    rel_tol=0.0, abs_tol=1e-9,
+                )
+            ):
+                log.warning(
+                    "Rejecting ambiguous MLAT reception for %s across frames %s and %s",
+                    msg.icao24, compatible[0][1], compatible[1][1],
+                )
+                return None
+            key = compatible[0][1]
+        if not key:
+            bucket = int(msg.recv_time / self.TRANSMISSION_WINDOW_SEC)
+            key = f"{base_key}:{bucket}"
         if key in self._solved:
             return None
 
@@ -332,6 +511,9 @@ class FrameAccumulator:
         if len(positions) < settings.MLAT_MIN_RECEIVERS:
             return None
 
+        if not receiver_geometry_is_safe(positions):
+            return None
+
         result = self.solver.solve(positions, timestamps)
         if not result:
             return None
@@ -340,9 +522,10 @@ class FrameAccumulator:
             log.debug("MLAT rejected: residual %.0f ns > threshold", result["tdoa_residual"])
             return None
 
-        return RawMLATReport(
-            session_id=f"mlat-{int(time.time()*1000)}",
-            solve_time=time.time(),
+        event_time = float(np.median(timestamps))
+        report = RawMLATReport(
+            session_id=f"mlat-{frame.icao24}-{int(event_time * 1_000_000)}",
+            solve_time=event_time,
             icao24=frame.icao24.upper(),
             lat=result["lat"],
             lon=result["lon"],
@@ -351,13 +534,21 @@ class FrameAccumulator:
             tdoa_residual=result["tdoa_residual"],
             cep90=result["cep90"],
             receiver_ids=receiver_ids,
+            source_event_ids=[
+                hashlib.sha256(
+                    f"{rid}:{ts:.9f}:{frame.raw_message}".encode()
+                ).hexdigest()
+                for rid, ts in frame.receptions if rid in receiver_ids
+            ],
         )
+        report.auth_tag = sign_mlat_report(report, settings.MLAT_SOLVER_SIGNING_KEY)
+        return report
 
     def _prune(self) -> None:
-        expired = [k for k, f in self._frames.items() if f.age() > self.WINDOW_SEC * 4]
+        expired = [k for k, f in self._frames.items() if f.age() > self.FRAME_TTL_SEC]
         for k in expired:
             del self._frames[k]
-        solved_cutoff = time.time() - self.WINDOW_SEC * 20
+        solved_cutoff = time.time() - self.FRAME_TTL_SEC
         self._solved = {
             key: solved_at for key, solved_at in self._solved.items()
             if solved_at >= solved_cutoff
@@ -367,12 +558,19 @@ class FrameAccumulator:
 # ─── Main Processing Loop ─────────────────────────────────────────────────────
 
 async def process_adsb_for_mlat(
-    accumulator, producer, raw_value: bytes, state_store=None
+    accumulator, producer, raw_value: bytes, state_store=None, adsb_msg=None
 ) -> bool:
     """Process one input and wait for any MLAT output to reach Kafka."""
     before = accumulator.snapshot()
     try:
-        adsb_msg = RawADSBMessage.from_bytes(raw_value)
+        adsb_msg = adsb_msg or RawADSBMessage.from_bytes(raw_value)
+        now = time.time()
+        if (
+            adsb_msg.recv_time < now - settings.SOURCE_EVENT_MAX_AGE_SEC
+            or adsb_msg.recv_time > now + settings.SOURCE_EVENT_FUTURE_SKEW_SEC
+        ):
+            log.warning("Rejecting stale/future physical reception %s", adsb_msg.recv_time)
+            return False
         report = accumulator.add_message(adsb_msg)
         if report is not None:
             await producer.send_and_wait(
@@ -394,6 +592,12 @@ async def run() -> None:
     logging.basicConfig(level=settings.LOG_LEVEL)
     log.info("Starting MLAT solver")
 
+    validate_receiver_configuration()
+    receiver_keys = validate_receiver_credentials(
+        settings.MLAT_RECEIVER_LOCATIONS, settings.MLAT_RECEIVER_API_KEYS
+    )
+    if not settings.MLAT_SOLVER_SIGNING_KEY:
+        raise ValueError("MLAT solver signing key is required")
     registry = ReceiverRegistry()
     solver = MLATSolver()
     accumulator = FrameAccumulator(registry, solver)
@@ -405,15 +609,11 @@ async def run() -> None:
         except Exception as exc:
             log.warning("Discarding invalid MLAT accumulator state: %s", exc)
 
-    # In production: load receiver locations from DB
-    # For demo: register a few example receivers
-    registry.register("receiver-london",   51.5074,  -0.1278,  15.0)
-    registry.register("receiver-paris",    48.8566,   2.3522,  35.0)
-    registry.register("receiver-brussels", 50.8503,   4.3517,  20.0)
-    registry.register("receiver-amsterdam", 52.3676,  4.9041,  5.0)
+    for receiver_id, location in settings.MLAT_RECEIVER_LOCATIONS.items():
+        registry.register(receiver_id, *location)
 
     consumer = AIOKafkaConsumer(
-        settings.TOPIC_RAW_ADSB,
+        settings.TOPIC_MLAT_RECEPTIONS,
         bootstrap_servers=settings.KAFKA_BOOTSTRAP,
         group_id=f"{settings.KAFKA_GROUP_PREFIX}.mlat-solver",
         value_deserializer=lambda v: v,
@@ -433,13 +633,28 @@ async def run() -> None:
     try:
         async for kafka_msg in consumer:
             try:
+                try:
+                    adsb_msg = RawADSBMessage.from_bytes(kafka_msg.value)
+                except Exception as exc:
+                    log.error("Discarding malformed MLAT input record: %s", exc)
+                    await commit_record(consumer, kafka_msg)
+                    continue
+                if (
+                    not physical_reception_is_valid(adsb_msg)
+                    or kafka_msg.key != physical_reception_key(
+                        adsb_msg, receiver_keys[adsb_msg.receiver_id]
+                    )
+                ):
+                    log.error("Discarding unauthenticated or identity-mismatched MLAT input")
+                    await commit_record(consumer, kafka_msg)
+                    continue
                 if await process_adsb_for_mlat(
-                    accumulator, producer, kafka_msg.value, state_store
+                    accumulator, producer, kafka_msg.value, state_store, adsb_msg
                 ):
                     solved_count += 1
                     if solved_count % 100 == 0:
                         log.info("MLAT: %d positions solved", solved_count)
-                await consumer.commit()
+                await commit_record(consumer, kafka_msg)
 
             except Exception as e:
                 log.error("MLAT processing error: %s", e)

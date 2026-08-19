@@ -18,17 +18,21 @@ Key pieces:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
+import re
+import secrets
 import time
+from collections.abc import Mapping
 from typing import Optional, List, Dict, Any
 
 import aiohttp
 import asyncpg
 import orjson
 import redis.asyncio as aioredis
-from aiokafka import AIOKafkaConsumer
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from contextlib import asynccontextmanager
@@ -36,8 +40,14 @@ from contextlib import asynccontextmanager
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from models import StateVector, RiskBand, Classification, DetectionLayer, LayerStatus
+from models import RawADSBMessage, StateVector, RiskBand, Classification, DetectionLayer, LayerStatus, normalize_icao24
 from config import settings, KAFKA_CONSUMER_STABILITY
+from kafka_offsets import commit_record
+from receiver_auth import validate_receiver_credentials as validate_receiver_key_map
+from processing.mlat_solver import (
+    geodetic_to_ecef, physical_reception_key, receiver_geometry_is_safe,
+    validate_receiver_configuration,
+)
 from coverage_area import (
     COVERAGE_LOCK_KEY,
     COVERAGE_RATE_KEY,
@@ -55,10 +65,16 @@ from coverage_area import (
 # simulated TDOA path, and processing/tdoa_validator.py for the true-TDOA
 # path once physical receivers exist)
 try:
-    from processing.cross_source_validator import CrossSourceValidator
+    from processing.cross_source_validator import (
+        CrossSourceValidator,
+        DISAGREEMENT_SPOOFED_M,
+        DISAGREEMENT_UNCERTAIN_M,
+    )
     from anomaly.enhanced_detector import EnhancedAnomalyDetector
     TDOA_AVAILABLE = True
 except ImportError:
+    DISAGREEMENT_UNCERTAIN_M = 1500.0
+    DISAGREEMENT_SPOOFED_M = 5000.0
     TDOA_AVAILABLE = False
     logging.warning("L1 cross-validation module not available - running without it")
 
@@ -67,8 +83,39 @@ log = logging.getLogger(__name__)
 # ─── Global state ──────────────────────────────────────────────────────────────
 
 redis_client: Optional[aioredis.Redis] = None
+mlat_reception_producer: Optional[AIOKafkaProducer] = None
 _ws_clients: set[WebSocket] = set()
 _track_snapshot: List[Dict[str, Any]] = []
+_SCAN_CURSORS: Dict[str, int] = {}
+_SCAN_SNAPSHOTS: Dict[str, Dict[Any, None]] = {}
+_SCAN_BUILDING: Dict[str, Dict[Any, None]] = {}
+_SCAN_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+async def scan_key_batch(
+    pattern: str, *, count: int = 500, max_batches: int = 4, max_keys: int = 10_000
+):
+    """Build and publish bounded full-cycle Redis key snapshots via SCAN."""
+    if redis_client is None:
+        return []
+    lock = _SCAN_LOCKS.setdefault(pattern, asyncio.Lock())
+    async with lock:
+        cursor = _SCAN_CURSORS.get(pattern, 0)
+        building = _SCAN_BUILDING.setdefault(pattern, {})
+        for _ in range(max_batches):
+            cursor, batch = await redis_client.scan(
+                cursor, match=pattern, count=count
+            )
+            for key in batch:
+                if len(building) < max_keys:
+                    building[key] = None
+            if cursor == 0:
+                _SCAN_SNAPSHOTS[pattern] = building
+                _SCAN_BUILDING[pattern] = {}
+                break
+        _SCAN_CURSORS[pattern] = int(cursor)
+        snapshot = _SCAN_SNAPSHOTS.get(pattern) or building
+        return list(snapshot)[:max_keys]
 
 # L1 validator instances
 cross_validator: Optional[CrossSourceValidator] = None
@@ -112,13 +159,15 @@ HEADERS = {
 }
 
 def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
-    """Normalize an adsb.lol point-feed response to the public API shape."""
+    """Normalize adsb.lol records without inventing source event timestamps."""
     aircraft = []
     received_at = time.time()
     for raw in data.get("ac") or []:
-        icao = str(raw.get("hex") or "").upper().lstrip("~")
+        if not isinstance(raw, dict):
+            continue
+        icao = _l1_normalized_icao(str(raw.get("hex") or "").upper().lstrip("~"))
         lat, lon = raw.get("lat"), raw.get("lon")
-        if len(icao) != 6 or lat is None or lon is None:
+        if icao is None or lat is None or lon is None:
             continue
         try:
             lat, lon = float(lat), float(lon)
@@ -128,35 +177,26 @@ def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
             continue
 
         def number(value, *, integer=False):
-            try:
-                parsed = float(value)
-                return int(parsed) if integer else parsed
-            except (TypeError, ValueError):
-                return None
+            return _safe_public_number(value, integer=integer)
 
         altitude = number(raw.get("alt_baro"), integer=True)
-        aircraft.append({
+        record = {
             "icao": icao,
-            "cs": str(raw.get("flight") or raw.get("r") or "").strip() or None,
-            "lat": lat,
-            "lon": lon,
-            "alt": altitude,
+            "cs": _safe_public_callsign(raw.get("flight") or raw.get("r")),
+            "lat": lat, "lon": lon, "alt": altitude,
             "vel": number(raw.get("gs"), integer=True),
             "hdg": number(raw.get("track")),
             "vr": number(raw.get("baro_rate"), integer=True),
             "nic": number(raw.get("nic"), integer=True),
             "nac_p": number(raw.get("nac_p"), integer=True),
-            "ts": received_at,
-            "gnd": raw.get("alt_baro") == "ground",
-            "src": "adsb_lol",
-            "risk": 0,
-            "anoms": [],
-            "cls": "CIVILIAN",
-            "conf": 0.75,
-            "mil": 0.0,
-            "band": "NORMAL",
-            "trail": [],
-        })
+            "gnd": raw.get("alt_baro") == "ground", "src": "adsb_lol",
+            "risk": 0, "anoms": [], "cls": "CIVILIAN", "conf": 0.75,
+            "mil": 0.0, "band": "NORMAL", "trail": [],
+        }
+        seen_pos = _safe_public_number(raw.get("seen_pos"), minimum=0.0)
+        if seen_pos is not None:
+            record["ts"] = received_at - seen_pos
+        aircraft.append(record)
     return aircraft
 
 
@@ -167,8 +207,10 @@ def _parse_adsb_lol_aircraft(data: dict) -> List[dict]:
 # per-aircraft polling, so this is not optional.
 _L1_CACHE: Dict[tuple[str, str], tuple] = {}
 _L1_CACHE_TTL = 60  # seconds
-_L1_CACHE_BREAK_DISTANCE_M = 20_000
-
+_L1_ALLOWED_SOURCES = {"opensky", "adsb_lol", "adsb_fi"}
+_L1_ALLOWED_VERDICTS = {
+    "LEGITIMATE", "UNCERTAIN", "SPOOFED", "INSUFFICIENT_SOURCES",
+}
 # Hard cap on live cross-validation calls per broadcast cycle. The global
 # feed carries thousands of aircraft; adsb.lol/adsb.fi/OpenSky cannot take
 # a per-aircraft hit at that volume. Bump this only if you have paid/higher
@@ -188,29 +230,327 @@ def _l1_cache_key(
     ``now`` is retained for call-site compatibility and deterministic tests.
     """
     return (
-        ac["icao"],
+        str(ac["icao"]).strip().upper(),
         str(ac.get("src") or "unknown").lower(),
     )
 
 
+def _l1_coordinate(value: Any, *, latitude: bool) -> Optional[float]:
+    """Return a finite in-range coordinate, or ``None`` for invalid input."""
+    if isinstance(value, bool):
+        return None
+    try:
+        coordinate = float(value)
+    except Exception:
+        return None
+    limit = 90.0 if latitude else 180.0
+    if not math.isfinite(coordinate) or not -limit <= coordinate <= limit:
+        return None
+    return coordinate
+
+
+def _l1_normalized_icao(value: Any) -> Optional[str]:
+    """Normalize a six-hex-character ICAO address."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    if len(normalized) != 6 or any(char not in "0123456789ABCDEF" for char in normalized):
+        return None
+    return normalized
+
+
+def _safe_public_number(
+    value: Any,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+    integer: bool = False,
+) -> Optional[float]:
+    """Normalize an untrusted optional display number to a finite value."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return int(parsed) if integer else parsed
+
+
+def _safe_public_callsign(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    allowed = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -")
+    if not 1 <= len(normalized) <= 16 or any(char not in allowed for char in normalized):
+        return None
+    return normalized
+
+
+def _raw_claim_matches_redis_key(key_text: str, claim: Any) -> bool:
+    """Validate an ``ac:<ICAO>`` key and its untrusted embedded raw claim."""
+    if not isinstance(claim, dict) or not isinstance(key_text, str):
+        return False
+    namespace, separator, suffix = key_text.partition(":")
+    key_icao = _l1_normalized_icao(suffix) if separator and namespace == "ac" else None
+    claim_icao = _l1_normalized_icao(claim.get("icao"))
+    source = claim.get("src")
+    return bool(
+        key_icao is not None
+        and claim_icao == key_icao
+        and isinstance(source, str)
+        and source.lower() in _L1_ALLOWED_SOURCES
+        and _l1_coordinate(claim.get("lat"), latitude=True) is not None
+        and _l1_coordinate(claim.get("lon"), latitude=False) is not None
+    )
+
+
+def _decode_redis_track(
+    namespace: str,
+    key_text: str,
+    raw: bytes,
+) -> Optional[tuple[str, dict]]:
+    """Decode one Redis record without allowing namespace or key bypasses."""
+    key_namespace, separator, _ = key_text.partition(":")
+    if not separator or key_namespace != namespace:
+        return None
+    if namespace == "ac":
+        try:
+            claim = orjson.loads(raw)
+        except Exception:
+            return None
+        if not _raw_claim_matches_redis_key(key_text, claim):
+            return None
+        normalized = {
+            "icao": _l1_normalized_icao(claim.get("icao")),
+            "src": str(claim.get("src")).lower(),
+            "lat": float(claim["lat"]),
+            "lon": float(claim["lon"]),
+            "cs": _safe_public_callsign(claim.get("cs")),
+            "alt": _safe_public_number(claim.get("alt"), integer=True),
+            "vel": _safe_public_number(claim.get("vel")),
+            "hdg": _safe_public_number(claim.get("hdg"), minimum=0.0, maximum=360.0),
+            "vr": _safe_public_number(claim.get("vr"), integer=True),
+            "nic": _safe_public_number(claim.get("nic"), minimum=0.0, maximum=15.0, integer=True),
+            "nac_p": _safe_public_number(claim.get("nac_p"), minimum=0.0, maximum=15.0, integer=True),
+            "gnd": claim.get("gnd") is True,
+            "cls": claim.get("cls") if claim.get("cls") in {
+                "CIVILIAN", "LIKELY_MILITARY", "CONFIRMED_MILITARY",
+                "DARK_AIRCRAFT", "UNKNOWN",
+            } else "UNKNOWN",
+            "conf": _safe_public_number(claim.get("conf"), minimum=0.0, maximum=1.0) or 0.0,
+            "mil": _safe_public_number(claim.get("mil"), minimum=0.0, maximum=1.0) or 0.0,
+            "band": claim.get("band") if claim.get("band") in {
+                "NORMAL", "ELEVATED", "HIGH", "CRITICAL",
+            } else "NORMAL",
+            "trail": [],
+        }
+        try:
+            risk = float(claim.get("risk", 0.0))
+            if not math.isfinite(risk):
+                raise ValueError
+        except (TypeError, ValueError):
+            risk = 0.0
+        normalized["risk"] = min(100.0, max(0.0, risk))
+        raw_anomalies = claim.get("anoms", [])
+        safe_anomalies = []
+        if isinstance(raw_anomalies, list):
+            allowed_chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:-")
+            for item in raw_anomalies[:32]:
+                anomaly_type = item.get("type") if isinstance(item, dict) else item
+                if not isinstance(anomaly_type, str):
+                    continue
+                anomaly_type = anomaly_type.strip().upper()
+                if (
+                    1 <= len(anomaly_type) <= 64
+                    and all(char in allowed_chars for char in anomaly_type)
+                ):
+                    safe_anomalies.append(anomaly_type)
+        normalized["anoms"] = safe_anomalies
+        try:
+            timestamp = float(claim["ts"])
+            if not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError
+            normalized["ts"] = timestamp
+        except (KeyError, TypeError, ValueError):
+            normalized.pop("ts", None)
+        return namespace, normalized
+
+    if namespace == "sv":
+        try:
+            state = StateVector.from_bytes(raw)
+            aircraft = state.to_api_dict()
+        except Exception:
+            return None
+        _, separator, suffix = key_text.partition(":")
+        key_icao = _l1_normalized_icao(suffix) if separator else None
+        state_icao = _l1_normalized_icao(aircraft.get("icao"))
+        if (
+            key_icao is None
+            or state_icao != key_icao
+            or _l1_coordinate(aircraft.get("lat"), latitude=True) is None
+            or _l1_coordinate(aircraft.get("lon"), latitude=False) is None
+        ):
+            return None
+        return namespace, aircraft
+    return None
+
+
+def _l1_projection_fingerprint(ac: Mapping[str, Any]) -> tuple[Optional[float], ...]:
+    """Normalize every claim input used by time-projected L1 validation."""
+    values = []
+    for field in ("ts", "vel", "hdg"):
+        try:
+            value = float(ac[field])
+            values.append(value if math.isfinite(value) else None)
+        except (KeyError, TypeError, ValueError):
+            values.append(None)
+    return tuple(values)
+
+
+def _l1_cache_entry_valid(
+    cached: Any,
+    now: float,
+    expected_icao: Optional[str] = None,
+    expected_source: Optional[str] = None,
+) -> bool:
+    """Validate the complete safety-relevant cache representation."""
+    if not isinstance(cached, tuple) or len(cached) != 5:
+        return False
+    timestamp, result, cached_lat, cached_lon, raw_disagreement = cached
+    if any(isinstance(value, bool) for value in (timestamp, now, raw_disagreement)):
+        return False
+    try:
+        timestamp = float(timestamp)
+        now = float(now)
+        raw_disagreement = float(raw_disagreement)
+    except Exception:
+        return False
+    if not isinstance(result, Mapping):
+        return False
+    try:
+        display_value = result["max_disagreement_m"]
+        confidence_value = result["confidence"]
+        if isinstance(display_value, bool) or isinstance(confidence_value, bool):
+            return False
+        display_disagreement = float(display_value)
+        confidence = float(confidence_value)
+        is_valid = result["is_valid"]
+        verdict = result["verdict"]
+        sources = result["sources_used"]
+        result_icao = _l1_normalized_icao(result["icao"])
+    except Exception:
+        return False
+    age = now - timestamp
+    if (
+        not math.isfinite(now)
+        or not math.isfinite(timestamp)
+        or not math.isfinite(age)
+        or age < 0.0
+        or age > _L1_CACHE_TTL
+        or not math.isfinite(display_disagreement)
+        or display_disagreement < 0.0
+        or not math.isfinite(confidence)
+        or not 0.0 <= confidence <= 1.0
+        or not isinstance(is_valid, bool)
+        or not isinstance(verdict, str)
+        or verdict not in _L1_ALLOWED_VERDICTS
+        or not isinstance(sources, (list, tuple))
+        or not all(isinstance(source, str) for source in sources)
+        or not math.isfinite(raw_disagreement)
+        or raw_disagreement < 0.0
+        or _l1_coordinate(cached_lat, latitude=True) is None
+        or _l1_coordinate(cached_lon, latitude=False) is None
+        or result_icao is None
+        or (expected_icao is not None and result_icao != _l1_normalized_icao(expected_icao))
+        or display_disagreement != round(raw_disagreement, 1)
+        or is_valid != (verdict == "LEGITIMATE")
+    ):
+        return False
+    if verdict == "INSUFFICIENT_SOURCES":
+        return raw_disagreement == 0.0 and not sources
+    normalized_sources = [source.lower() for source in sources]
+    normalized_expected_source = (
+        expected_source.lower() if isinstance(expected_source, str) else None
+    )
+    if (
+        not sources
+        or any(source not in _L1_ALLOWED_SOURCES for source in normalized_sources)
+        or normalized_expected_source in normalized_sources
+    ):
+        return False
+    expected_verdict = (
+        "LEGITIMATE"
+        if raw_disagreement < DISAGREEMENT_UNCERTAIN_M
+        else "UNCERTAIN"
+        if raw_disagreement < DISAGREEMENT_SPOOFED_M
+        else "SPOOFED"
+    )
+    if verdict != expected_verdict:
+        return False
+    return True
+
+
 def _l1_claim_displacement_m(ac: dict, cached: tuple) -> float:
     """Great-circle distance from the coordinates validated in a cache entry."""
-    if len(cached) < 4:
+    current_lat = _l1_coordinate(ac.get("lat"), latitude=True)
+    current_lon = _l1_coordinate(ac.get("lon"), latitude=False)
+    cached_lat = _l1_coordinate(cached[2], latitude=True)
+    cached_lon = _l1_coordinate(cached[3], latitude=False)
+    if None in (current_lat, current_lon, cached_lat, cached_lon):
         return float("inf")
-    lat1, lon1 = map(math.radians, (float(ac["lat"]), float(ac["lon"])))
-    lat2, lon2 = map(math.radians, (float(cached[2]), float(cached[3])))
+    assert current_lat is not None and current_lon is not None
+    assert cached_lat is not None and cached_lon is not None
+    lat1, lon1 = map(math.radians, (current_lat, current_lon))
+    lat2, lon2 = map(math.radians, (cached_lat, cached_lon))
     dlat, dlon = lat2 - lat1, lon2 - lon1
     value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 6_371_000 * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1 - value)))
 
 
 def _l1_cache_is_fresh(ac: dict, now: float) -> bool:
-    cached = _L1_CACHE.get(_l1_cache_key(ac, now))
-    return bool(
-        cached
-        and now - cached[0] <= _L1_CACHE_TTL
-        and _l1_claim_displacement_m(ac, cached) <= _L1_CACHE_BREAK_DISTANCE_M
+    key = _l1_cache_key(ac, now)
+    cached = _L1_CACHE.get(key)
+    if (
+        _l1_coordinate(ac.get("lat"), latitude=True) is None
+        or _l1_coordinate(ac.get("lon"), latitude=False) is None
+        or not _l1_cache_entry_valid(cached, now, key[0], key[1])
+    ):
+        _L1_CACHE.pop(key, None)
+        return False
+    assert isinstance(cached, tuple)
+    cached_fingerprint = cached[1].get("_claim_fingerprint")
+    current_fingerprint = _l1_projection_fingerprint(ac)
+    if cached_fingerprint is None:
+        # Legacy/test entries are reusable only when no projection inputs exist.
+        if any(value is not None for value in current_fingerprint):
+            _L1_CACHE.pop(key, None)
+            return False
+    elif (
+        not isinstance(cached_fingerprint, (list, tuple))
+        or tuple(cached_fingerprint) != current_fingerprint
+    ):
+        _L1_CACHE.pop(key, None)
+        return False
+    try:
+        disagreement = float(cached[4])
+    except Exception:
+        _L1_CACHE.pop(key, None)
+        return False
+    # By the triangle inequality, moving the claim by m can change its maximum
+    # disagreement by at most m. Reuse is safe only while movement is strictly
+    # below the nearest classification boundary. At exactly 1500 m or 5000 m
+    # the margin is zero, so even an unchanged claim is conservatively checked.
+    margin = min(
+        abs(disagreement - DISAGREEMENT_UNCERTAIN_M),
+        abs(disagreement - DISAGREEMENT_SPOOFED_M),
     )
+    return _l1_claim_displacement_m(ac, cached) < margin
 
 
 def _select_l1_candidates(
@@ -225,10 +565,17 @@ def _select_l1_candidates(
     fresh_candidates = [
         ac for ac in aircraft_list
         if ac.get("icao") and ac.get("lat") is not None and ac.get("lon") is not None
-        and str(ac.get("src") or "").lower() in {"opensky", "adsb_lol", "adsb_fi"}
+        and str(ac.get("src") or "").lower() in _L1_ALLOWED_SOURCES
         and not _l1_cache_is_fresh(ac, now)
     ]
-    fresh_candidates.sort(key=lambda ac: ac.get("risk", 0), reverse=True)
+    def safe_risk(ac: dict) -> float:
+        try:
+            risk = float(ac.get("risk", 0.0))
+            return risk if math.isfinite(risk) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    fresh_candidates.sort(key=safe_risk, reverse=True)
     return fresh_candidates[:_L1_MAX_PER_CYCLE]
 
 
@@ -244,9 +591,10 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
 
     now = time.time()
     for key, cached in list(_L1_CACHE.items()):
-        if now - cached[0] > _L1_CACHE_TTL:
+        if not _l1_cache_entry_valid(cached, now, key[0], key[1]):
             _L1_CACHE.pop(key, None)
     candidates = _select_l1_candidates(aircraft_list, now)
+    validated_keys = set()
 
     if candidates:
         results = await asyncio.gather(
@@ -266,14 +614,36 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
             if isinstance(result, BaseException):
                 log.warning(f"L1 cross-validation failed for {ac.get('icao')}: {result}")
                 continue
-            _L1_CACHE[_l1_cache_key(ac, now)] = (
-                now, result.to_dict(), float(ac["lat"]), float(ac["lon"])
+            key = _l1_cache_key(ac, now)
+            cached_result = result.to_dict()
+            cached_result["_claim_fingerprint"] = list(
+                _l1_projection_fingerprint(ac)
             )
+            candidate_entry = (
+                now,
+                cached_result,
+                float(ac["lat"]),
+                float(ac["lon"]),
+                float(result.max_disagreement_m),
+            )
+            if not _l1_cache_entry_valid(candidate_entry, now, key[0], key[1]):
+                log.warning("Rejected inconsistent L1 result for %s", ac.get("icao"))
+                _L1_CACHE.pop(key, None)
+                continue
+            _L1_CACHE[key] = candidate_entry
+            validated_keys.add(key)
 
     # Apply cache (fresh this cycle or still within TTL) to every aircraft
     for ac in aircraft_list:
-        cached = _L1_CACHE.get(_l1_cache_key(ac, now))
-        if cached is None or not _l1_cache_is_fresh(ac, now):
+        key = _l1_cache_key(ac, now)
+        cached = _L1_CACHE.get(key)
+        if cached is None:
+            ac.pop("l1", None)
+            continue
+        # A result produced this cycle is authoritative even when it lies
+        # exactly on a boundary. It must simply never be reused next cycle.
+        if key not in validated_keys and not _l1_cache_is_fresh(ac, now):
+            ac.pop("l1", None)
             continue
         result = cached[1]
         ac["l1"] = {
@@ -296,6 +666,43 @@ async def run_l1_cross_validation(aircraft_list: List[dict]) -> None:
                     "description": f"Aggregator reports disagree by {result['max_disagreement_m']:.0f}m "
                                    f"({'/'.join(result['sources_used'])})",
                 })
+
+
+async def _validate_raw_l1_claim(icao: str) -> Optional[dict]:
+    """Validate the originating raw aggregator claim, never a canonical fusion output."""
+    requested_icao = _l1_normalized_icao(icao)
+    if redis_client is None or cross_validator is None or requested_icao is None:
+        return None
+    raw = await redis_client.get(f"ac:{requested_icao}")
+    if not raw:
+        return None
+    try:
+        claim = orjson.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(claim, dict):
+        return None
+    claim_icao = _l1_normalized_icao(claim.get("icao"))
+    source = claim.get("src")
+    lat = _l1_coordinate(claim.get("lat"), latitude=True)
+    lon = _l1_coordinate(claim.get("lon"), latitude=False)
+    if (
+        claim_icao != requested_icao
+        or not isinstance(source, str)
+        or source.lower() not in _L1_ALLOWED_SOURCES
+        or lat is None
+        or lon is None
+    ):
+        return None
+    claim["icao"] = claim_icao
+    claim["src"] = source.lower()
+    claim["lat"] = lat
+    claim["lon"] = lon
+    claims = _select_l1_claim_records([("ac", claim)])
+    if not claims:
+        return None
+    await run_l1_cross_validation(claims)
+    return claims[0].get("l1")
 
 
 _THREAT_TO_RISK = {
@@ -324,13 +731,16 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
             continue
         cached_l1 = _L1_CACHE.get(_l1_cache_key(ac, now))
         l1_result = None
-        if cached_l1 and now - cached_l1[0] <= _L1_CACHE_TTL:
+        if cached_l1 and _l1_cache_is_fresh(ac, now):
             l1_result = cached_l1[1]
-        observed_at = ac.get("last_seen", ac.get("obs_ts", ac.get("ts", now)))
+        observed_at = ac.get("last_seen", ac.get("obs_ts", ac.get("ts")))
         try:
             observed_at = float(observed_at)
+            if not math.isfinite(observed_at) or observed_at < 0:
+                raise ValueError
         except (TypeError, ValueError):
-            observed_at = now
+            log.warning("Skipping timestamp-less raw observation for %s", icao)
+            continue
         try:
             assessment = anomaly_detector.assess(
                 icao=icao, lat=ac["lat"], lon=ac["lon"],
@@ -376,31 +786,115 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, cross_validator, anomaly_detector
-    
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
-    
-    # Initialize L1 cross-source validator (real live-network comparison,
-    # not simulated TDOA — see processing/cross_source_validator.py)
-    if TDOA_AVAILABLE:
+    global redis_client, mlat_reception_producer, cross_validator, anomaly_detector
+
+    tasks: List[asyncio.Task] = []
+    validator = None
+    reception_producer = None
+    body_error: Optional[BaseException] = None
+    critical_errors: List[BaseException] = []
+    shutdown_started = False
+    owner_task = asyncio.current_task()
+    redis_client = None
+    mlat_reception_producer = None
+    cross_validator = None
+    anomaly_detector = None
+    try:
+        validate_receiver_configuration()
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+        reception_producer = AIOKafkaProducer(
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP,
+            compression_type="lz4",
+        )
+        await reception_producer.start()
+        mlat_reception_producer = reception_producer
+
+        # Initialize L1 cross-source validator (real live-network comparison,
+        # not simulated TDOA — see processing/cross_source_validator.py)
+        if TDOA_AVAILABLE:
+            try:
+                validator = CrossSourceValidator()
+                cross_validator = await validator.__aenter__()
+                anomaly_detector = EnhancedAnomalyDetector()
+                log.info("✅ L1 cross-source validator initialized (OpenSky/adsb.lol/adsb.fi)")
+            except Exception as e:
+                log.error("Failed to initialize L1 cross-validator: %s", e)
+                cross_validator = None
+                anomaly_detector = None
+
+        for background_loop in (broadcast_loop, alert_consumer_loop):
+            coroutine = background_loop()
+            try:
+                task = asyncio.create_task(coroutine)
+                tasks.append(task)
+
+                def surface_critical_exit(done_task: asyncio.Task) -> None:
+                    if shutdown_started or done_task.cancelled():
+                        return
+                    try:
+                        error = done_task.exception()
+                    except BaseException as exc:
+                        error = exc
+                    if error is None:
+                        error = RuntimeError("critical background task exited unexpectedly")
+                    critical_errors.append(error)
+                    if owner_task is not None and not owner_task.done():
+                        owner_task.cancel(str(error))
+
+                task.add_done_callback(surface_critical_exit)
+            except BaseException:
+                coroutine.close()
+                raise
         try:
-            cross_validator = CrossSourceValidator()
-            await cross_validator.__aenter__()
-            anomaly_detector = EnhancedAnomalyDetector()
-            log.info("✅ L1 cross-source validator initialized (OpenSky/adsb.lol/adsb.fi)")
-        except Exception as e:
-            log.error(f"Failed to initialize L1 cross-validator: {e}")
-            cross_validator = None
-            anomaly_detector = None
-    
-    asyncio.create_task(broadcast_loop())
-    asyncio.create_task(alert_consumer_loop())
-    
-    yield
-    
-    await redis_client.close()
-    if cross_validator:
-        await cross_validator.__aexit__(None, None, None)
+            yield
+        except BaseException as exc:
+            body_error = exc
+            raise
+    finally:
+        shutdown_started = True
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+
+        critical_error = critical_errors[0] if critical_errors else None
+        for result in results:
+            if not isinstance(result, asyncio.CancelledError):
+                if critical_error is None:
+                    critical_error = (
+                        result
+                        if isinstance(result, BaseException)
+                        else RuntimeError("critical background task exited unexpectedly")
+                    )
+                break
+
+        # Background work must no longer be able to touch these resources.
+        cleanup_error = None
+        try:
+            if reception_producer is not None:
+                await reception_producer.stop()
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            if redis_client is not None:
+                await redis_client.close()
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            if validator is not None:
+                await validator.__aexit__(None, None, None)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        redis_client = None
+        mlat_reception_producer = None
+        cross_validator = None
+        anomaly_detector = None
+        if body_error is None:
+            if critical_error is not None:
+                raise critical_error
+            if cleanup_error is not None:
+                raise cleanup_error
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -453,11 +947,15 @@ async def _fetch_live_aircraft(area: Optional[CoverageArea] = None) -> List[dict
                             log.warning("adsb.lol fallback returned HTTP %d", fallback_resp.status)
                     return []
                 data = await resp.json(content_type=None)
-                states = data.get("states") or []
+                states = data.get("states") or [] if isinstance(data, dict) else []
+                if not isinstance(states, list):
+                    states = []
 
         aircraft = []
         for s in states:
-            if not s or s[0] is None or s[5] is None or s[6] is None:
+            if not isinstance(s, (list, tuple)) or len(s) < 12:
+                continue
+            if not isinstance(s[0], str) or s[5] is None or s[6] is None:
                 continue
             try:
                 lat, lon = float(s[6]), float(s[5])
@@ -467,29 +965,31 @@ async def _fetch_live_aircraft(area: Optional[CoverageArea] = None) -> List[dict
                 continue
             if not within_coverage_area(lat, lon, area):
                 continue
-            icao = s[0].upper().strip()
-            if len(icao) != 6:
+            icao = _l1_normalized_icao(s[0].upper().strip())
+            if icao is None:
                 continue
 
-            def ft(m):
-                try: return int(float(m) * 3.28084) if m else None
-                except: return None
-            def kts(ms):
-                try: return int(float(ms) * 1.944) if ms else None
-                except: return None
+            altitude_m = _safe_public_number(s[7])
+            velocity_ms = _safe_public_number(s[9])
+            timestamp = _safe_public_number(s[4])
+            if timestamp is None:
+                timestamp = _safe_public_number(s[3])
 
             ac = {
                 "icao": icao,
-                "cs":   (s[1] or "").strip() or None,
+                "cs":   _safe_public_callsign(s[1]),
                 "lat":  lat, "lon": lon,
-                "alt":  ft(s[7]), "vel": kts(s[9]),
-                "hdg":  float(s[10]) if s[10] else None,
-                "vr":   int(float(s[11]) * 196.85) if s[11] else None,
+                "alt":  int(altitude_m * 3.28084) if altitude_m is not None else None,
+                "vel":  int(velocity_ms * 1.944) if velocity_ms is not None else None,
+                "hdg":  _safe_public_number(s[10], minimum=0.0, maximum=360.0),
+                "vr":   (int(vertical_rate * 196.85)
+                         if (vertical_rate := _safe_public_number(s[11])) is not None else None),
                 "gnd":  bool(s[8]), "src": "opensky",
-                "ts": float(s[4] or s[3] or time.time()),
                 "risk": 0, "anoms": [], "cls": "CIVILIAN",
                 "conf": 0.85, "mil": 0.0, "band": "NORMAL", "trail": [],
             }
+            if timestamp is not None:
+                ac["ts"] = timestamp
             
             aircraft.append(ac)
 
@@ -509,13 +1009,84 @@ async def _fetch_live_aircraft(area: Optional[CoverageArea] = None) -> List[dict
 
 # ─── REST Endpoints ───────────────────────────────────────────────────────────
 
+L1_MANUAL_RATE_KEY = "l1:manual:rate"
+
+
+async def require_operator(
+    operator_key: Optional[str] = Header(default=None, alias="X-SkySecure-Operator-Key"),
+) -> None:
+    configured = settings.OPERATOR_API_KEY
+    if not configured:
+        raise HTTPException(status_code=503, detail="Operator API access is not configured")
+    if operator_key is None or not secrets.compare_digest(operator_key, configured):
+        raise HTTPException(status_code=403, detail="Operator authorization required")
+
+
+def validate_receiver_credentials() -> Dict[str, str]:
+    return validate_receiver_key_map(
+        settings.MLAT_RECEIVER_LOCATIONS, settings.MLAT_RECEIVER_API_KEYS
+    )
+
+
+async def require_mlat_receiver(
+    receiver_key: Optional[str] = Header(default=None, alias="X-SkySecure-Receiver-Key"),
+) -> str:
+    try:
+        configured = validate_receiver_credentials()
+    except ValueError:
+        raise HTTPException(status_code=503, detail="Physical receiver access is not configured")
+    if receiver_key is not None:
+        for receiver_id, expected in configured.items():
+            if expected and secrets.compare_digest(receiver_key, expected):
+                return receiver_id
+    raise HTTPException(status_code=403, detail="Physical receiver authorization required")
+
+
+@app.post("/api/mlat/receptions")
+async def ingest_mlat_reception(
+    reception: RawADSBMessage,
+    authenticated_receiver_id: str = Depends(require_mlat_receiver),
+):
+    if reception.receiver_id != authenticated_receiver_id:
+        raise HTTPException(status_code=403, detail="Receiver identity does not match credential")
+    if reception.receiver_id not in settings.MLAT_RECEIVER_LOCATIONS:
+        raise HTTPException(status_code=422, detail="Unknown physical receiver identity")
+    if (
+        reception.msg_type not in (11, 17, 18, 20, 21)
+        or re.fullmatch(r"(?:[0-9A-F]{14}|[0-9A-F]{28})", reception.raw_message) is None
+    ):
+        raise HTTPException(status_code=422, detail="Unsupported physical Mode-S reception")
+    now = time.time()
+    if (
+        reception.recv_time < now - settings.SOURCE_EVENT_MAX_AGE_SEC
+        or reception.recv_time > now + settings.SOURCE_EVENT_FUTURE_SKEW_SEC
+    ):
+        raise HTTPException(status_code=422, detail="Reception timestamp is stale or future-dated")
+    if mlat_reception_producer is None:
+        raise HTTPException(status_code=503, detail="Physical receiver publisher is not initialized")
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    reception_bytes = reception.to_bytes()
+    receiver_secret = validate_receiver_credentials()[authenticated_receiver_id]
+    await mlat_reception_producer.send_and_wait(
+        topic=settings.TOPIC_MLAT_RECEPTIONS,
+        key=physical_reception_key(reception, receiver_secret),
+        value=reception_bytes,
+    )
+    await redis_client.setex(
+        f"mlat:receiver:last_seen:{reception.receiver_id}",
+        settings.RECEIVER_TIMEOUT_SEC * 2,
+        str(reception.recv_time).encode(),
+    )
+    return {"status": "accepted"}
+
 @app.get("/api/coverage")
 async def get_coverage_area_config():
     area = await load_coverage_area(redis_client) if redis_client else default_coverage_area()
     return {"coverage": area.model_dump()}
 
 
-@app.put("/api/coverage")
+@app.put("/api/coverage", dependencies=[Depends(require_operator)])
 async def update_coverage_area_config(area: CoverageArea):
     global _live_cache
     if redis_client is None:
@@ -590,7 +1161,7 @@ async def get_all_aircraft(
     """
     Return state vectors from the Redis fusion pipeline with TDOA validation.
     """
-    keys = await redis_client.keys("sv:*")
+    keys = await scan_key_batch("sv:*")
     results = []
     area = await load_coverage_area(redis_client)
 
@@ -600,11 +1171,14 @@ async def get_all_aircraft(
             pipe.get(k)
         raw_values = await pipe.execute()
 
-        for raw in raw_values:
+        for key, raw in zip(keys, raw_values):
             if not raw:
                 continue
             try:
                 sv = StateVector.from_bytes(raw)
+                key_text = key.decode() if isinstance(key, bytes) else str(key)
+                if sv.icao24 != normalize_icao24(key_text.removeprefix("sv:")):
+                    continue
                 if sv.risk_score >= min_risk:
                     ac = sv.to_api_dict()
                     if _track_in_coverage(ac, area):
@@ -650,16 +1224,11 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
                     # Add L1 cross-validation status if available. This is
                     # an already-small alert list, so a direct per-item call
                     # (not the batch/rate-limit path used for the full feed) is fine.
-                    if (TDOA_AVAILABLE and cross_validator
-                            and sv.lat is not None and sv.lon is not None):
+                    if TDOA_AVAILABLE and cross_validator:
                         try:
-                            l1_result = await cross_validator.validate_aircraft(sv.icao24, sv.lat, sv.lon)
-                            alert['l1'] = {
-                                'validated': l1_result.is_valid,
-                                'verdict': l1_result.verdict,
-                                'disagreement_m': round(l1_result.max_disagreement_m, 1),
-                                'confidence': round(l1_result.confidence, 3),
-                            }
+                            l1 = await _validate_raw_l1_claim(sv.icao24)
+                            if l1:
+                                alert["l1"] = l1
                         except Exception as e:
                             log.warning(f"L1 validation failed for {sv.icao24}: {e}")
                     
@@ -678,7 +1247,7 @@ async def get_stats():
         raise HTTPException(status_code=503, detail="Redis unavailable")
     lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
     async with lock:
-        keys = await redis_client.keys("sv:*")
+        keys = await scan_key_batch("sv:*")
         total = 0
         area = await load_coverage_area(redis_client)
         classifications = {c.value: 0 for c in Classification}
@@ -689,11 +1258,14 @@ async def get_stats():
             pipe = redis_client.pipeline()
             for key in keys:
                 pipe.get(key)
-            for raw in await pipe.execute():
+            for key, raw in zip(keys, await pipe.execute()):
                 if not raw:
                     continue
                 try:
                     sv = StateVector.from_bytes(raw)
+                    key_text = key.decode() if isinstance(key, bytes) else str(key)
+                    if sv.icao24 != normalize_icao24(key_text.removeprefix("sv:")):
+                        continue
                     if not _track_in_coverage(sv.to_api_dict(), area):
                         continue
                     total += 1
@@ -725,25 +1297,29 @@ async def _load_state_vectors() -> List[StateVector]:
         ):
             return _layer_vector_cache["vectors"]
 
-        keys = []
-        async for key in redis_client.scan_iter(match="sv:*", count=500):
-            keys.append(key)
+        keys = await scan_key_batch("sv:*")
         if not keys:
             _layer_vector_cache.update(
                 client_id=id(redis_client), ts=now, vectors=[]
             )
             return []
-        pipe = redis_client.pipeline()
-        for key in keys:
-            pipe.get(key)
         vectors = []
-        for raw in await pipe.execute():
-            if not raw:
-                continue
-            try:
-                vectors.append(StateVector.from_bytes(raw))
-            except Exception:
-                continue
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            pipe = redis_client.pipeline()
+            for key in chunk:
+                pipe.get(key)
+            for key, raw in zip(chunk, await pipe.execute()):
+                if not raw:
+                    continue
+                try:
+                    sv = StateVector.from_bytes(raw)
+                    key_text = key.decode() if isinstance(key, bytes) else str(key)
+                    if sv.icao24 != normalize_icao24(key_text.removeprefix("sv:")):
+                        continue
+                    vectors.append(sv)
+                except Exception:
+                    continue
         _layer_vector_cache.update(
             client_id=id(redis_client), ts=now, vectors=vectors
         )
@@ -897,20 +1473,28 @@ async def get_l1_sources():
     return {"count": len(SOURCES), "sources": list(SOURCES.keys())}
 
 
-@app.post("/api/l1/validate")
+@app.post("/api/l1/validate", dependencies=[Depends(require_operator)])
 async def validate_position_l1(
     icao: str,
     lat: float,
     lon: float,
 ):
     """Manually cross-validate an aircraft's position against independent live networks."""
+    normalized_icao = _l1_normalized_icao(icao)
+    if normalized_icao is None:
+        raise HTTPException(status_code=422, detail="ICAO must be exactly six hexadecimal characters")
     if not TDOA_AVAILABLE or not cross_validator:
         return {"error": "L1 cross-validation not available"}
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    permitted = await redis_client.set(L1_MANUAL_RATE_KEY, "1", ex=5, nx=True)
+    if not permitted:
+        raise HTTPException(status_code=429, detail="Manual L1 validation is rate limited")
     
     try:
-        result = await cross_validator.validate_aircraft(icao, lat, lon)
+        result = await cross_validator.validate_aircraft(normalized_icao, lat, lon)
         return {
-            "icao": icao,
+            "icao": normalized_icao,
             "position": {"lat": lat, "lon": lon},
             "l1_result": result.to_dict(),
         }
@@ -957,6 +1541,46 @@ async def healthz():
         "dependencies": dependencies,
         "l1_enabled": TDOA_AVAILABLE,
         "l1_validator_ready": cross_validator is not None,
+    }
+
+
+@app.get("/api/mlat/readiness")
+async def mlat_readiness():
+    if redis_client is None or mlat_reception_producer is None:
+        raise HTTPException(status_code=503, detail="MLAT intake dependencies unavailable")
+    try:
+        validate_receiver_credentials()
+        positions = [
+            geodetic_to_ecef(*location)
+            for location in settings.MLAT_RECEIVER_LOCATIONS.values()
+        ]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Invalid MLAT receiver configuration")
+    if not receiver_geometry_is_safe(positions):
+        raise HTTPException(status_code=503, detail="Unsafe MLAT receiver geometry")
+    receiver_ids = list(settings.MLAT_RECEIVER_LOCATIONS)
+    values = await redis_client.mget([
+        f"mlat:receiver:last_seen:{receiver_id}" for receiver_id in receiver_ids
+    ])
+    now = time.time()
+    active = []
+    for receiver_id, value in zip(receiver_ids, values):
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= now - timestamp <= settings.RECEIVER_TIMEOUT_SEC:
+            active.append(receiver_id)
+    if len(active) < settings.MLAT_MIN_RECEIVERS:
+        raise HTTPException(status_code=503, detail={
+            "status": "not_ready",
+            "active_receivers": len(active),
+            "required_receivers": settings.MLAT_MIN_RECEIVERS,
+        })
+    return {
+        "status": "ready",
+        "active_receivers": len(active),
+        "required_receivers": settings.MLAT_MIN_RECEIVERS,
     }
 
 
@@ -1057,6 +1681,8 @@ async def _publish_alert(ac: Dict[str, Any], anomalies: List[Dict[str, Any]]) ->
         for ws, result in zip(clients, results):
             if isinstance(result, BaseException):
                 _ws_clients.discard(ws)
+        if clients and all(isinstance(result, BaseException) for result in results):
+            raise RuntimeError("alert delivery failed for every connected client")
 
 def _deduplicate_track_records(records: List[tuple[str, dict]]) -> List[dict]:
     """Return one track per ICAO, preferring canonical fused state vectors."""
@@ -1118,8 +1744,8 @@ async def broadcast_loop() -> None:
     while True:
         await asyncio.sleep(settings.WS_BROADCAST_INTERVAL)
         try:
-            keys = await redis_client.keys("ac:*")
-            fused_keys = await redis_client.keys("sv:*")
+            keys = await scan_key_batch("ac:*")
+            fused_keys = await scan_key_batch("sv:*")
 
             all_keys = list(set(keys + fused_keys))
             records: List[tuple[str, dict]] = []
@@ -1133,20 +1759,11 @@ async def broadcast_loop() -> None:
                         continue
                     key_text = key.decode() if isinstance(key, bytes) else str(key)
                     namespace = key_text.split(":", 1)[0]
-                    try:
-                        import orjson as _oj
-                        ac = _oj.loads(raw)
-                        if isinstance(ac, dict) and ac.get("icao"):
-                            records.append((namespace, ac))
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        sv = StateVector.from_bytes(raw)
-                        ac = sv.to_api_dict()
-                        records.append((namespace, ac))
-                    except Exception:
+                    decoded = _decode_redis_track(namespace, key_text, raw)
+                    if decoded is None:
+                        log.warning("Discarding invalid Redis track %s", key_text)
                         continue
+                    records.append(decoded)
 
             tracks = _deduplicate_track_records(records)
             l1_claims = _select_l1_claim_records(records)
@@ -1170,6 +1787,74 @@ async def broadcast_loop() -> None:
 
 # ─── Background: alert consumer ───────────────────────────────────────────────
 
+def _alert_event_identity(msg) -> bytes:
+    """Derive stable identity from immutable payload bytes, never an untrusted header."""
+    value = getattr(msg, "value", b"")
+    if not isinstance(value, bytes):
+        value = bytes(value)
+    return hashlib.sha256(value).hexdigest().encode()
+
+
+def _alert_effect_keys(msg) -> tuple[str, str]:
+    digest = hashlib.sha256(_alert_event_identity(msg)).hexdigest()
+    return f"completed:api-alert:{digest}", f"processing:api-alert:{digest}"
+
+
+async def _reserve_alert_effect(msg, *, timeout: float = 2.0) -> Optional[str]:
+    """Atomically acquire a short lease, or return None for a completed replay."""
+    if redis_client is None:
+        raise RuntimeError("Redis unavailable for alert idempotency")
+    completed_key, lease_key = _alert_effect_keys(msg)
+    token = secrets.token_hex(16)
+    script = """
+    if redis.call('EXISTS', KEYS[1]) == 1 then return 2 end
+    if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 end
+    return 0
+    """
+    status = await asyncio.wait_for(
+        redis_client.eval(script, 2, completed_key, lease_key, token, 30),
+        timeout=timeout,
+    )
+    if status == 2:
+        return None
+    if status == 1:
+        return token
+    raise RuntimeError("alert effect is already being processed")
+
+
+async def _complete_alert_effect(msg, token: str, *, timeout: float = 2.0) -> None:
+    """Atomically mark completion only while this worker still owns the lease."""
+    if redis_client is None:
+        raise RuntimeError("Redis unavailable for alert idempotency")
+    completed_key, lease_key = _alert_effect_keys(msg)
+    script = """
+    if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+    redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+    redis.call('DEL', KEYS[2])
+    return 1
+    """
+    completed = await asyncio.wait_for(
+        redis_client.eval(script, 2, completed_key, lease_key, token, 7 * 86_400),
+        timeout=timeout,
+    )
+    if completed != 1:
+        raise RuntimeError("lost ownership of alert effect lease")
+
+
+async def _release_alert_effect(msg, token: str, *, timeout: float = 2.0) -> None:
+    """Release an unfinished effect lease without disturbing another owner."""
+    if redis_client is None:
+        raise RuntimeError("Redis unavailable for alert idempotency")
+    _, lease_key = _alert_effect_keys(msg)
+    script = """
+    if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+    return redis.call('DEL', KEYS[1])
+    """
+    await asyncio.wait_for(
+        redis_client.eval(script, 1, lease_key, token), timeout=timeout,
+    )
+
+
 async def alert_consumer_loop() -> None:
     consumer = AIOKafkaConsumer(
         settings.TOPIC_ALERTS_ANOMALY,
@@ -1183,35 +1868,60 @@ async def alert_consumer_loop() -> None:
     try:
         async for msg in consumer:
             if not _ws_clients:
-                await consumer.commit()
+                await commit_record(consumer, msg)
                 continue
             try:
                 sv = StateVector.from_bytes(msg.value)
-                ac = sv.to_api_dict()
-                area = await load_coverage_area(redis_client)
-                if not _track_in_coverage(ac, area):
-                    await consumer.commit()
-                    continue
-                
-                # Apply L1 cross-validation to this single alert (one item
-                # at a time off the Kafka topic, so a direct call is fine —
-                # the rate-limit concern is about the full global feed)
-                if (TDOA_AVAILABLE and cross_validator
-                        and ac.get("lat") is not None and ac.get("lon") is not None):
-                    try:
-                        l1_result = await cross_validator.validate_aircraft(ac["icao"], ac["lat"], ac["lon"])
-                        ac["l1"] = {
-                            "validated": l1_result.is_valid,
-                            "verdict": l1_result.verdict,
-                            "disagreement_m": round(l1_result.max_disagreement_m, 1),
-                        }
-                    except Exception as e:
-                        log.warning(f"L1 validation failed in alert loop: {e}")
-                
-                await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
-                await consumer.commit()
-            except Exception as e:
-                log.error("Alert push error: %s", e)
-                raise
+            except Exception as exc:
+                log.error("Skipping malformed anomaly-alert record: %s", exc)
+                await commit_record(consumer, msg)
+                continue
+
+            # Retry the same record before consuming a later offset. Committing
+            # a later message after skipping this one would also commit past the
+            # failed offset on that partition and silently lose the alert.
+            for attempt in range(2):
+                token = None
+                completed = False
+                try:
+                    ac = sv.to_api_dict()
+                    area = await load_coverage_area(redis_client)
+                    if not _track_in_coverage(ac, area):
+                        await commit_record(consumer, msg)
+                        break
+                    token = await _reserve_alert_effect(msg)
+                    if token is None:
+                        await commit_record(consumer, msg)
+                        break
+
+                    # Apply L1 cross-validation to this single alert (one item
+                    # at a time off the Kafka topic, so a direct call is fine.
+                    if TDOA_AVAILABLE and cross_validator:
+                        try:
+                            l1 = await _validate_raw_l1_claim(ac["icao"])
+                            if l1:
+                                ac["l1"] = l1
+                        except Exception as e:
+                            log.warning("L1 validation failed in alert loop: %s", e)
+
+                    await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
+                    await _complete_alert_effect(msg, token)
+                    completed = True
+                    await commit_record(consumer, msg)
+                    break
+                except BaseException as e:
+                    if token is not None and not completed:
+                        try:
+                            await _release_alert_effect(msg, token)
+                        except Exception as release_error:
+                            log.error("Alert lease release error: %s", release_error)
+                    if not isinstance(e, Exception):
+                        raise
+                    log.error("Alert push attempt %d failed: %s", attempt + 1, e)
+                    if attempt == 1:
+                        # Do not advance to another offset. Restarting the
+                        # consumer preserves at-least-once replay for this one.
+                        raise
+                    await asyncio.sleep(0)
     finally:
         await consumer.stop()

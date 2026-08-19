@@ -11,7 +11,7 @@ class L2ReplayTests(unittest.TestCase):
 
     def _sample(self, index, velocity, heading, vertical_rate=0):
         return StateVector(
-            icao24="REPLAY1",
+            icao24="AEA001",
             lat=40.0 + index * 0.001,
             lon=-75.0 + index * 0.001,
             altitude_baro=12000 + index * 10,

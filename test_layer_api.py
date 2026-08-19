@@ -19,11 +19,7 @@ class LayerApiTests(unittest.IsolatedAsyncioTestCase):
         redis = AsyncMock()
         keys = [f"sv:{v.icao24}".encode() for v in vectors]
 
-        async def scan_iter(**_kwargs):
-            for key in keys:
-                yield key
-
-        redis.scan_iter = MagicMock(side_effect=scan_iter)
+        redis.scan = AsyncMock(return_value=(0, keys))
         pipeline = MagicMock()
         pipeline.get = MagicMock(return_value=pipeline)
         pipeline.execute = AsyncMock(return_value=[v.to_bytes() for v in vectors])

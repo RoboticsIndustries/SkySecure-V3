@@ -15,10 +15,12 @@ Also writes enriched StateVectors back to Redis with updated risk scores.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
+import secrets
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from typing import Dict, List, Optional, Deque
 
 import numpy as np
@@ -34,6 +36,7 @@ from models import (
     LayerEvaluation, LayerStatus, RiskBand,
 )
 from config import settings, KAFKA_CONSUMER_STABILITY
+from kafka_offsets import commit_record
 from anomaly.enhanced_detector import EnhancedAnomalyDetector, LayerResult
 
 log = logging.getLogger(__name__)
@@ -219,23 +222,27 @@ class AircraftBaseline:
         sv: StateVector,
         *,
         fresh_velocity: bool = True,
+        fresh_altitude: bool = True,
         fresh_heading: bool = True,
         fresh_vertical_rate: bool = True,
+        observation_time: Optional[float] = None,
     ) -> None:
+        timestamp = float(sv.last_seen if observation_time is None else observation_time)
         observation = dict(self.last_observation or {})
         if fresh_velocity and sv.velocity is not None:
             self.velocities.append(float(sv.velocity))
             observation["velocity"] = float(sv.velocity)
-            observation["velocity_timestamp"] = float(sv.last_seen)
-        if sv.altitude_baro is not None:
+            observation["velocity_timestamp"] = timestamp
+        if fresh_altitude and sv.altitude_baro is not None:
             self.altitudes.append(float(sv.altitude_baro))
+            observation["altitude_timestamp"] = timestamp
         if fresh_vertical_rate and sv.vertical_rate is not None:
             self.vrates.append(float(sv.vertical_rate))
             observation["vertical_rate"] = float(sv.vertical_rate)
-            observation["vertical_rate_timestamp"] = float(sv.last_seen)
+            observation["vertical_rate_timestamp"] = timestamp
         if fresh_heading and sv.heading is not None:
             observation["heading"] = float(sv.heading)
-            observation["heading_timestamp"] = float(sv.last_seen)
+            observation["heading_timestamp"] = timestamp
         if observation:
             # Keep the legacy key for baselines serialized by older versions.
             observation["timestamp"] = max(
@@ -289,33 +296,63 @@ class StatisticalDetector:
         self._baselines[icao] = baseline
 
     @staticmethod
+    def _has_current_adsb_observation(sv: StateVector) -> bool:
+        if not sv.source_reports:
+            return sv.last_update_source in (DataSource.ADSB, DataSource.UNKNOWN)
+        if sv.last_update_source != DataSource.ADSB or sv.last_update_timestamp is None:
+            return False
+        return any(
+            report.source == DataSource.ADSB
+            and abs(float(report.timestamp) - float(sv.last_update_timestamp)) <= 0.001
+            for report in sv.source_reports
+        )
+
+    @staticmethod
     def _fresh_kinematic_fields(sv: StateVector) -> tuple[bool, bool, bool]:
         """Return whether velocity, heading, and vertical rate were measured now."""
         if not sv.source_reports:
             # Direct/legacy state vectors have no source provenance.
             return True, True, True
-        report = sv.source_reports[-1]
-        same_event = abs(float(report.timestamp) - float(sv.last_seen)) <= 0.001
-        adsb_event = same_event and report.source == DataSource.ADSB
+        if not StatisticalDetector._has_current_adsb_observation(sv):
+            return False, False, False
+        report = next((
+            item for item in reversed(sv.source_reports)
+            if item.source == DataSource.ADSB
+            and abs(float(item.timestamp) - float(sv.last_update_timestamp)) <= 0.001
+        ), None)
+        if report is None:
+            return False, False, False
         return (
-            adsb_event and report.velocity is not None,
-            adsb_event and report.heading is not None,
-            adsb_event and report.vertical_rate is not None,
+            report.velocity is not None,
+            report.heading is not None,
+            report.vertical_rate is not None,
         )
 
     def check(self, sv: StateVector) -> List[AnomalyFlag]:
         icao = sv.icao24
         baseline = self.get_baseline(icao)
         flags = []
+        observation_time = float(
+            sv.last_update_timestamp if sv.last_update_timestamp is not None else sv.last_seen
+        )
         fresh_velocity, fresh_heading, fresh_vertical_rate = self._fresh_kinematic_fields(sv)
 
         previous = baseline.last_observation
         if previous:
+            fresh_velocity = fresh_velocity and float(previous.get(
+                "velocity_timestamp", previous.get("timestamp", -1.0)
+            )) < observation_time
+            fresh_heading = fresh_heading and float(previous.get(
+                "heading_timestamp", previous.get("timestamp", -1.0)
+            )) < observation_time
+            fresh_vertical_rate = fresh_vertical_rate and float(previous.get(
+                "vertical_rate_timestamp", previous.get("timestamp", -1.0)
+            )) < observation_time
             previous_velocity = previous.get("velocity")
             velocity_time = float(previous.get(
-                "velocity_timestamp", previous.get("timestamp", sv.last_seen)
+                "velocity_timestamp", previous.get("timestamp", observation_time)
             ))
-            velocity_dt = float(sv.last_seen) - velocity_time
+            velocity_dt = observation_time - velocity_time
             if fresh_velocity and 0.1 <= velocity_dt <= 300.0:
                 if sv.velocity is not None and previous_velocity is not None:
                     acceleration = abs(float(sv.velocity) - float(previous_velocity)) / velocity_dt
@@ -331,9 +368,9 @@ class StatisticalDetector:
 
             previous_heading = previous.get("heading")
             heading_time = float(previous.get(
-                "heading_timestamp", previous.get("timestamp", sv.last_seen)
+                "heading_timestamp", previous.get("timestamp", observation_time)
             ))
-            heading_dt = float(sv.last_seen) - heading_time
+            heading_dt = observation_time - heading_time
             if fresh_heading and 0.1 <= heading_dt <= 300.0:
                 if sv.heading is not None and previous_heading is not None:
                     heading_delta = abs((float(sv.heading) - float(previous_heading) + 180.0) % 360.0 - 180.0)
@@ -375,8 +412,14 @@ class StatisticalDetector:
         baseline.update(
             sv,
             fresh_velocity=fresh_velocity,
+            fresh_altitude=(
+                self._has_current_adsb_observation(sv)
+                and float((previous or {}).get("altitude_timestamp", -1.0))
+                    < observation_time
+            ),
             fresh_heading=fresh_heading,
             fresh_vertical_rate=fresh_vertical_rate,
+            observation_time=observation_time,
         )
         return flags
 
@@ -423,7 +466,9 @@ class LSTMTrajectoryPredictor:
             model = TrajectoryLSTM()
             model_path = "data/trajectory_lstm.pt"
             if os.path.exists(model_path):
-                model.load_state_dict(torch.load(model_path, map_location="cpu"))
+                model.load_state_dict(
+                    torch.load(model_path, map_location="cpu", weights_only=True)
+                )
                 model.eval()
                 self._model = model
                 self._model_loaded = True
@@ -561,6 +606,10 @@ class ThreatScorer:
 
 class AnomalyDetector:
 
+    _publishing_outbox_keys: set[bytes] = set()
+    _MAX_SCAN_CURSORS = 128
+    _GLOBAL_OUTBOX_MATCH = "outbox:anomaly-alert:*"
+
     def __init__(self) -> None:
         self.rule_engine  = RuleEngine()
         self.statistical  = StatisticalDetector()
@@ -571,6 +620,10 @@ class AnomalyDetector:
         self._last_l2_persist: Dict[str, float] = {}
         self._last_l2_access: Dict[str, float] = {}
         self._last_results: Dict[str, StateVector] = {}
+        self._outbox_scan_cursors: OrderedDict[str, int] = OrderedDict()
+        self._global_outbox_scan_cursor = 0
+        self._outbox_scan_pending: OrderedDict[str, Deque] = OrderedDict()
+        self._global_outbox_scan_pending: Deque = deque()
 
     async def hydrate_l2_baseline(self, redis_client, icao: str) -> None:
         """Load a baseline once per process so detector state survives restarts."""
@@ -594,6 +647,9 @@ class AnomalyDetector:
             return
         try:
             prior = StateVector.from_bytes(raw)
+            if prior.icao24 != icao:
+                log.warning("Discarding identity-mismatched prior detector result for %s", icao)
+                return
             l2 = prior.layer_evaluations.get(DetectionLayer.L2.value)
             if l2 and "velocity_baseline" in l2.detectors_evaluated:
                 self._last_results[icao] = prior
@@ -616,18 +672,273 @@ class AnomalyDetector:
         )
         self._last_l2_persist[icao] = now
 
-    async def persist_event_state(self, redis_client, sv: StateVector) -> None:
-        """Atomically commit replay identity, enrichment, and its L2 baseline."""
+    @staticmethod
+    def alert_outbox_key(sv: StateVector) -> str:
+        """Return an immutable, deterministic key for one alert event."""
+        digest = hashlib.sha256(sv.to_bytes()).hexdigest()
+        return f"outbox:anomaly-alert:{sv.icao24}:{digest}"
+
+    async def persist_event_state(
+        self, redis_client, sv: StateVector, *, pending_alert: bool = False
+    ) -> None:
+        """Atomically commit enrichment, baseline, and an immutable alert event."""
+        payload = sv.to_bytes()
         pipeline = redis_client.pipeline(transaction=True)
         pipeline.setex(
             f"baseline:l2:{sv.icao24}", 86_400,
             orjson.dumps(self.statistical.get_baseline(sv.icao24).to_dict()),
         )
         pipeline.setex(
-            f"sv:{sv.icao24}", settings.REDIS_TTL_STATE_VECTOR, sv.to_bytes()
+            f"sv:{sv.icao24}", settings.REDIS_TTL_STATE_VECTOR, payload
         )
-        await pipeline.execute()
+        if pending_alert:
+            # NX makes the content-addressed event immutable. Distinct events
+            # for one ICAO have distinct keys and therefore cannot overwrite.
+            pipeline.set(self.alert_outbox_key(sv), payload, nx=True)
+        await asyncio.wait_for(pipeline.execute(), timeout=5.0)
         self._last_l2_persist[sv.icao24] = time.monotonic()
+
+    @staticmethod
+    def _claim_key(key):
+        raw = key if isinstance(key, bytes) else key.encode()
+        claim = b"outbox-claim:anomaly-alert:" + hashlib.sha256(raw).hexdigest().encode()
+        return claim if isinstance(key, bytes) else claim.decode()
+
+    @staticmethod
+    async def _release_claim(
+        redis_client, claim_key, token: str, *, operation_timeout: float = 2.0
+    ) -> None:
+        await asyncio.wait_for(
+            redis_client.eval(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                "return redis.call('DEL', KEYS[1]) else return 0 end",
+                1, claim_key, token,
+            ),
+            timeout=operation_timeout,
+        )
+
+    @staticmethod
+    async def _ack_claimed_payload(
+        redis_client, key, claim_key, payload: bytes, token: str,
+        *, operation_timeout: float = 2.0,
+    ) -> int:
+        return await asyncio.wait_for(
+            redis_client.eval(
+                "if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end; "
+                "if redis.call('GET', KEYS[1]) ~= ARGV[1] then "
+                "redis.call('DEL', KEYS[2]); return 0 end; "
+                "redis.call('DEL', KEYS[1]); redis.call('DEL', KEYS[2]); return 1",
+                2, key, claim_key, payload, token,
+            ),
+            timeout=operation_timeout,
+        )
+
+    @staticmethod
+    async def _renew_claim_loop(
+        redis_client,
+        claim_key,
+        token: str,
+        claim_ttl: int,
+        stopped: asyncio.Event,
+        lease_lost: asyncio.Event,
+        operation_timeout: float,
+    ) -> None:
+        """Keep a publish lease alive and fence the publisher if ownership is lost."""
+        interval = max(0.25, claim_ttl / 3.0)
+        while True:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                renewed = await asyncio.wait_for(
+                    redis_client.eval(
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                        "return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end",
+                        1, claim_key, token, claim_ttl,
+                    ),
+                    timeout=operation_timeout,
+                )
+            except BaseException:
+                lease_lost.set()
+                return
+            if not renewed:
+                lease_lost.set()
+                return
+
+    @staticmethod
+    def _outbox_event_id(key) -> bytes:
+        raw = key if isinstance(key, bytes) else str(key).encode()
+        return hashlib.sha256(raw).hexdigest().encode()
+
+    async def publish_pending_alert_key(
+        self,
+        redis_client,
+        producer,
+        key,
+        *,
+        publish_timeout: float = 5.0,
+        operation_timeout: float = 2.0,
+    ) -> bool:
+        """Publish one at-least-once event under a renewable, fenced Redis lease."""
+        raw_key = key if isinstance(key, bytes) else str(key).encode()
+        if raw_key in self._publishing_outbox_keys:
+            return False
+        self._publishing_outbox_keys.add(raw_key)
+        token = secrets.token_hex(16)
+        claim_key = self._claim_key(key)
+        claim_ttl = max(2, int(math.ceil(publish_timeout)) + 1)
+        try:
+            claimed = await asyncio.wait_for(
+                redis_client.set(claim_key, token, nx=True, ex=claim_ttl),
+                timeout=operation_timeout,
+            )
+            if not claimed:
+                return False
+            payload = await asyncio.wait_for(
+                redis_client.get(key), timeout=operation_timeout
+            )
+            if payload is None:
+                await self._release_claim(
+                    redis_client, claim_key, token,
+                    operation_timeout=operation_timeout,
+                )
+                return False
+            try:
+                pending = StateVector.from_bytes(payload)
+            except Exception as exc:
+                log.error("Discarding malformed anomaly alert outbox entry %r: %s", key, exc)
+                await self._ack_claimed_payload(
+                    redis_client, key, claim_key, payload, token,
+                    operation_timeout=operation_timeout,
+                )
+                return False
+
+            expected_key = self.alert_outbox_key(pending).encode()
+            if raw_key != expected_key:
+                log.error(
+                    "Discarding identity-mismatched anomaly alert outbox entry %r",
+                    key,
+                )
+                await self._ack_claimed_payload(
+                    redis_client, key, claim_key, payload, token,
+                    operation_timeout=operation_timeout,
+                )
+                return False
+
+            event_key = (
+                f"{pending.icao24}:{pending.last_seen:.6f}:{pending.update_count}"
+            ).encode()
+            event_id = self._outbox_event_id(key)
+            stopped = asyncio.Event()
+            lease_lost = asyncio.Event()
+            renew_task = asyncio.create_task(self._renew_claim_loop(
+                redis_client, claim_key, token, claim_ttl, stopped,
+                lease_lost, operation_timeout,
+            ))
+            try:
+                await asyncio.wait_for(
+                    producer.send_and_wait(
+                        topic=settings.TOPIC_ALERTS_ANOMALY,
+                        key=event_key,
+                        value=payload,
+                        headers=[("event_id", event_id)],
+                    ),
+                    timeout=publish_timeout,
+                )
+            except BaseException:
+                stopped.set()
+                await asyncio.gather(renew_task, return_exceptions=True)
+                await self._release_claim(
+                    redis_client, claim_key, token,
+                    operation_timeout=operation_timeout,
+                )
+                raise
+            stopped.set()
+            await asyncio.gather(renew_task, return_exceptions=True)
+
+            # The acknowledgement script verifies both lease ownership and
+            # exact payload bytes in the same Redis operation. If ownership was
+            # lost, leave the immutable item for an at-least-once retry;
+            # downstream event-id deduplication suppresses duplicate effects.
+            if not lease_lost.is_set():
+                await self._ack_claimed_payload(
+                    redis_client, key, claim_key, payload, token,
+                    operation_timeout=operation_timeout,
+                )
+            return True
+        finally:
+            self._publishing_outbox_keys.discard(raw_key)
+
+    async def drain_pending_alerts(
+        self,
+        redis_client,
+        producer,
+        *,
+        max_items: int = 100,
+        publish_timeout: float = 5.0,
+        operation_timeout: float = 2.0,
+        match: str = _GLOBAL_OUTBOX_MATCH,
+    ) -> int:
+        """Publish at most one bounded SCAN page, without process-local locks."""
+        published = 0
+        if max_items <= 0:
+            return 0
+        try:
+            is_global_scan = match == self._GLOBAL_OUTBOX_MATCH
+            pending = (
+                self._global_outbox_scan_pending
+                if is_global_scan
+                else self._outbox_scan_pending.get(match)
+            )
+            if pending:
+                keys = [pending.popleft() for _ in range(min(max_items, len(pending)))]
+            else:
+                cursor = (
+                    self._global_outbox_scan_cursor
+                    if is_global_scan
+                    else self._outbox_scan_cursors.get(match, 0)
+                )
+                next_cursor, scanned_keys = await asyncio.wait_for(
+                    redis_client.scan(cursor=cursor, match=match, count=max_items),
+                    timeout=operation_timeout,
+                )
+                scanned_keys = list(dict.fromkeys(scanned_keys))
+                keys = scanned_keys[:max_items]
+                overflow = scanned_keys[max_items:]
+                if is_global_scan:
+                    self._global_outbox_scan_cursor = int(next_cursor)
+                    self._global_outbox_scan_pending.extend(overflow)
+                else:
+                    self._outbox_scan_cursors.pop(match, None)
+                    if next_cursor:
+                        self._outbox_scan_cursors[match] = int(next_cursor)
+                    self._outbox_scan_pending.pop(match, None)
+                    if overflow:
+                        self._outbox_scan_pending[match] = deque(overflow)
+                    while len(self._outbox_scan_cursors) > self._MAX_SCAN_CURSORS:
+                        self._outbox_scan_cursors.popitem(last=False)
+                    while len(self._outbox_scan_pending) > self._MAX_SCAN_CURSORS:
+                        self._outbox_scan_pending.popitem(last=False)
+        except Exception as exc:
+            log.warning("Anomaly alert outbox scan failed: %s", exc)
+            return 0
+        unique_keys = list(dict.fromkeys(keys))[:max_items]
+        for key in unique_keys:
+            try:
+                if await self.publish_pending_alert_key(
+                    redis_client, producer, key,
+                    publish_timeout=publish_timeout,
+                    operation_timeout=operation_timeout,
+                ):
+                    published += 1
+            except Exception as exc:
+                # Stop immediately during an outage rather than spending one
+                # timeout per backlog item. The claimed entry remains durable.
+                log.warning("Anomaly alert outbox publish failed for %r: %s", key, exc)
+                break
+        return published
 
     def prune_l2_state(self, max_idle_seconds: float = 86_400.0) -> int:
         """Bound process-local detector state; Redis remains the durable copy."""
@@ -649,6 +960,11 @@ class AnomalyDetector:
 
     def is_replay(self, sv: StateVector) -> bool:
         prior = self._last_results.get(sv.icao24)
+        if (
+            prior is not None and sv.source_event_id
+            and prior.source_event_id == sv.source_event_id
+        ):
+            return True
         return prior is not None and (
             sv.last_seen, sv.update_count
         ) <= (
@@ -675,12 +991,17 @@ class AnomalyDetector:
         ]
 
         # Canonical L2: deterministic kinematic rules + statistical baselines.
-        l2_flags = self.rule_engine.check_all(sv)
+        current_adsb_observation = self.statistical._has_current_adsb_observation(sv)
+        adsb_observation_time = float(
+            sv.last_update_timestamp if current_adsb_observation
+            and sv.last_update_timestamp is not None else sv.last_seen
+        )
+        l2_flags = self.rule_engine.check_all(sv) if current_adsb_observation else []
 
         # Layer 2: Statistics
         l2_flags.extend(self.statistical.check(sv))
         for flag in l2_flags:
-            flag.timestamp = sv.last_seen
+            flag.timestamp = adsb_observation_time
         all_flags.extend(l2_flags)
         evaluated_l2_flags = [
             flag for flag in upstream_flags if flag.layer == DetectionLayer.L2
@@ -696,18 +1017,17 @@ class AnomalyDetector:
             ],
             triggered_detectors=sorted({flag.detector for flag in evaluated_l2_flags}),
             score_delta=sum(flag.score_delta for flag in evaluated_l2_flags),
-            timestamp=sv.last_seen,
+            timestamp=adsb_observation_time,
         )
 
         # Canonical L3 combines trajectory behavior with ADS-B integrity
         # metadata when the selected source supplies NIC/NACp.
         is_adsb_integrity_event = (
-            sv.last_update_source == DataSource.ADSB
-            or (sv.last_update_source == DataSource.UNKNOWN and not sv.source_reports)
+            self.statistical._has_current_adsb_observation(sv)
         )
         if is_adsb_integrity_event:
             integrity_result = self.integrity.check_integrity(
-                sv.icao24, sv.nic, sv.nac_p, sv.last_seen, sv.update_count
+                sv.icao24, sv.nic, sv.nac_p, adsb_observation_time, sv.update_count
             )
         else:
             integrity_result = LayerResult(
@@ -732,7 +1052,10 @@ class AnomalyDetector:
             all_flags.append(integrity_flag)
 
         # Layer 3: trajectory predictor
-        lstm_flag = self.lstm.update_and_check(sv)
+        advances_trajectory = (
+            prior_result is None or float(sv.last_seen) > float(prior_result.last_seen)
+        )
+        lstm_flag = self.lstm.update_and_check(sv) if advances_trajectory else None
         trajectory_detector = "trajectory_lstm" if self.lstm._model_loaded else "trajectory_heuristic"
         sequence_ready = len(self.lstm._sequences.get(sv.icao24, ())) >= self.lstm.SEQ_LEN + 1
         if lstm_flag:
@@ -774,71 +1097,148 @@ class AnomalyDetector:
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
+async def drain_alert_outbox_periodically(
+    detector: AnomalyDetector,
+    redis_client,
+    producer,
+    interval_seconds: float = 30.0,
+) -> None:
+    """Retry the durable alert outbox even when no fused-track records arrive."""
+    while True:
+        published = await detector.drain_pending_alerts(redis_client, producer)
+        if published:
+            log.info("Published %d anomaly alerts from durable outbox", published)
+        await asyncio.sleep(interval_seconds)
+
+
+async def supervise_detector_tasks(consumer_coro, outbox_coro) -> None:
+    """Run consumer and recovery together; either stopping cancels the other."""
+    consumer_task = asyncio.create_task(consumer_coro)
+    outbox_task = asyncio.create_task(outbox_coro)
+    try:
+        done, _ = await asyncio.wait(
+            {consumer_task, outbox_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if outbox_task in done:
+            outbox_task.result()
+            raise RuntimeError("Anomaly outbox recovery stopped unexpectedly")
+        consumer_task.result()
+    finally:
+        for task in (consumer_task, outbox_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(consumer_task, outbox_task, return_exceptions=True)
+
+
+async def consume_fused_tracks(detector, redis_client, consumer, alert_producer) -> None:
+    count = 0
+    async for msg in consumer:
+        try:
+            sv = StateVector.from_bytes(msg.value)
+        except Exception as exc:
+            log.error("Skipping malformed fused-track record: %s", exc)
+            await asyncio.wait_for(commit_record(consumer, msg), timeout=5.0)
+            continue
+
+        try:
+            await detector.hydrate_last_result(redis_client, sv.icao24)
+            await detector.hydrate_l2_baseline(redis_client, sv.icao24)
+            if detector.is_replay(sv):
+                await detector.drain_pending_alerts(
+                    redis_client, alert_producer, max_items=10,
+                    publish_timeout=1.0,
+                    match=f"outbox:anomaly-alert:{sv.icao24}:*",
+                )
+                await commit_record(consumer, msg)
+                continue
+            sv = detector.process(sv)
+            alerting = sv.risk_band in (RiskBand.ALERT, RiskBand.CRITICAL)
+            outbox_key = detector.alert_outbox_key(sv) if alerting else None
+            await detector.persist_event_state(redis_client, sv, pending_alert=alerting)
+            if outbox_key is not None:
+                await detector.publish_pending_alert_key(
+                    redis_client, alert_producer, outbox_key
+                )
+            await commit_record(consumer, msg)
+            count += 1
+            if count % 10_000 == 0:
+                pruned = detector.prune_l2_state()
+                log.info(
+                    "Anomaly detector: processed %d state vectors; pruned %d idle L2 baselines",
+                    count, pruned,
+                )
+        except Exception as exc:
+            log.error("Anomaly detection error: %s", exc)
+            raise
+
+
 async def run() -> None:
     logging.basicConfig(level=settings.LOG_LEVEL)
     log.info("Starting anomaly detector")
 
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
-    detector = AnomalyDetector()
-
-    consumer = AIOKafkaConsumer(
-        settings.TOPIC_FUSED_TRACKS,
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP,
-        group_id=f"{settings.KAFKA_GROUP_PREFIX}.anomaly-detector",
-        value_deserializer=lambda v: v,
-        auto_offset_reset="latest",
-        fetch_max_bytes=10_485_760,
-        **KAFKA_CONSUMER_STABILITY,
-    )
-
-    alert_producer = AIOKafkaProducer(
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP,
-        compression_type="lz4",
-    )
-
-    await consumer.start()
-    await alert_producer.start()
-
+    redis_client = None
+    consumer = None
+    alert_producer = None
+    outbox_drain_task = None
     count = 0
     try:
-        async for msg in consumer:
-            try:
-                sv = StateVector.from_bytes(msg.value)
-                await detector.hydrate_last_result(redis_client, sv.icao24)
-                await detector.hydrate_l2_baseline(redis_client, sv.icao24)
-                if detector.is_replay(sv):
-                    await consumer.commit()
-                    continue
-                sv = detector.process(sv)
-                await detector.persist_event_state(redis_client, sv)
+        # Construction and startup share the cleanup scope. Each successfully
+        # returned resource is tracked immediately, so a later constructor or
+        # start failure cannot strand it.
+        redis_client = aioredis.from_url(
+            settings.REDIS_URL, decode_responses=False
+        )
+        detector = AnomalyDetector()
+        consumer = AIOKafkaConsumer(
+            settings.TOPIC_FUSED_TRACKS,
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP,
+            group_id=f"{settings.KAFKA_GROUP_PREFIX}.anomaly-detector",
+            value_deserializer=lambda v: v,
+            auto_offset_reset="latest",
+            fetch_max_bytes=10_485_760,
+            **KAFKA_CONSUMER_STABILITY,
+        )
+        alert_producer = AIOKafkaProducer(
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP,
+            compression_type="lz4",
+        )
 
-                # Publish alerts for ALERT/CRITICAL band
-                if sv.risk_band in (RiskBand.ALERT, RiskBand.CRITICAL):
-                    await alert_producer.send_and_wait(
-                        topic=settings.TOPIC_ALERTS_ANOMALY,
-                        key=sv.icao24.encode(),
-                        value=sv.to_bytes(),
-                    )
-
-                await consumer.commit()
-
-                count += 1
-                if count % 10_000 == 0:
-                    pruned = detector.prune_l2_state()
-                    log.info(
-                        "Anomaly detector: processed %d state vectors; pruned %d idle L2 baselines",
-                        count,
-                        pruned,
-                    )
-
-            except Exception as e:
-                log.error("Anomaly detection error: %s", e)
-                raise
+        await asyncio.wait_for(consumer.start(), timeout=15.0)
+        await asyncio.wait_for(alert_producer.start(), timeout=15.0)
+        await supervise_detector_tasks(
+            consume_fused_tracks(detector, redis_client, consumer, alert_producer),
+            drain_alert_outbox_periodically(detector, redis_client, alert_producer),
+        )
 
     finally:
-        await consumer.stop()
-        await alert_producer.stop()
-        await redis_client.close()
+        if outbox_drain_task is not None:
+            outbox_drain_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(outbox_drain_task, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Timed out waiting for anomaly outbox task cancellation")
+
+        # Attempt every allocated resource independently and bound each cleanup.
+        cleanup = []
+        names = []
+        if consumer is not None:
+            cleanup.append(asyncio.wait_for(consumer.stop(), timeout=5.0))
+            names.append("consumer")
+        if alert_producer is not None:
+            cleanup.append(asyncio.wait_for(alert_producer.stop(), timeout=5.0))
+            names.append("producer")
+        if redis_client is not None:
+            cleanup.append(asyncio.wait_for(redis_client.close(), timeout=5.0))
+            names.append("redis")
+        if cleanup:
+            cleanup_results = await asyncio.gather(*cleanup, return_exceptions=True)
+            for resource, result in zip(names, cleanup_results):
+                if isinstance(result, BaseException):
+                    log.warning("Failed to clean up %s: %s", resource, result)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 # Web / API
-fastapi==0.111.0
+fastapi==0.141.1
 uvicorn[standard]==0.29.0
 websockets==12.0
 httpx==0.27.0
-aiohttp==3.9.5
+aiohttp==3.14.3
 
 # Kafka
 confluent-kafka==2.4.0
@@ -25,8 +25,9 @@ scipy==1.13.0
 pandas==2.2.2
 pyproj==3.6.1          # geodetic calculations
 
-# Machine Learning
-torch==2.3.0
+# Machine Learning (PyTorch is optional; the runtime uses the heuristic
+# trajectory detector unless a trusted model and separately managed Torch
+# installation are provided.)
 scikit-learn==1.4.2
 joblib==1.4.2
 
@@ -34,7 +35,7 @@ joblib==1.4.2
 pyModeS==2.19           # Mode S / ADS-B decoder
 
 # Serialization
-pydantic==2.7.1
+pydantic==2.13.4
 orjson==3.10.3
 msgpack==1.0.8
 
@@ -44,5 +45,5 @@ structlog==24.1.0
 prometheus-client==0.20.0
 tenacity==8.3.0
 haversine==2.8.1
-pydantic-settings==2.3.4
+pydantic-settings==2.15.0
 lz4==4.3.3

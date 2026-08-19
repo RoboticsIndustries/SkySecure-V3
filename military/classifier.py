@@ -284,31 +284,40 @@ class FormationDetector:
 
     def __init__(self, redis_client) -> None:
         self.redis = redis_client
-        self._formation_groups: Dict[str, List[str]] = {}  # leader_icao → member ICAOs 
+        self._formation_groups: Dict[str, List[str]] = {}
+        self._scan_cursor = 0
+        self._scan_snapshot: Dict[object, None] = {}
+        self._scan_building: Dict[object, None] = {}
 
     async def scan(self) -> List[List[str]]:
-        """
-        Scan all active state vectors for formation patterns.
-        Returns list of formation groups (each a list of ICAO24 strings).
-        """
-        import redis.asyncio as aioredis
-
-        # Fetch all active state vectors from Redis
-        keys = await self.redis.keys("sv:*")
-        if not keys: 
+        """Boundedly scan active state vectors for formation patterns."""
+        for _ in range(4):
+            self._scan_cursor, batch = await self.redis.scan(
+                self._scan_cursor, match="sv:*", count=500,
+            )
+            for key in batch:
+                if len(self._scan_building) < 10_000:
+                    self._scan_building[key] = None
+            if self._scan_cursor == 0:
+                self._scan_snapshot = self._scan_building
+                self._scan_building = {}
+                break
+        keys = list(self._scan_snapshot or self._scan_building)[:10_000]
+        if not keys:
             return []
-        pipe = self.redis.pipeline()
-        for k in keys:
-            pipe.get(k)
-        raw_values = await pipe.execute()
 
         vectors: List[StateVector] = []
-        for raw in raw_values:
-            if raw:
-                try:
-                    vectors.append(StateVector.from_bytes(raw))
-                except Exception:
-                    pass
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            pipe = self.redis.pipeline()
+            for key in chunk:
+                pipe.get(key)
+            for raw in await pipe.execute():
+                if raw:
+                    try:
+                        vectors.append(StateVector.from_bytes(raw))
+                    except Exception:
+                        pass
 
         # Filter to airborne aircraft with position + heading
         airborne = [
