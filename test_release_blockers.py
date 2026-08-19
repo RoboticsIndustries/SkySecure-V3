@@ -1,6 +1,10 @@
 import unittest
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 from pydantic import ValidationError
@@ -154,6 +158,33 @@ class FinalReleaseBlockerTests(unittest.IsolatedAsyncioTestCase):
             '"receiver-amsterdam":"d123456789012345"}'
         )
         module.validate_environment(valid)
+
+        unsafe_passwords = {
+            "inline-comment padding": "x # this text only pads the raw line",
+            "dotenv interpolation": "${A_VERY_LONG_UNSET_ENVIRONMENT_VARIABLE}",
+            "quoted dotenv value": '"this-is-a-long-enough-password"',
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            for label, unsafe_password in unsafe_passwords.items():
+                with self.subTest(label=label):
+                    candidate = dict(valid)
+                    candidate["POSTGRES_PASSWORD"] = unsafe_password
+                    candidate_path = Path(temporary_directory) / "candidate.env"
+                    candidate_path.write_text(
+                        "\n".join(f"{key}={value}" for key, value in candidate.items())
+                        + "\n"
+                    )
+                    clean_environment = dict(os.environ)
+                    clean_environment.pop("A_VERY_LONG_UNSET_ENVIRONMENT_VARIABLE", None)
+                    result = subprocess.run(
+                        [sys.executable, str(script), str(candidate_path)],
+                        text=True,
+                        capture_output=True,
+                        env=clean_environment,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn(unsafe_password, result.stdout + result.stderr)
 
         readme = Path("README.md").read_text()
         running = Path("RUNNING.md").read_text()

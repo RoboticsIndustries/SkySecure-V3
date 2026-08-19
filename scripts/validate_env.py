@@ -31,7 +31,14 @@ def parse_env(path: Path) -> dict[str, str]:
         key = key.strip()
         if not key:
             raise ValueError(f"empty environment key on line {line_number}")
-        values[key] = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if "#" in value:
+            raise ValueError(f"inline comments are unsupported on line {line_number}")
+        if "$" in value:
+            raise ValueError(f"dotenv interpolation is unsupported on line {line_number}")
+        if value.startswith(("'", '"')) or value.endswith(("'", '"')):
+            raise ValueError(f"quoted dotenv values are unsupported on line {line_number}")
+        values[key] = value
     return values
 
 

@@ -387,8 +387,11 @@ docker compose up -d --build
 
 The preflight rejects published placeholders, short required secrets, malformed
 receiver-key JSON, fewer than four receiver credentials, and duplicate receiver
-credentials. `docker compose config` validates interpolation and structure; it
-does not by itself prove that example secrets were replaced.
+credentials. To keep validation identical to the deployed value, the environment
+file must use the documented unquoted literal format; inline comments, outer
+quotes, and `$` interpolation are rejected. `docker compose config` validates
+interpolation and structure; it does not by itself prove that example secrets
+were replaced.
 
 Check startup:
 
