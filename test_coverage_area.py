@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
+from redis.exceptions import LockError
 
 from coverage_area import (
     CoverageArea,
@@ -70,11 +71,25 @@ class CoverageAreaTests(unittest.IsolatedAsyncioTestCase):
 
     def test_websocket_origin_is_restricted_to_configured_dashboard_origins(self):
         class Socket:
-            def __init__(self, origin):
+            def __init__(self, origin, forwarded_host=None, forwarded_proto=None):
                 self.headers = {"origin": origin} if origin is not None else {}
+                if forwarded_host is not None:
+                    self.headers["x-forwarded-host"] = forwarded_host
+                if forwarded_proto is not None:
+                    self.headers["x-forwarded-proto"] = forwarded_proto
 
         self.assertFalse(_websocket_origin_allowed(Socket("https://evil.example")))
         self.assertTrue(_websocket_origin_allowed(Socket("http://localhost:3000")))
+        self.assertTrue(_websocket_origin_allowed(Socket(
+            "http://192.168.1.50:3000",
+            forwarded_host="192.168.1.50:3000",
+            forwarded_proto="http",
+        )))
+        self.assertFalse(_websocket_origin_allowed(Socket(
+            "https://evil.example",
+            forwarded_host="192.168.1.50:3000",
+            forwarded_proto="http",
+        )))
         self.assertTrue(_websocket_origin_allowed(Socket(None)))
 
     async def test_selected_area_is_shared_through_redis(self):
@@ -110,6 +125,34 @@ class CoverageAreaTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CoverageAreaApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_fetch_returns_last_valid_cache_when_coverage_lock_is_busy(self):
+        class BusyRedis(FakeRedis):
+            def lock(self, *args, **kwargs):
+                class Lock:
+                    async def __aenter__(self):
+                        raise LockError("busy")
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+                return Lock()
+
+        previous_redis = api_main.redis_client
+        previous_cache = api_main._live_cache
+        api_main.redis_client = BusyRedis()
+        api_main._live_cache = {
+            "ts": 1.0,
+            "aircraft": [{"icao": "CACHED"}],
+            "coverage_token": b"last-valid",
+        }
+        try:
+            response = await api_main.get_live_aircraft()
+        finally:
+            api_main.redis_client = previous_redis
+            api_main._live_cache = previous_cache
+
+        self.assertEqual(response["source"], "stale-cache")
+        self.assertEqual(response["aircraft"], [{"icao": "CACHED"}])
+
     async def test_live_fetch_discards_batch_when_area_changes_in_flight(self):
         redis = FakeRedis()
         first = CoverageArea(latitude=40.0, longitude=-75.0, radius_nm=100, label="First")

@@ -31,6 +31,7 @@ import aiohttp
 import asyncpg
 import orjson
 import redis.asyncio as aioredis
+from redis.exceptions import LockError
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -150,6 +151,10 @@ def _websocket_origin_allowed(websocket: WebSocket) -> bool:
     if origin is None:
         return True  # Non-browser monitoring clients do not send Origin.
     allowed = {value.rstrip("/") for value in settings.API_CORS_ORIGINS}
+    forwarded_host = websocket.headers.get("x-forwarded-host")
+    forwarded_proto = websocket.headers.get("x-forwarded-proto")
+    if forwarded_host and forwarded_proto in {"http", "https"}:
+        allowed.add(f"{forwarded_proto}://{forwarded_host}".rstrip("/"))
     return origin.rstrip("/") in allowed
 
 
@@ -1114,38 +1119,58 @@ async def get_live_aircraft():
             raise HTTPException(status_code=503, detail="Redis unavailable")
 
         coverage_lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
-        async with coverage_lock:
-            area, coverage_token = await load_coverage_area_record(redis_client)
-            now = time.time()
-            if (
-                now - _live_cache["ts"] < LIVE_CACHE_TTL
-                and _live_cache["aircraft"]
-                and _live_cache.get("coverage_token") == coverage_token
-            ):
+        try:
+            async with coverage_lock:
+                area, coverage_token = await load_coverage_area_record(redis_client)
+                now = time.time()
+                if (
+                    now - _live_cache["ts"] < LIVE_CACHE_TTL
+                    and _live_cache["aircraft"]
+                    and _live_cache.get("coverage_token") == coverage_token
+                ):
+                    return {
+                        "count": len(_live_cache["aircraft"]),
+                        "source": "cache",
+                        "aircraft": _live_cache["aircraft"],
+                        "tdoa_enabled": TDOA_AVAILABLE,
+                    }
+        except LockError:
+            if _live_cache["aircraft"]:
                 return {
                     "count": len(_live_cache["aircraft"]),
-                    "source": "cache",
+                    "source": "stale-cache",
                     "aircraft": _live_cache["aircraft"],
                     "tdoa_enabled": TDOA_AVAILABLE,
                 }
+            raise HTTPException(status_code=503, detail="Coverage update in progress")
 
         for _ in range(5):
             aircraft = await _fetch_live_aircraft(area)
             coverage_lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
-            async with coverage_lock:
-                current_area, current_token = await load_coverage_area_record(redis_client)
-                if current_token == coverage_token:
-                    _live_cache = {
-                        "ts": time.time(),
-                        "aircraft": aircraft,
-                        "coverage_token": coverage_token,
-                    }
+            try:
+                async with coverage_lock:
+                    current_area, current_token = await load_coverage_area_record(redis_client)
+                    if current_token == coverage_token:
+                        _live_cache = {
+                            "ts": time.time(),
+                            "aircraft": aircraft,
+                            "coverage_token": coverage_token,
+                        }
+                        return {
+                            "count": len(aircraft),
+                            "source": "live",
+                            "aircraft": aircraft,
+                            "tdoa_enabled": TDOA_AVAILABLE,
+                        }
+            except LockError:
+                if _live_cache["aircraft"]:
                     return {
-                        "count": len(aircraft),
-                        "source": "live",
-                        "aircraft": aircraft,
+                        "count": len(_live_cache["aircraft"]),
+                        "source": "stale-cache",
+                        "aircraft": _live_cache["aircraft"],
                         "tdoa_enabled": TDOA_AVAILABLE,
                     }
+                raise HTTPException(status_code=503, detail="Coverage update in progress")
             # The operator switched during the fetch. The lock guarantees the
             # token and response decision are atomic with PUT.
             area, coverage_token = current_area, current_token
