@@ -136,6 +136,11 @@ def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * math.asin(math.sqrt(a))
 
 
+def mlat_disagreement_threshold_nm(cep90_m: float) -> float:
+    """Return a floor-bounded comparison radius from solver uncertainty."""
+    return max(settings.GHOST_MLAT_CONFIRM_NM, cep90_m / 1852.0)
+
+
 # ─── Fusion Engine ────────────────────────────────────────────────────────────
 
 class FusionEngine:
@@ -166,7 +171,7 @@ class FusionEngine:
         if not self._source_event_time_is_acceptable(msg.recv_time):
             log.warning("Rejecting stale/future ADS-B event time %s", msg.recv_time)
             return None
-        sv = await self._load_or_create(msg.icao24)
+        sv = await self._load_or_create(msg.icao24, msg.recv_time)
         latest_adsb = max(
             (report for report in sv.source_reports
              if report.source == DataSource.ADSB),
@@ -230,6 +235,7 @@ class FusionEngine:
                 timestamp=max(flag.timestamp for flag in l4_flags),
             )
 
+        adsb_confidence = confidence_for_source(DataSource.ADSB)
         source_report = SourceReport(
             source=DataSource.ADSB,
             receiver_id=msg.receiver_id,
@@ -239,8 +245,8 @@ class FusionEngine:
             velocity=msg.velocity,
             heading=msg.heading,
             vertical_rate=msg.vertical_rate,
-            weight=confidence_for_source(DataSource.ADSB),
-            confidence=confidence_for_source(DataSource.ADSB),
+            weight=adsb_confidence,
+            confidence=adsb_confidence,
             timestamp=msg.recv_time,
         )
 
@@ -303,7 +309,7 @@ class FusionEngine:
         )[-10:]
 
         if is_current_event:
-            sv.confidence = confidence_for_source(DataSource.ADSB)
+            sv.confidence = adsb_confidence
         sv.last_seen = max(prior_last_seen, msg.recv_time)
         sv.last_update_source = DataSource.ADSB
         sv.last_update_timestamp = msg.recv_time
@@ -336,7 +342,7 @@ class FusionEngine:
             return None
         if not receiver_geometry_is_safe(receiver_positions):
             return None
-        sv = await self._load_or_create(report.icao24)
+        sv = await self._load_or_create(report.icao24, report.solve_time)
         latest_mlat = max(
             (source for source in sv.source_reports
              if source.source == DataSource.MLAT),
@@ -389,22 +395,33 @@ class FusionEngine:
             default=None,
         )
         aligned_adsb = latest_adsb is not None
+        l4_detectors: List[str] = []
 
         # Compare only measurements aligned in event time; the fused current
         # position may represent a newer event and is not valid evidence here.
         if aligned_adsb and latest_adsb is not None:
             assert latest_adsb.lat is not None and latest_adsb.lon is not None
+            l4_detectors.append("adsb_mlat_disagreement")
             dist = haversine_nm(
                 latest_adsb.lat, latest_adsb.lon, report.lat, report.lon
             )
-            if dist > settings.GHOST_MLAT_CONFIRM_NM:
+            disagreement_threshold_nm = mlat_disagreement_threshold_nm(report.cep90)
+            if dist > disagreement_threshold_nm:
                 flag = AnomalyFlag(
                     anomaly_type=AnomalyType.GHOST_AIRCRAFT,
                     layer=DetectionLayer.L4,
                     detector="adsb_mlat_disagreement",
                     score_delta=25,
-                    description=f"ADS-B and MLAT positions differ by {dist:.1f} NM",
-                    meta={"dist_nm": dist, "mlat_receivers": report.num_receivers},
+                    description=(
+                        f"ADS-B and MLAT positions differ by {dist:.1f} NM "
+                        f"(threshold {disagreement_threshold_nm:.1f} NM)"
+                    ),
+                    meta={
+                        "dist_nm": dist,
+                        "threshold_nm": disagreement_threshold_nm,
+                        "mlat_cep90_m": report.cep90,
+                        "mlat_receivers": report.num_receivers,
+                    },
                     timestamp=report.solve_time,
                 )
                 sv.anomalies.append(flag)
@@ -415,7 +432,7 @@ class FusionEngine:
             layer=DetectionLayer.L4,
             status=(LayerStatus.TRIGGERED if l4_flags else
                     LayerStatus.EVALUATED if has_adsb else LayerStatus.SKIPPED),
-            detectors_evaluated=["adsb_mlat_disagreement"] if has_adsb else [],
+            detectors_evaluated=l4_detectors,
             triggered_detectors=[flag.detector for flag in l4_flags],
             score_delta=sum(flag.score_delta for flag in l4_flags),
             skipped_reason=(None if has_adsb else
@@ -439,7 +456,7 @@ class FusionEngine:
             sv.lat = report.lat
             sv.lon = report.lon
 
-        if report.altitude_baro and report.solve_time >= prior_last_seen:
+        if report.solve_time >= prior_last_seen:
             sv.altitude_baro = report.altitude_baro
 
         if DataSource.MLAT not in sv.sources:
@@ -467,7 +484,7 @@ class FusionEngine:
         if not icao:
             return None
 
-        sv = await self._load_or_create(icao)
+        sv = await self._load_or_create(icao, msg.recv_time)
         if msg.flight:
             sv.callsign = msg.flight.strip()
         if DataSource.ACARS not in sv.sources:
@@ -514,7 +531,9 @@ class FusionEngine:
             )
             return True
 
-    async def _load_or_create(self, icao24: str) -> StateVector:
+    async def _load_or_create(
+        self, icao24: str, observed_at: Optional[float] = None
+    ) -> StateVector:
         key = f"fusion:sv:{icao24.upper()}"
         raw = await self.redis.get(key)
 
@@ -527,7 +546,10 @@ class FusionEngine:
             except Exception:
                 pass
 
-        return StateVector(icao24=icao24.upper(), first_seen=time.time())
+        event_time = observed_at if observed_at is not None else time.time()
+        return StateVector(
+            icao24=icao24.upper(), first_seen=event_time, last_seen=event_time
+        )
 
     async def deliver_outbox_event(self, event_id: str, producer) -> bytes:
         """Lease, acknowledge, and conditionally mark one durable outbox row."""

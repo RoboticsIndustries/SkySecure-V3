@@ -4,10 +4,10 @@ SkySecure uses one canonical layer taxonomy across event payloads, APIs, logs, a
 
 | Layer | Purpose | Current implementation |
 |---|---|---|
-| L1 | Position and source validation | Cross-validates independent public ADS-B aggregators. Physical receiver TDOA remains future work. |
+| L1 | Position and source validation | Compares public ADS-B aggregators that may share upstream data. This is not physical receiver TDOA. |
 | L2 | Kinematic and behavioral detection | Deterministic physics checks, timestamp-aware acceleration and turn rate, and persistent per-aircraft statistical baselines. |
-| L3 | Learned trajectory detection | Sequence trajectory detector. Uses a heuristic fallback until a trained LSTM checkpoint is installed. |
-| L4 | Multi-sensor fusion | Compares event-time-aligned ADS-B and MLAT reports when physical MLAT data is available. |
+| L3 | Learned trajectory and navigation integrity | Sequence trajectory detector plus NIC/NACp evidence. Uses a heuristic fallback until a trained LSTM checkpoint is installed. |
+| L4 | Multi-sensor fusion | Compares event-time-aligned ADS-B and authenticated MLAT positions when physical data is available; horizontal thresholds respect reported CEP90. |
 | L5 | Identity and threat intelligence | Duplicate ICAO detection today; external intelligence and airspace policy are future work. |
 
 ## Trigger contract

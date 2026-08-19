@@ -2,10 +2,10 @@
 
 SkySecure is a real-time ADS-B security research platform. The deployed pipeline currently wires:
 
-- L1: independent public-feed position/source cross-validation.
+- L1: comparison across public aggregators that may share upstream data.
 - L2: kinematic rules and statistical baselines.
-- L3: trajectory checks; it uses a documented heuristic fallback when `/app/data/trajectory_lstm.pt` is absent.
-- L4: authenticated physical-receiver MLAT comparison. It reports unavailable/skipped until genuine, signed, event-aligned physical receptions exist.
+- L3: trajectory checks plus NIC/NACp integrity; it uses a documented heuristic fallback when `/app/data/trajectory_lstm.pt` is absent.
+- L4: authenticated physical-receiver MLAT position comparison with a CEP90-aware horizontal threshold. It reports unavailable/skipped until genuine, signed physical receptions exist.
 - L5: identity/threat evidence actually supplied by upstream processing; no unsupported external intelligence is inferred.
 
 No measured detection-accuracy or false-positive claim is made without labeled ground truth.
@@ -15,7 +15,10 @@ No measured detection-accuracy or false-positive claim is made without labeled g
 A new, empty development environment may initialize the complete stack:
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# Replace every placeholder in .env before continuing.
+docker compose config --quiet
+docker compose up -d --build
 ```
 
 This is not the production update procedure for an existing installation.

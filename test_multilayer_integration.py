@@ -29,6 +29,26 @@ def make_mlat_report(**values):
 
 
 class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_adsb_event_populates_canonical_state(self):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        now = time.time()
+
+        result = await FusionEngine(redis).process_adsb(RawADSBMessage(
+            receiver_id="feed", recv_time=now, icao24="ABC123",
+            raw_message="8DABC123", msg_type=17,
+            lat=40.0, lon=-75.0, altitude_baro=12000,
+            nic=8, nac_p=10,
+        ))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual((result.lat, result.lon), (40.0, -75.0))
+        self.assertEqual(result.altitude_baro, 12000)
+        self.assertEqual((result.nic, result.nac_p), (8, 10))
+        self.assertEqual(result.first_seen, now)
+        self.assertEqual(result.last_seen, now)
+
     async def test_fusion_rejects_unknown_or_unsafe_mlat_receiver_geometry(self):
         redis = AsyncMock()
         engine = FusionEngine(redis)
@@ -163,6 +183,54 @@ class MultilayerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert result is not None
         self.assertEqual(result.layer_evaluations["L4"].status, LayerStatus.SKIPPED)
         self.assertIn("MLAT", result.layer_evaluations["L4"].skipped_reason or "")
+
+    async def test_zero_foot_mlat_altitude_is_not_discarded(self):
+        redis = AsyncMock()
+        now = time.time()
+        state = StateVector(
+            icao24="ABC123", last_seen=now - 1,
+            altitude_baro=500,
+        )
+        redis.get.return_value = state.to_bytes()
+
+        result = await FusionEngine(redis).process_mlat(make_mlat_report(
+            session_id="ground-level", solve_time=now,
+            icao24="ABC123", lat=40.0, lon=-75.0,
+            altitude_baro=0, num_receivers=4,
+            tdoa_residual=10.0, cep90=100.0,
+        ))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.altitude_baro, 0)
+
+    async def test_mlat_position_disagreement_respects_reported_cep90(self):
+        redis = AsyncMock()
+        now = time.time()
+        state = StateVector(
+            icao24="ABC123", last_seen=now,
+            source_reports=[SourceReport(
+                source=DataSource.ADSB, lat=40.0, lon=-75.0,
+                altitude=10000, timestamp=now,
+            )],
+        )
+        redis.get.return_value = state.to_bytes()
+
+        result = await FusionEngine(redis).process_mlat(make_mlat_report(
+            session_id="within-uncertainty", solve_time=now,
+            icao24="ABC123", lat=40.05, lon=-75.0,
+            altitude_baro=10000, num_receivers=4,
+            tdoa_residual=10.0, cep90=10_000.0,
+        ))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertFalse(any(
+            flag.detector == "adsb_mlat_disagreement"
+            for flag in result.anomalies
+        ))
+        evaluation = result.layer_evaluations["L4"]
+        self.assertEqual(evaluation.status, LayerStatus.EVALUATED)
 
     async def test_adsb_mlat_disagreement_records_l4_evaluation(self):
         event_time = time.time()

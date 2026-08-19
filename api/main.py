@@ -1331,7 +1331,7 @@ def _empty_layer_summary() -> Dict[str, Dict[str, Any]]:
         "L1": "Position and source cross-validation",
         "L2": "Kinematic and behavioral anomaly detection",
         "L3": "Trajectory models and ADS-B NIC/NACp integrity",
-        "L4": "Multi-sensor fusion",
+        "L4": "Event-aligned ADS-B/MLAT position fusion",
         "L5": "Identity and threat intelligence",
     }
     return {
@@ -1342,6 +1342,7 @@ def _empty_layer_summary() -> Dict[str, Dict[str, Any]]:
             "skipped": 0,
             "trigger_count": 0,
             "detectors": {},
+            "evaluated_detectors": {},
             "skipped_reasons": {},
         }
         for layer in DetectionLayer
@@ -1369,6 +1370,10 @@ async def get_layer_summary():
                     bucket["skipped_reasons"].get(reason, 0) + 1
                 )
                 continue
+            for detector in evaluation.detectors_evaluated:
+                bucket["evaluated_detectors"][detector] = (
+                    bucket["evaluated_detectors"].get(detector, 0) + 1
+                )
             if evaluation.status == LayerStatus.SKIPPED:
                 bucket["skipped"] += 1
                 reason = evaluation.skipped_reason or "Unspecified"

@@ -196,6 +196,28 @@ class L2OperationalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.layer_evaluations["L3"].status, LayerStatus.SKIPPED)
         self.assertIn("warming up", state.layer_evaluations["L3"].skipped_reason or "")
 
+    async def test_integrity_evidence_uses_adsb_event_time_not_newer_fused_time(self):
+        detector = AnomalyDetector()
+        state = StateVector(
+            icao24="ABC123", lat=39.95, lon=-75.16,
+            nic=0, nac_p=0,
+            last_seen=200.0, update_count=1,
+            last_update_source=DataSource.ADSB,
+            last_update_timestamp=100.0,
+            source_reports=[SourceReport(
+                source=DataSource.ADSB, lat=39.95, lon=-75.16,
+                timestamp=100.0,
+            )],
+        )
+
+        result = detector.process(state)
+
+        flag = next(
+            item for item in result.anomalies
+            if item.detector == "integrity_metadata"
+        )
+        self.assertEqual(flag.timestamp, 100.0)
+
     async def test_prune_clears_all_per_aircraft_detector_state(self):
         detector = AnomalyDetector()
         state = self._state(t=100.0, velocity=400.0, heading=0.0)

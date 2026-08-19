@@ -1047,7 +1047,7 @@ class AnomalyDetector:
                     "nic": sv.nic,
                     "nac_p": sv.nac_p,
                 },
-                timestamp=sv.last_seen,
+                timestamp=adsb_observation_time,
             )
             all_flags.append(integrity_flag)
 

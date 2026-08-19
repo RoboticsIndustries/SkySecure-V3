@@ -35,6 +35,7 @@ class Layer3IntegrationTests(unittest.TestCase):
         adsb = StateVector(
             icao24="ABC123", nic=8, nac_p=10, last_seen=100.0, update_count=1,
             last_update_source=DataSource.ADSB,
+            last_update_timestamp=100.0,
             source_reports=[SourceReport(
                 source=DataSource.ADSB, lat=40.0, lon=-75.0, timestamp=100.0
             )],
