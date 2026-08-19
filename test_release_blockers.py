@@ -95,6 +95,27 @@ class FinalReleaseBlockerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(env_example.count("replace-with-distinct-secret-"), 4)
         self.assertNotIn("95%", guide)
 
+    def test_docs_do_not_overstate_aggregator_or_receiver_trust(self):
+        readme = Path("README.md").read_text()
+        running = Path("RUNNING.md").read_text()
+        layers = Path("docs/detection-layers.md").read_text()
+        api = Path("api/main.py").read_text()
+        combined = "\n".join((readme, running, layers, api))
+
+        for unsupported in (
+            "independent public networks",
+            "Independent source positions disagree",
+            "independent live networks",
+            "signed physical receptions",
+            "identity-bound HMAC credential",
+        ):
+            self.assertNotIn(unsupported, combined)
+        self.assertIn("separate public aggregators", readme)
+        self.assertIn("receiver-specific bearer credential", running)
+        self.assertIn("solver-signed MLAT reports", running)
+        self.assertIn("canonical anomaly flag", readme)
+        self.assertIn("simplified `type` and `description`", readme)
+
     def test_no_unbounded_redis_keys_or_unsupported_metrics(self):
         api = Path("api/main.py").read_text()
         frontend = Path("frontend/index.html").read_text()

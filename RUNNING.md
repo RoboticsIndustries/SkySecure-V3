@@ -5,7 +5,7 @@ SkySecure is a real-time ADS-B security research platform. The deployed pipeline
 - L1: comparison across public aggregators that may share upstream data.
 - L2: kinematic rules and statistical baselines.
 - L3: trajectory checks plus NIC/NACp integrity; it uses a documented heuristic fallback when `/app/data/trajectory_lstm.pt` is absent.
-- L4: authenticated physical-receiver MLAT position comparison with a CEP90-aware horizontal threshold. It reports unavailable/skipped until genuine, signed physical receptions exist.
+- L4: position comparison from authenticated physical-receiver submissions and solver-signed MLAT reports, with a CEP90-aware horizontal threshold. It reports unavailable/skipped until genuine physical receptions exist.
 - L5: identity/threat evidence actually supplied by upstream processing; no unsupported external intelligence is inferred.
 
 No measured detection-accuracy or false-positive claim is made without labeled ground truth.
@@ -47,7 +47,7 @@ The newly declared Kafka/ZooKeeper named volumes are for fresh installations and
 
 ## Physical MLAT trust path
 
-1. Each configured receiver submits a bounded-time, valid Mode-S reception to the API with its identity-bound HMAC credential.
+1. Each configured receiver submits a bounded-time, valid Mode-S reception to the API with its receiver-specific bearer credential.
 2. The API publishes acknowledged receptions to `raw.mlat.receptions`.
 3. The solver requires a complete, nonempty, distinct receiver credential map and safe receiver geometry.
 4. A solved report carries one distinct canonical source-event ID per receiver and an HMAC-SHA256 solver signature.

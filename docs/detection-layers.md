@@ -12,7 +12,7 @@ SkySecure uses one canonical layer taxonomy across event payloads, APIs, logs, a
 
 ## Trigger contract
 
-Every anomaly includes:
+Every canonical anomaly flag produced by the detector pipeline includes:
 
 - `layer`: canonical layer (`L1` through `L5`)
 - `detector`: stable detector identifier
@@ -21,6 +21,9 @@ Every anomaly includes:
 - `description`: concise human-readable explanation
 - `evidence`: measured values and thresholds used by the detector
 - `timestamp`: event time
+
+Raw/public-feed fallback records may expose simplified display anomalies with
+only `type` and `description`; they are not canonical detector flags.
 
 Timestamps come from source events rather than worker processing time. ADS-B
 and MLAT measurements must be within five seconds to produce an L4 comparison.

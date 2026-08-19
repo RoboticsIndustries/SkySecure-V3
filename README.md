@@ -34,7 +34,7 @@ SkySecure V3 is a real-time aircraft telemetry security research platform. It co
 Imagine several people watching the same aircraft:
 
 1. One person reports where the aircraft says it is.
-2. Another asks whether independent public networks tell a compatible story.
+2. Another asks whether separate public aggregators—whose upstream data may overlap—tell a compatible story.
 3. Another checks whether the movement is physically plausible.
 4. Another learns the aircraft's recent pattern and watches its navigation-quality indicators.
 5. If physical receivers are installed, another independently calculates position from arrival times and compares that result with the broadcast position.
@@ -221,7 +221,7 @@ See [Layer 4 physical MLAT operation](#layer-4-physical-mlat-operation).
 
 ## Evidence, status, and risk
 
-Every anomaly contains:
+Every canonical anomaly flag produced by the detector pipeline contains:
 
 | Field | Meaning |
 |---|---|
@@ -232,6 +232,11 @@ Every anomaly contains:
 | `description` | Human-readable explanation |
 | `evidence` | Measurements and thresholds |
 | `timestamp` | Source event time, not worker processing time |
+
+Raw/public-feed fallback records exposed by `/api/live-aircraft` or WebSocket
+fallback paths may carry only a simplified `type` and `description`. Those
+display records are not canonical detector flags and must not be treated as the
+full evidence contract above.
 
 Every state vector also carries `layer_evaluations`:
 

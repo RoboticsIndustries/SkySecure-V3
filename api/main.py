@@ -1454,7 +1454,7 @@ async def get_layer_triggers(layer: str, limit: int = Query(100, ge=1, le=1000))
                 "detector": "cross_source_position",
                 "type": "POSITION_DISAGREEMENT",
                 "score_delta": 80,
-                "description": "Independent source positions disagree",
+                "description": "Separate aggregator positions disagree",
                 "evidence": result,
                 "timestamp": aircraft.get("ts", time.time()),
             })
@@ -1471,7 +1471,7 @@ async def get_layer_triggers(layer: str, limit: int = Query(100, ge=1, le=1000))
 
 @app.get("/api/l1/sources")
 async def get_l1_sources():
-    """Which independent live networks L1 cross-validation is currently using."""
+    """Which configured public aggregators L1 cross-validation is currently using."""
     if not TDOA_AVAILABLE or not cross_validator:
         return {"error": "L1 cross-validation not available", "sources": []}
     from processing.cross_source_validator import SOURCES
@@ -1484,7 +1484,7 @@ async def validate_position_l1(
     lat: float,
     lon: float,
 ):
-    """Manually cross-validate an aircraft's position against independent live networks."""
+    """Manually compare an aircraft position across configured public aggregators."""
     normalized_icao = _l1_normalized_icao(icao)
     if normalized_icao is None:
         raise HTTPException(status_code=422, detail="ICAO must be exactly six hexadecimal characters")
