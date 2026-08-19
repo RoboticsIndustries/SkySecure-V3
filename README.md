@@ -403,7 +403,11 @@ docker compose logs --since=5m api fusion-engine anomaly-detector mlat-solver
 
 Open:
 
-- Dashboard: `http://127.0.0.1:3000`
+- Dashboard on this host: `http://127.0.0.1:3000`
+- Dashboard from the LAN: `http://<host-LAN-IP>:3000` (for example,
+  `http://192.168.1.50:3000` on the current host). Set `FRONTEND_BIND_IP` to
+  a specific interface address to restrict the default `0.0.0.0` frontend
+  bind. The API, PostgreSQL, Redis, and Kafka ports remain loopback-only.
 - OpenAPI/Swagger: `http://127.0.0.1:8000/docs`
 - Health: `http://127.0.0.1:8000/healthz`
 

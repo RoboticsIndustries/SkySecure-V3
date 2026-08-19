@@ -227,6 +227,17 @@ class FinalReleaseBlockerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("94.3%", frontend)
         self.assertNotIn("2.1%", frontend)
 
+    def test_only_frontend_is_lan_exposed(self):
+        compose = Path("docker-compose.yml").read_text()
+        self.assertIn('${FRONTEND_BIND_IP:-0.0.0.0}:3000:80', compose)
+        for loopback_binding in (
+            '127.0.0.1:8000:8000',
+            '127.0.0.1:5432:5432',
+            '127.0.0.1:6379:6379',
+            '127.0.0.1:9092:9092',
+        ):
+            self.assertIn(loopback_binding, compose)
+
     async def test_scan_publishes_complete_bounded_cycle_snapshot(self):
         import api.main as api_main
         previous = api_main.redis_client
