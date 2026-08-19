@@ -1,4 +1,5 @@
 import unittest
+import importlib.util
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -115,6 +116,68 @@ class FinalReleaseBlockerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("solver-signed MLAT reports", running)
         self.assertIn("canonical anomaly flag", readme)
         self.assertIn("simplified `type` and `description`", readme)
+
+    def test_env_preflight_rejects_published_placeholders(self):
+        script = Path("scripts/validate_env.py")
+        spec = importlib.util.spec_from_file_location("validate_env", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec else None)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        env_example = Path(".env.example")
+        published = (
+            module.parse_env(env_example)
+            if env_example.exists()
+            else {
+                "POSTGRES_PASSWORD": "replace-with-a-strong-random-password",
+                "MLAT_SOLVER_SIGNING_KEY": "replace-with-an-independent-secret",
+                "MLAT_RECEIVER_API_KEYS": (
+                    '{"receiver-london":"replace-with-distinct-secret-1",'
+                    '"receiver-paris":"replace-with-distinct-secret-2",'
+                    '"receiver-brussels":"replace-with-distinct-secret-3",'
+                    '"receiver-amsterdam":"replace-with-distinct-secret-4"}'
+                ),
+            }
+        )
+        with self.assertRaises(ValueError):
+            module.validate_environment(published)
+
+        valid = dict(published)
+        valid["POSTGRES_PASSWORD"] = "p" * 32
+        valid["MLAT_SOLVER_SIGNING_KEY"] = "s" * 32
+        valid["MLAT_RECEIVER_API_KEYS"] = (
+            '{"receiver-london":"a123456789012345",'
+            '"receiver-paris":"b123456789012345",'
+            '"receiver-brussels":"c123456789012345",'
+            '"receiver-amsterdam":"d123456789012345"}'
+        )
+        module.validate_environment(valid)
+
+        readme = Path("README.md").read_text()
+        running = Path("RUNNING.md").read_text()
+        command = "python3 scripts/validate_env.py .env"
+        self.assertIn(command, readme)
+        self.assertIn(command, running)
+
+    def test_docs_distinguish_available_code_from_deployed_l2_inputs(self):
+        readme = Path("README.md").read_text()
+        layers = Path("docs/detection-layers.md").read_text()
+        self.assertIn("not populated by the current public-feed adapters", readme)
+        self.assertIn("not operational on the current public-feed path", layers)
+        self.assertIn(
+            "| `fused.tracks` | 8 | `fusion-engine` outbox | `anomaly-detector` |",
+            readme,
+        )
+        self.assertNotIn("API/runtime consumers", readme)
+        self.assertIn(
+            'docker compose exec -T postgres pg_restore --list < "$backup"',
+            readme,
+        )
+        self.assertNotIn('pg_restore --list "$backup"', readme)
+        self.assertIn("`curl` for documented health/API verification commands", readme)
+        self.assertIn("require working amd64 container emulation", readme)
 
     def test_no_unbounded_redis_keys_or_unsupported_metrics(self):
         api = Path("api/main.py").read_text()

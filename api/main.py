@@ -1401,6 +1401,9 @@ async def get_layer_summary():
         if not result:
             continue
         layers["L1"]["evaluated"] += 1
+        layers["L1"]["evaluated_detectors"]["cross_source_position"] = (
+            layers["L1"]["evaluated_detectors"].get("cross_source_position", 0) + 1
+        )
         if result.get("verdict") == "SPOOFED":
             layers["L1"]["triggered"] += 1
             layers["L1"]["trigger_count"] += 1

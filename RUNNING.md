@@ -17,6 +17,7 @@ A new, empty development environment may initialize the complete stack:
 ```bash
 cp .env.example .env
 # Replace every placeholder in .env before continuing.
+python3 scripts/validate_env.py .env
 docker compose config --quiet
 docker compose up -d --build
 ```

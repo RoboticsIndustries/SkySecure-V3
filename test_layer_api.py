@@ -56,9 +56,20 @@ class LayerApiTests(unittest.IsolatedAsyncioTestCase):
         return [triggered, evaluated]
 
     async def test_layer_summary_counts_evaluations_and_triggers(self):
-        with patch("api.main.redis_client", self._redis(self._vectors())):
+        l1_results = [
+            {"icao": "ABC123", "l1": {"verdict": "LEGITIMATE"}},
+            {"icao": "DEF456", "l1": {"verdict": "SPOOFED"}},
+        ]
+        with (
+            patch("api.main.redis_client", self._redis(self._vectors())),
+            patch("api.main._track_snapshot", l1_results),
+        ):
             payload = await get_layer_summary()
 
+        l1 = payload["layers"]["L1"]
+        self.assertEqual(l1["evaluated"], 2)
+        self.assertEqual(l1["evaluated_detectors"]["cross_source_position"], 2)
+        self.assertEqual(l1["triggered"], 1)
         l2 = payload["layers"]["L2"]
         self.assertEqual(l2["evaluated"], 2)
         self.assertEqual(l2["triggered"], 1)

@@ -149,7 +149,7 @@ The remaining work is tracked in [REMAINING_IMPROVEMENTS.md](REMAINING_IMPROVEME
 **Implemented behavior:**
 
 - Maximum-speed and teleportation checks.
-- Altitude jump and barometric-versus-geometric altitude checks.
+- Altitude jump checks. Barometric-versus-geometric comparison code exists, but geometric altitude is not populated by the current public-feed adapters and that comparator is not operational on that path.
 - Timestamp-aware acceleration and turn-rate checks.
 - Per-aircraft velocity and vertical-rate baselines.
 - ADS-B source-position conflict detection.
@@ -283,7 +283,7 @@ Risk uses current unique detector evidence plus classification contribution and 
 | `raw.mlat.receptions` | 8 | API receiver intake | `mlat-solver` |
 | `raw.mlat` | 4 | `mlat-solver` | `fusion-engine` |
 | `raw.acars` | 4 | Optional/future producer | fusion path when connected |
-| `fused.tracks` | 8 | `fusion-engine` outbox | `anomaly-detector`, API/runtime consumers |
+| `fused.tracks` | 8 | `fusion-engine` outbox | `anomaly-detector` |
 | `alerts.anomaly` | 4 | `anomaly-detector` | downstream alert consumers |
 
 Consumers manually commit only the completed record's partition at `offset + 1`. At-least-once duplicates are preferred over silent loss.
@@ -342,8 +342,13 @@ Fresh installations use named volumes. Existing installations that predate those
 
 - Docker Engine or Docker Desktop
 - Docker Compose v2 (`docker compose`)
+- Python 3.9+ for environment preflight and host-side development checks
+- `curl` for documented health/API verification commands
 - Git for development/update workflows
 - Enough disk for PostgreSQL, Redis AOF, Kafka logs, images, and backups
+
+Compose pins Kafka, ZooKeeper, and PostGIS/PostgreSQL images to `linux/amd64`.
+Non-amd64 hosts therefore require working amd64 container emulation.
 
 ### Environment file
 
@@ -375,9 +380,15 @@ These instructions are only for a new empty installation.
 ```bash
 cp .env.example .env
 # Replace all placeholders in .env.
+python3 scripts/validate_env.py .env
 docker compose config --quiet
 docker compose up -d --build
 ```
+
+The preflight rejects published placeholders, short required secrets, malformed
+receiver-key JSON, fewer than four receiver credentials, and duplicate receiver
+credentials. `docker compose config` validates interpolation and structure; it
+does not by itself prove that example secrets were replaced.
 
 Check startup:
 
@@ -589,10 +600,12 @@ backup="/secure/skysecure-backups/skysecure-$(date -u +%Y%m%dT%H%M%SZ).dump"
 docker compose exec -T postgres \
   pg_dump -U skysecure -d skysecure -Fc \
   > "$backup"
-pg_restore --list "$backup" >/dev/null
+docker compose exec -T postgres pg_restore --list < "$backup" >/dev/null
 ```
 
-Do not treat a zero-byte or unlisted dump as a backup.
+Do not treat a zero-byte or unlisted dump as a backup. Verification runs
+`pg_restore` inside the version-compatible PostgreSQL container, so a host
+PostgreSQL client installation is not required.
 
 ### Database migration
 
