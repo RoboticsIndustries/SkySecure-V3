@@ -98,8 +98,14 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./scripts/migrations/001_fusion_event_commits.sql:/migration.sql:ro
-    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-h", "postgres", "-U", "skysecure", "-d", "skysecure", "-f", "/migration.sql"]
+      - ./scripts/migrations/001_fusion_event_commits.sql:/migration-001.sql:ro
+      - ./scripts/migrations/002_anomaly_history.sql:/migration-002.sql:ro
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -h postgres -U skysecure -d skysecure -f /migration-001.sql
+        psql -v ON_ERROR_STOP=1 -h postgres -U skysecure -d skysecure -f /migration-002.sql
     networks: [skysecure]
 
   adsb-ingestor:
@@ -225,6 +231,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
     networks: [skysecure]
     healthcheck:

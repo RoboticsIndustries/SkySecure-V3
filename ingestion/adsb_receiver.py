@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from models import RawADSBMessage, normalize_icao24
 from config import settings
 from coverage_area import COVERAGE_LOCK_KEY, coverage_url, load_coverage_area, load_coverage_area_record, within_coverage_area
+from world_scan import tick_world_scan
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,12 @@ def adsb_lol_fallback_url(
 
 async def current_coverage_url(redis_client: Any) -> str:
     return coverage_url(await load_coverage_area(redis_client))
+
+
+async def prepare_scan_cycle(redis_client: Any, *, now: float):
+    """Advance world scanning before freezing this ingestion cycle's coverage."""
+    await tick_world_scan(redis_client, now=now)
+    return await load_coverage_area_record(redis_client)
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -192,7 +199,7 @@ async def run() -> None:
         while True:
             t0 = time.time()
             try:
-                area, coverage_token = await load_coverage_area_record(redis_client)
+                area, coverage_token = await prepare_scan_cycle(redis_client, now=t0)
                 async with session.get(
                     "https://opensky-network.org/api/states/all",
                     timeout=aiohttp.ClientTimeout(total=25),

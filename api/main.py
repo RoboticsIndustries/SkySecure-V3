@@ -25,6 +25,7 @@ import re
 import secrets
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 import aiohttp
@@ -37,6 +38,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from contextlib import asynccontextmanager
+from pydantic import BaseModel, Field
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -59,6 +61,14 @@ from coverage_area import (
     load_coverage_area_record,
     save_coverage_area,
     within_coverage_area,
+)
+from world_scan import (
+    MIN_WORLD_SCAN_DWELL_SECONDS,
+    WORLD_SCAN_TILES,
+    configure_world_scan,
+    load_world_scan_state,
+    save_world_scan_and_coverage,
+    tile_area,
 )
 
 # L1 imports — real multi-source cross-validation (no receiver hardware yet;
@@ -84,6 +94,11 @@ log = logging.getLogger(__name__)
 # ─── Global state ──────────────────────────────────────────────────────────────
 
 redis_client: Optional[aioredis.Redis] = None
+postgres_pool: Optional[asyncpg.Pool] = None
+POSTGRES_CLOSE_TIMEOUT_SECONDS = 5.0
+HOTSPOT_QUERY_TIMEOUT_SECONDS = 3.0
+HOTSPOT_CACHE_TTL_SECONDS = 60.0
+HOTSPOT_ALLOWED_HOURS = frozenset({0, 1, 24, 168, 720})
 mlat_reception_producer: Optional[AIOKafkaProducer] = None
 _ws_clients: set[WebSocket] = set()
 _track_snapshot: List[Dict[str, Any]] = []
@@ -91,6 +106,8 @@ _SCAN_CURSORS: Dict[str, int] = {}
 _SCAN_SNAPSHOTS: Dict[str, Dict[Any, None]] = {}
 _SCAN_BUILDING: Dict[str, Dict[Any, None]] = {}
 _SCAN_LOCKS: Dict[str, asyncio.Lock] = {}
+_hotspot_query_lock = asyncio.Lock()
+_hotspot_cache: Dict[tuple[int, int], tuple[float, Dict[str, Any]]] = {}
 
 
 async def scan_key_batch(
@@ -789,24 +806,74 @@ def run_l2_l3_detection(aircraft_list: List[dict]) -> None:
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
+
+async def verify_anomaly_history_schema(pool) -> None:
+    """Fail startup unless migration 002 and replay-safe uniqueness are present."""
+    ready = await pool.fetchval(
+        """
+        SELECT
+          NOT EXISTS (
+            SELECT required.column_name
+            FROM unnest(ARRAY['event_id','callsign','layer','detector','risk_score'])
+                 AS required(column_name)
+            EXCEPT
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'anomaly_events'
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'anomaly_events'
+              AND column_name = 'event_id'
+              AND is_nullable = 'NO'
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid
+                               AND a.attnum = i.indkey[0]
+            WHERE i.indrelid = 'public.anomaly_events'::regclass
+              AND a.attname = 'event_id'
+              AND i.indisunique
+              AND i.indisvalid
+              AND i.indisready
+              AND i.indpred IS NULL
+              AND i.indnkeyatts = 1
+              AND i.indnatts = 1
+          )
+        """
+    )
+    if not ready:
+        raise RuntimeError("anomaly history schema migration is incomplete")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, mlat_reception_producer, cross_validator, anomaly_detector
+    global redis_client, postgres_pool, mlat_reception_producer, cross_validator, anomaly_detector
 
     tasks: List[asyncio.Task] = []
     validator = None
     reception_producer = None
+    history_pool = None
     body_error: Optional[BaseException] = None
     critical_errors: List[BaseException] = []
     shutdown_started = False
     owner_task = asyncio.current_task()
     redis_client = None
+    postgres_pool = None
     mlat_reception_producer = None
     cross_validator = None
     anomaly_detector = None
     try:
         validate_receiver_configuration()
         redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+        history_pool = await asyncpg.create_pool(
+            dsn=settings.POSTGRES_DSN, min_size=1, max_size=5, timeout=5,
+        )
+        await verify_anomaly_history_schema(history_pool)
+        postgres_pool = history_pool
         reception_producer = AIOKafkaProducer(
             bootstrap_servers=settings.KAFKA_BOOTSTRAP,
             compression_type="lz4",
@@ -874,32 +941,43 @@ async def lifespan(app: FastAPI):
                 break
 
         # Background work must no longer be able to touch these resources.
-        cleanup_error = None
+        cleanup_errors: List[BaseException] = []
         try:
             if reception_producer is not None:
                 await reception_producer.stop()
         except BaseException as exc:
-            cleanup_error = exc
+            cleanup_errors.append(exc)
+        try:
+            if history_pool is not None:
+                try:
+                    await asyncio.wait_for(
+                        history_pool.close(), timeout=POSTGRES_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("PostgreSQL pool shutdown timed out") from exc
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         try:
             if redis_client is not None:
                 await redis_client.close()
         except BaseException as exc:
-            cleanup_error = exc
+            cleanup_errors.append(exc)
         try:
             if validator is not None:
                 await validator.__aexit__(None, None, None)
         except BaseException as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
+            cleanup_errors.append(exc)
         redis_client = None
+        postgres_pool = None
         mlat_reception_producer = None
         cross_validator = None
         anomaly_detector = None
         if body_error is None:
-            if critical_error is not None:
-                raise critical_error
-            if cleanup_error is not None:
-                raise cleanup_error
+            shutdown_errors = ([critical_error] if critical_error is not None else []) + cleanup_errors
+            if len(shutdown_errors) == 1:
+                raise shutdown_errors[0]
+            if shutdown_errors:
+                raise BaseExceptionGroup("SkySecure API shutdown failures", shutdown_errors)
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -1091,6 +1169,45 @@ async def get_coverage_area_config():
     return {"coverage": area.model_dump()}
 
 
+class WorldScanCommand(BaseModel):
+    enabled: bool
+    dwell_seconds: int = Field(
+        default=360, ge=MIN_WORLD_SCAN_DWELL_SECONDS, le=86400,
+    )
+
+
+@app.get("/api/world-scan")
+async def get_world_scan():
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    state = await load_world_scan_state(redis_client)
+    return {
+        "scan": state.model_dump(),
+        "tile_count": len(WORLD_SCAN_TILES),
+        "current_tile": tile_area(state.tile_index).model_dump(),
+    }
+
+
+@app.put("/api/world-scan", dependencies=[Depends(require_operator)])
+async def set_world_scan(command: WorldScanCommand):
+    global _live_cache
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    state = await configure_world_scan(
+        redis_client,
+        enabled=command.enabled,
+        dwell_seconds=command.dwell_seconds,
+        now=time.time(),
+    )
+    _live_cache = {"ts": 0, "aircraft": [], "coverage_token": b""}
+    return {
+        "status": "updated",
+        "scan": state.model_dump(),
+        "tile_count": len(WORLD_SCAN_TILES),
+        "current_tile": tile_area(state.tile_index).model_dump(),
+    }
+
+
 @app.put("/api/coverage", dependencies=[Depends(require_operator)])
 async def update_coverage_area_config(area: CoverageArea):
     global _live_cache
@@ -1100,7 +1217,15 @@ async def update_coverage_area_config(area: CoverageArea):
     async with lock:
         if await redis_client.get(COVERAGE_RATE_KEY):
             raise HTTPException(status_code=429, detail="Coverage may be changed once every 2 seconds")
-        await save_coverage_area(redis_client, area)
+        scan_state = await load_world_scan_state(redis_client)
+        if scan_state.enabled:
+            await save_world_scan_and_coverage(
+                redis_client,
+                scan_state.model_copy(update={"enabled": False}),
+                area,
+            )
+        else:
+            await save_coverage_area(redis_client, area)
         await redis_client.set(COVERAGE_RATE_KEY, "1", ex=2)
     _live_cache = {"ts": 0, "aircraft": [], "coverage_token": b""}
     return {"coverage": area.model_dump(), "status": "updated"}
@@ -1264,6 +1389,180 @@ async def get_alerts(limit: int = Query(100, le=1000), min_score: int = Query(50
     area = await load_coverage_area(redis_client)
     alerts = [alert for alert in alerts if _track_in_coverage(alert, area)]
     return {"count": len(alerts), "alerts": alerts[:limit]}
+
+
+async def persist_anomaly_snapshot(
+    pool: Any,
+    state: StateVector,
+    source_event_id: str,
+) -> int:
+    """Persist immutable, replay-safe map evidence for every located trigger."""
+    if state.lat is None or state.lon is None or not state.anomalies:
+        return 0
+    rows = []
+    for index, anomaly in enumerate(state.anomalies):
+        rows.append((
+            f"{source_event_id}:{index}:{anomaly.detector}",
+            datetime.fromtimestamp(anomaly.timestamp, tz=timezone.utc),
+            state.icao24,
+            state.callsign,
+            anomaly.anomaly_type.value,
+            anomaly.layer.value,
+            anomaly.detector,
+            state.risk_score,
+            max(1, min(5, (state.risk_score + 19) // 20)),
+            anomaly.description,
+            anomaly.score_delta,
+            state.lat,
+            state.lon,
+            orjson.dumps({
+                "evidence": anomaly.meta,
+                "risk_band": state.risk_band.value,
+                "classification": state.classification.value,
+                "source": state.primary_source.value,
+            }).decode(),
+        ))
+    await pool.executemany(
+        """
+        INSERT INTO anomaly_events (
+            event_id, time, icao24, callsign, anomaly_type, layer, detector,
+            risk_score, severity, description, score_delta, lat, lon, meta
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb
+        )
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+@app.get("/api/anomalies/history")
+async def get_anomaly_history(
+    hours: int = Query(24, ge=0, le=87600),
+    limit: int = Query(2000, ge=1, le=10000),
+):
+    """Return durable anomaly snapshots for historical map rendering."""
+    if postgres_pool is None:
+        raise HTTPException(status_code=503, detail="Historical anomaly store unavailable")
+    if hours:
+        rows = await postgres_pool.fetch(
+            """
+            SELECT event_id, time, icao24, callsign, anomaly_type, layer,
+                   detector, risk_score, description, score_delta, lat, lon, meta
+            FROM anomaly_events
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+              AND time >= NOW() - ($1 * INTERVAL '1 hour')
+            ORDER BY time DESC
+            LIMIT $2
+            """,
+            hours,
+            limit,
+        )
+    else:
+        rows = await postgres_pool.fetch(
+            """
+            SELECT event_id, time, icao24, callsign, anomaly_type, layer,
+                   detector, risk_score, description, score_delta, lat, lon, meta
+            FROM anomaly_events
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+            ORDER BY time DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    events = []
+    for row in rows:
+        event = dict(row)
+        if isinstance(event.get("time"), datetime):
+            event["time"] = event["time"].isoformat()
+        if isinstance(event.get("meta"), str):
+            event["meta"] = orjson.loads(event["meta"])
+        events.append(event)
+    return {"count": len(events), "hours": hours, "events": events}
+
+
+@app.get("/api/anomalies/hotspots")
+async def get_anomaly_hotspots(
+    hours: int = Query(168, ge=0, le=87600),
+    precision: int = Query(1, ge=0, le=3),
+):
+    """Aggregate durable anomaly evidence into bounded, cached geographic cells."""
+    if hours not in HOTSPOT_ALLOWED_HOURS:
+        raise HTTPException(
+            status_code=422,
+            detail="hours must be one of 0, 1, 24, 168, or 720",
+        )
+    if postgres_pool is None:
+        raise HTTPException(status_code=503, detail="Historical anomaly store unavailable")
+
+    cache_key = (hours, precision)
+    now = time.monotonic()
+    cached = _hotspot_cache.get(cache_key)
+    if cached and now - cached[0] < HOTSPOT_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    async with _hotspot_query_lock:
+        now = time.monotonic()
+        cached = _hotspot_cache.get(cache_key)
+        if cached and now - cached[0] < HOTSPOT_CACHE_TTL_SECONDS:
+            return cached[1]
+        if hours:
+            query = postgres_pool.fetch(
+                """
+                SELECT round(lat::numeric, $2)::double precision AS lat,
+                       round(lon::numeric, $2)::double precision AS lon,
+                       COUNT(*)::integer AS event_count,
+                       MAX(risk_score)::integer AS max_risk,
+                       COUNT(DISTINCT icao24)::integer AS aircraft_count,
+                       MAX(time) AS last_seen,
+                       array_agg(DISTINCT anomaly_type ORDER BY anomaly_type) AS anomaly_types
+                FROM anomaly_events
+                WHERE lat IS NOT NULL AND lon IS NOT NULL
+                  AND time >= NOW() - ($1 * INTERVAL '1 hour')
+                GROUP BY round(lat::numeric, $2), round(lon::numeric, $2)
+                ORDER BY event_count DESC, max_risk DESC
+                LIMIT 2000
+                """,
+                hours,
+                precision,
+            )
+        else:
+            query = postgres_pool.fetch(
+                """
+                SELECT round(lat::numeric, $1)::double precision AS lat,
+                       round(lon::numeric, $1)::double precision AS lon,
+                       COUNT(*)::integer AS event_count,
+                       MAX(risk_score)::integer AS max_risk,
+                       COUNT(DISTINCT icao24)::integer AS aircraft_count,
+                       MAX(time) AS last_seen,
+                       array_agg(DISTINCT anomaly_type ORDER BY anomaly_type) AS anomaly_types
+                FROM anomaly_events
+                WHERE lat IS NOT NULL AND lon IS NOT NULL
+                GROUP BY round(lat::numeric, $1), round(lon::numeric, $1)
+                ORDER BY event_count DESC, max_risk DESC
+                LIMIT 2000
+                """,
+                precision,
+            )
+        try:
+            rows = await asyncio.wait_for(
+                query, timeout=HOTSPOT_QUERY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=503, detail="Hotspot query exceeded its execution budget",
+            ) from exc
+
+        hotspots = []
+        for row in rows:
+            hotspot = dict(row)
+            if isinstance(hotspot.get("last_seen"), datetime):
+                hotspot["last_seen"] = hotspot["last_seen"].isoformat()
+            hotspots.append(hotspot)
+        result = {"count": len(hotspots), "hours": hours, "hotspots": hotspots}
+        _hotspot_cache[cache_key] = (time.monotonic(), result)
+        return result
 
 
 @app.get("/api/stats")
@@ -1899,10 +2198,9 @@ async def alert_consumer_loop() -> None:
     )
     await consumer.start()
     try:
+        if postgres_pool is None:
+            raise RuntimeError("anomaly history storage unavailable")
         async for msg in consumer:
-            if not _ws_clients:
-                await commit_record(consumer, msg)
-                continue
             try:
                 sv = StateVector.from_bytes(msg.value)
             except Exception as exc:
@@ -1918,26 +2216,31 @@ async def alert_consumer_loop() -> None:
                 completed = False
                 try:
                     ac = sv.to_api_dict()
-                    area = await load_coverage_area(redis_client)
-                    if not _track_in_coverage(ac, area):
-                        await commit_record(consumer, msg)
-                        break
                     token = await _reserve_alert_effect(msg)
                     if token is None:
                         await commit_record(consumer, msg)
                         break
 
-                    # Apply L1 cross-validation to this single alert (one item
-                    # at a time off the Kafka topic, so a direct call is fine.
-                    if TDOA_AVAILABLE and cross_validator:
-                        try:
-                            l1 = await _validate_raw_l1_claim(ac["icao"])
-                            if l1:
-                                ac["l1"] = l1
-                        except Exception as e:
-                            log.warning("L1 validation failed in alert loop: %s", e)
+                    # Historical evidence is durable even when no dashboard is
+                    # connected or the world scanner has moved to another tile.
+                    await persist_anomaly_snapshot(
+                        postgres_pool, sv, _alert_event_identity(msg).decode()
+                    )
 
-                    await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
+                    area = await load_coverage_area(redis_client)
+                    should_publish = bool(_ws_clients) and _track_in_coverage(ac, area)
+                    if should_publish:
+                        # Apply L1 cross-validation to this single alert (one item
+                        # at a time off the Kafka topic, so a direct call is fine.
+                        if TDOA_AVAILABLE and cross_validator:
+                            try:
+                                l1 = await _validate_raw_l1_claim(ac["icao"])
+                                if l1:
+                                    ac["l1"] = l1
+                            except Exception as e:
+                                log.warning("L1 validation failed in alert loop: %s", e)
+
+                        await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
                     await _complete_alert_effect(msg, token)
                     completed = True
                     await commit_record(consumer, msg)

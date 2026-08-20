@@ -33,6 +33,8 @@ const AIRPORTS=[
 ];
 
 let allAC=[],markers={},aptLayers=[],map,coverageCircle,currentCoverage=null;
+let historicalEvents=[],historicalLayerGroup=null,hotspotData=[],hotspotLayers=[],worldScanEnabled=false;
+const HISTORICAL_COLOR='#a855f7';
 let ch1=null,ch2=null;
 const acHistory={},acEvents={};
 const MAX_PTS=120;
@@ -179,6 +181,7 @@ function initMap(){
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
     attribution:'OpenStreetMap / CARTO',subdomains:'abcd',maxZoom:19
   }).addTo(map);
+  historicalLayerGroup=L.layerGroup().addTo(map);
   const sel=document.getElementById('apt-sel');
   AIRPORTS.forEach(a=>{
     const o=document.createElement('option');
@@ -301,6 +304,98 @@ async function applyCoverage(){
     document.getElementById('coverage-airport').value='';
     status.textContent='Coverage update failed: '+e.message;
   }
+}
+
+async function loadWorldScan(){
+  const status=document.getElementById('world-scan-status');
+  try{
+    const r=await fetch(API+'/api/world-scan');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const data=await r.json(),scan=data.scan||{};
+    worldScanEnabled=Boolean(scan.enabled);
+    document.getElementById('world-scan-dwell').value=String(scan.dwell_seconds||360);
+    document.getElementById('world-scan-toggle').textContent=worldScanEnabled?'Stop world scan':'Start world scan';
+    status.textContent=worldScanEnabled?
+      'Active: '+data.current_tile.label+' · tile '+(scan.tile_index+1)+'/'+data.tile_count:
+      'Stopped';
+  }catch(e){ status.textContent='Scanner unavailable'; }
+}
+
+async function updateWorldScan(){
+  const status=document.getElementById('world-scan-status');
+  const dwell=Number(document.getElementById('world-scan-dwell').value);
+  try{
+    let operatorKey=sessionStorage.getItem('skysecureOperatorKey');
+    if(!operatorKey){
+      operatorKey=window.prompt('SkySecure operator key');
+      if(!operatorKey) throw new Error('operator authorization required');
+      sessionStorage.setItem('skysecureOperatorKey',operatorKey);
+    }
+    status.textContent=worldScanEnabled?'Stopping scanner...':'Starting worldwide rotation...';
+    const r=await fetch(API+'/api/world-scan',{method:'PUT',headers:{
+      'Content-Type':'application/json','X-SkySecure-Operator-Key':operatorKey
+    },body:JSON.stringify({enabled:!worldScanEnabled,dwell_seconds:dwell})});
+    if(r.status===403) sessionStorage.removeItem('skysecureOperatorKey');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    await loadWorldScan(); await loadCoverage(); await pollLive();
+  }catch(e){ status.textContent='Scanner update failed: '+e.message; }
+}
+
+function clearMapLayers(layers){
+  layers.forEach(layer=>map.removeLayer(layer));
+  layers.length=0;
+}
+
+function renderHistoricalAnomalies(events=historicalEvents){
+  historicalEvents=events||historicalEvents;
+  if(!historicalLayerGroup) return;
+  historicalLayerGroup.clearLayers();
+  if(!document.getElementById('history-markers').checked) return;
+  historicalEvents.forEach(event=>{
+    if(event.lat==null||event.lon==null) return;
+    const marker=L.circleMarker([event.lat,event.lon],{
+      radius:Math.max(7,Math.min(12,Math.round((event.risk_score||40)/12))),
+      color:HISTORICAL_COLOR,fillColor:HISTORICAL_COLOR,fillOpacity:0.75,weight:1
+    }).addTo(historicalLayerGroup);
+    marker.bindPopup('<div class="pt">Historical anomaly · '+esc(event.icao24||'unknown')+'</div>'+
+      '<div class="pr"><span class="pk">Observed</span><b>'+esc(event.time)+'</b></div>'+
+      '<div class="pr"><span class="pk">Layer / detector</span><b>'+esc(event.layer||'--')+' / '+esc(event.detector||'--')+'</b></div>'+
+      '<div class="pr"><span class="pk">Evidence</span><span>'+esc(event.description||event.anomaly_type||'--')+'</span></div>'+
+      '<div style="color:'+HISTORICAL_COLOR+';font-size:10px;margin-top:6px">Historical public-feed evidence; not independent spoof confirmation.</div>');
+  });
+}
+
+function renderHotspots(hotspots=hotspotData){
+  hotspotData=hotspots||hotspotData;
+  clearMapLayers(hotspotLayers);
+  if(!document.getElementById('hotspot-layer').checked) return;
+  hotspotData.forEach(hotspot=>{
+    const count=Number(hotspot.event_count)||1;
+    const color=(hotspot.max_risk||0)>=76?'#ef4444':'#f97316';
+    const layer=L.circle([hotspot.lat,hotspot.lon],{
+      radius:Math.min(180000,25000+Math.sqrt(count)*22000),
+      color,fillColor:color,fillOpacity:Math.min(0.42,0.10+count/80),weight:1
+    }).addTo(map);
+    layer.bindPopup('<div class="pt">Anomaly hotspot</div>'+
+      '<div class="pr"><span class="pk">Events</span><b>'+count+'</b></div>'+
+      '<div class="pr"><span class="pk">Aircraft</span><b>'+esc(hotspot.aircraft_count||0)+'</b></div>'+
+      '<div class="pr"><span class="pk">Peak risk</span><b>'+esc(hotspot.max_risk||0)+'/100</b></div>');
+    hotspotLayers.push(layer);
+  });
+}
+
+async function loadHistoricalAnomalies(){
+  const hours=Number(document.getElementById('history-window').value);
+  try{
+    const history=await fetch(API+'/api/anomalies/history?hours='+hours+'&limit=10000');
+    if(!history.ok) throw new Error('history HTTP '+history.status);
+    historicalEvents=(await history.json()).events||[];
+    renderHistoricalAnomalies(historicalEvents);
+    const hotspots=await fetch(API+'/api/anomalies/hotspots?hours='+hours+'&precision=1');
+    if(!hotspots.ok) throw new Error('hotspots HTTP '+hotspots.status);
+    hotspotData=(await hotspots.json()).hotspots||[];
+    renderHotspots(hotspotData);
+  }catch(e){ console.warn('[anomaly-history] load failed:',e.message); }
 }
 
 function applyFilters(){ renderAircraft(allAC); }
@@ -763,6 +858,8 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   initMap();
   loadCoverage();
+  loadWorldScan();
+  loadHistoricalAnomalies();
 
   // WebSocket for real-time anomaly-scored data
   connectWS();
@@ -774,4 +871,6 @@ window.addEventListener('DOMContentLoaded', () => {
   updateLayerSummary();
   updateLayerTriggers();
   setInterval(()=>{ updateLayerSummary(); updateLayerTriggers(); }, 15000);
+  setInterval(()=>{ loadWorldScan(); loadCoverage(); }, 30000);
+  setInterval(loadHistoricalAnomalies, 60000);
 });

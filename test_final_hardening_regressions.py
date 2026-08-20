@@ -1163,6 +1163,8 @@ class AlertDeliveryStateMachineRegressionTests(unittest.IsolatedAsyncioTestCase)
 
         with (
             patch("api.main.AIOKafkaConsumer", return_value=consumer),
+            patch("api.main.postgres_pool", AsyncMock()),
+            patch("api.main.persist_anomaly_snapshot", new=AsyncMock()),
             patch("api.main.load_coverage_area", new=AsyncMock(return_value=object())),
             patch("api.main._track_in_coverage", return_value=True),
             patch("api.main._reserve_alert_effect", reserve),
@@ -1200,6 +1202,8 @@ class AlertDeliveryStateMachineRegressionTests(unittest.IsolatedAsyncioTestCase)
         consumer.commit.side_effect = commit
         with (
             patch("api.main.AIOKafkaConsumer", return_value=consumer),
+            patch("api.main.postgres_pool", AsyncMock()),
+            patch("api.main.persist_anomaly_snapshot", new=AsyncMock()),
             patch("api.main.load_coverage_area", new=AsyncMock(return_value=object())),
             patch("api.main._track_in_coverage", return_value=True),
             patch("api.main._reserve_alert_effect", new=reserve),
@@ -1227,6 +1231,8 @@ class AlertDeliveryStateMachineRegressionTests(unittest.IsolatedAsyncioTestCase)
 
         with (
             patch("api.main.AIOKafkaConsumer", return_value=consumer),
+            patch("api.main.postgres_pool", AsyncMock()),
+            patch("api.main.persist_anomaly_snapshot", new=AsyncMock()),
             patch("api.main.load_coverage_area", new=AsyncMock(return_value=object())),
             patch("api.main._track_in_coverage", return_value=True),
             patch("api.main._reserve_alert_effect", reserve),
@@ -1243,6 +1249,15 @@ class AlertDeliveryStateMachineRegressionTests(unittest.IsolatedAsyncioTestCase)
 
 
 class ApiLifespanTaskSupervisionRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.history_pool = AsyncMock()
+        self.history_pool.close = AsyncMock()
+        self.history_pool_patch = patch(
+            "api.main.asyncpg.create_pool", AsyncMock(return_value=self.history_pool)
+        )
+        self.history_pool_patch.start()
+        self.addCleanup(self.history_pool_patch.stop)
+
     async def test_lifespan_starts_and_stops_physical_reception_publisher(self):
         async def block():
             await asyncio.Event().wait()

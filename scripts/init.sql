@@ -54,9 +54,14 @@ CREATE INDEX IF NOT EXISTS idx_fusion_outbox_pending
 -- ─── Anomaly events ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS anomaly_events (
     id              BIGSERIAL       PRIMARY KEY,
+    event_id        TEXT            NOT NULL UNIQUE,
     time            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     icao24          CHAR(6),
+    callsign        VARCHAR(16),
     anomaly_type    VARCHAR(48)     NOT NULL,
+    layer           VARCHAR(4),
+    detector        VARCHAR(64),
+    risk_score      SMALLINT,
     severity        SMALLINT,       -- 1–5
     description     TEXT,
     score_delta     SMALLINT,
@@ -69,6 +74,9 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
 CREATE INDEX IF NOT EXISTS idx_anomaly_time ON anomaly_events (time DESC);
 CREATE INDEX IF NOT EXISTS idx_anomaly_icao ON anomaly_events (icao24);
 CREATE INDEX IF NOT EXISTS idx_anomaly_type ON anomaly_events (anomaly_type);
+CREATE INDEX IF NOT EXISTS idx_anomaly_geo ON anomaly_events USING GIST (
+    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+) WHERE lat IS NOT NULL AND lon IS NOT NULL;
 
 -- ─── Aircraft registry (known identities) ──────────────────────
 CREATE TABLE IF NOT EXISTS aircraft_registry (
