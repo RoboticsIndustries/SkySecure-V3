@@ -414,6 +414,10 @@ function renderHotspots(hotspots=hotspotData){
   hotspotData.forEach(hotspot=>{
     const count=Number(hotspot.event_count)||1;
     const confidence=hotspot.confidence||'emerging';
+    const aircraftIds=Array.isArray(hotspot.aircraft_ids)?hotspot.aircraft_ids:[];
+    const aircraftLinks=aircraftIds.slice(0,20).map(icao=>
+      '<button class="view-hist" data-aircraft-details="'+esc(icao)+'" data-close-popup="1">'+esc(icao)+' details</button>'
+    ).join('')+(aircraftIds.length>20?'<div style="font-size:10px;margin-top:4px">+'+esc(aircraftIds.length-20)+' more aircraft</div>':'');
     const color={critical:'#ef4444',confirmed:'#f97316',emerging:'#eab308'}[confidence]||'#eab308';
     const layer=L.circle([hotspot.lat,hotspot.lon],{
       radius:Math.min(180000,25000+Math.sqrt(count)*22000),
@@ -426,7 +430,8 @@ function renderHotspots(hotspots=hotspotData){
       '<div class="pr"><span class="pk">Deduplicated events</span><b>'+count+'</b></div>'+
       '<div class="pr"><span class="pk">Raw observations</span><b>'+esc(hotspot.raw_event_count||count)+'</b></div>'+
       '<div class="pr"><span class="pk">Aircraft</span><b>'+esc(hotspot.aircraft_count||0)+'</b></div>'+
-      '<div class="pr"><span class="pk">Peak risk</span><b>'+esc(hotspot.max_risk||0)+'/100</b></div>');
+      '<div class="pr"><span class="pk">Peak risk</span><b>'+esc(hotspot.max_risk||0)+'/100</b></div>'+
+      '<div style="font-size:10px;font-weight:700;margin-top:8px">Contributing aircraft</div>'+aircraftLinks);
     hotspotLayers.push(layer);
   });
 }

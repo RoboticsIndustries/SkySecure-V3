@@ -1543,6 +1543,7 @@ async def get_anomaly_hotspots(
                        SUM(raw_event_count)::integer AS raw_event_count,
                        MAX(max_risk)::integer AS max_risk,
                        COUNT(DISTINCT icao24)::integer AS aircraft_count,
+                       array_agg(DISTINCT icao24 ORDER BY icao24) AS aircraft_ids,
                        COUNT(DISTINCT detector)::integer AS detector_count,
                        MIN(event_time) AS first_seen,
                        MAX(event_time) AS last_seen,

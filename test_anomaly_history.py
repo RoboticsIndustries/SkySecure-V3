@@ -131,6 +131,7 @@ class AnomalyHistoryPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "event_count": 7,
             "max_risk": 91,
             "aircraft_count": 3,
+            "aircraft_ids": ["ABC123", "DEF456", "789ABC"],
             "last_seen": datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
             "anomaly_types": ["TELEPORTATION", "DUPLICATE_ICAO"],
         }]
@@ -141,6 +142,7 @@ class AnomalyHistoryPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["hotspots"][0]["event_count"], 7)
         self.assertEqual(result["hotspots"][0]["max_risk"], 91)
+        self.assertEqual(result["hotspots"][0]["aircraft_ids"], ["ABC123", "DEF456", "789ABC"])
         self.assertEqual(result["hotspots"][0]["last_seen"], "2026-08-20T12:00:00+00:00")
         sql, hours, precision = pool.fetch.await_args.args
         self.assertIn("GROUP BY", sql)
@@ -157,6 +159,7 @@ class AnomalyHistoryPersistenceTests(unittest.IsolatedAsyncioTestCase):
         sql, effective_hours, precision = pool.fetch.await_args.args
         self.assertIn("date_bin(INTERVAL '10 minutes'", sql)
         self.assertIn("COUNT(DISTINCT icao24) >= 3", sql)
+        self.assertIn("array_agg(DISTINCT icao24 ORDER BY icao24) AS aircraft_ids", sql)
         self.assertIn("COUNT(*) >= 10", sql)
         self.assertIn("INTERVAL '15 minutes'", sql)
         self.assertIn("INTERVAL '2 hours'", sql)

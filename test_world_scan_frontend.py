@@ -59,6 +59,14 @@ class WorldScanFrontendTests(unittest.TestCase):
         self.assertIn("historicalEvents.filter", APP)
         self.assertNotIn("target=\"_blank\"", APP)
 
+    def test_hotspot_popup_links_each_contributing_aircraft_to_details(self):
+        hotspot_renderer = APP.split("function renderHotspots", 1)[1].split(
+            "async function loadHistoricalAnomalies", 1
+        )[0]
+        self.assertIn("hotspot.aircraft_ids", hotspot_renderer)
+        self.assertIn("data-aircraft-details", hotspot_renderer)
+        self.assertIn("Contributing aircraft", hotspot_renderer)
+
 
 if __name__ == "__main__":
     unittest.main()
