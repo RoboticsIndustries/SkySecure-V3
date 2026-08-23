@@ -34,6 +34,7 @@ const AIRPORTS=[
 
 let allAC=[],markers={},aptLayers=[],map,coverageCircle,currentCoverage=null;
 let historicalEvents=[],historicalLayerGroup=null,hotspotData=[],hotspotLayers=[],worldScanEnabled=false;
+let hotspotWindowHours=24,hotspotRecencyHours=2;
 const HISTORICAL_COLOR='#a855f7';
 let ch1=null,ch2=null;
 const acHistory={},acEvents={};
@@ -121,13 +122,33 @@ function openPanel(icao){
   document.getElementById('hp').classList.add('open');
   renderPanel(icao);
 }
+function openAircraftDetails(icao){
+  const normalized=String(icao||'').trim().toUpperCase();
+  if(!normalized) return;
+  const live=allAC.find(a=>a.icao===normalized);
+  const retained=historicalEvents.filter(event=>event.icao24===normalized);
+  if(!live&&!retained.length) return;
+  if(live&&live.lat!=null&&live.lon!=null) map.flyTo([live.lat,live.lon],9,{duration:0.8});
+  else if(retained[0]?.lat!=null&&retained[0]?.lon!=null) map.flyTo([retained[0].lat,retained[0].lon],9,{duration:0.8});
+  openPanel(normalized);
+}
 function closePanel(){
   document.getElementById('hp').classList.remove('open');
   openIcao=null;
 }
 function renderPanel(icao){
-  const ac=allAC.find(a=>a.icao===icao);
-  const hist=acHistory[icao]||[],evts=acEvents[icao]||[];
+  const retained=historicalEvents.filter(event=>event.icao24===icao);
+  const latest=retained[0];
+  const ac=allAC.find(a=>a.icao===icao)||(latest?{
+    icao,cs:latest.callsign,lat:latest.lat,lon:latest.lon,
+    alt:null,vel:null,hdg:null,risk:latest.risk_score||0,
+    anoms:retained.map(event=>event.anomaly_type),cls:'HISTORICAL'
+  }:null);
+  const hist=acHistory[icao]||[];
+  const evts=[...(acEvents[icao]||[]),...retained.map(event=>({
+    ts:event.time,sev:(event.risk_score||0)>=76?'red':'orange',
+    msg:(event.detector||event.anomaly_type||'Anomaly')+': '+(event.description||'retained evidence')
+  }))];
   if(!ac) return;
   const sp=spoofScore(ac),mil=checkMil(ac);
   const cls=mil?'CONFIRMED MILITARY':(ac.cls||'UNKNOWN').replace(/_/g,' ');
@@ -257,6 +278,37 @@ async function loadCoverage(){
   }catch(e){ status.textContent='Coverage settings unavailable'; }
 }
 
+function getOperatorKey(forcePrompt=false){
+  let key=forcePrompt?'':sessionStorage.getItem('skysecureOperatorKey');
+  if(!key) key=window.prompt('SkySecure operator key');
+  if(!key) throw new Error('operator authorization required');
+  sessionStorage.setItem('skysecureOperatorKey',key);
+  return key;
+}
+
+async function operatorFetch(path,options={},authorizationError='Operator authorization failed'){
+  const send=key=>fetch(API+path,{...options,headers:{
+    ...(options.headers||{}),'X-SkySecure-Operator-Key':key
+  }});
+  let key=getOperatorKey();
+  let r=await send(key);
+  if(r.status===403){
+    sessionStorage.removeItem('skysecureOperatorKey');
+    try{ key=getOperatorKey(true); }
+    catch(_error){ throw new Error(authorizationError); }
+    r=await send(key);
+  }
+  if(r.status===403){
+    sessionStorage.removeItem('skysecureOperatorKey');
+    throw new Error(authorizationError);
+  }
+  if(r.status===503){
+    await new Promise(resolve=>setTimeout(resolve,300));
+    r=await send(key);
+  }
+  return r;
+}
+
 function selectCoverageAirport(){
   const iata=document.getElementById('coverage-airport').value;
   const airport=AIRPORTS.find(a=>a.iata===iata); if(!airport) return;
@@ -284,16 +336,9 @@ async function applyCoverage(){
   const area={latitude:lat,longitude:lon,radius_nm:radius,label:airport?(airport.iata+' — '+airport.name):'Custom map area'};
   status.textContent='Switching live feed...';
   try{
-    let operatorKey=sessionStorage.getItem('skysecureOperatorKey');
-    if(!operatorKey){
-      operatorKey=window.prompt('SkySecure operator key');
-      if(!operatorKey) throw new Error('operator authorization required');
-      sessionStorage.setItem('skysecureOperatorKey',operatorKey);
-    }
-    const r=await fetch(API+'/api/coverage',{method:'PUT',headers:{
-      'Content-Type':'application/json','X-SkySecure-Operator-Key':operatorKey
+    const r=await operatorFetch('/api/coverage',{method:'PUT',headers:{
+      'Content-Type':'application/json'
     },body:JSON.stringify(area)});
-    if(r.status===403) sessionStorage.removeItem('skysecureOperatorKey');
     if(!r.ok) throw new Error('HTTP '+r.status);
     fillCoverage(area); map.flyTo([lat,lon],6,{duration:1.0});
     _directCache={}; _backendCache={}; mergeAndRender();
@@ -323,22 +368,18 @@ async function loadWorldScan(){
 
 async function updateWorldScan(){
   const status=document.getElementById('world-scan-status');
+  const button=document.getElementById('world-scan-toggle');
   const dwell=Number(document.getElementById('world-scan-dwell').value);
+  button.disabled=true;
   try{
-    let operatorKey=sessionStorage.getItem('skysecureOperatorKey');
-    if(!operatorKey){
-      operatorKey=window.prompt('SkySecure operator key');
-      if(!operatorKey) throw new Error('operator authorization required');
-      sessionStorage.setItem('skysecureOperatorKey',operatorKey);
-    }
     status.textContent=worldScanEnabled?'Stopping scanner...':'Starting worldwide rotation...';
-    const r=await fetch(API+'/api/world-scan',{method:'PUT',headers:{
-      'Content-Type':'application/json','X-SkySecure-Operator-Key':operatorKey
-    },body:JSON.stringify({enabled:!worldScanEnabled,dwell_seconds:dwell})});
-    if(r.status===403) sessionStorage.removeItem('skysecureOperatorKey');
+    const r=await operatorFetch('/api/world-scan',{method:'PUT',headers:{
+      'Content-Type':'application/json'
+    },body:JSON.stringify({enabled:!worldScanEnabled,dwell_seconds:dwell})},'Scanner authorization failed');
     if(!r.ok) throw new Error('HTTP '+r.status);
     await loadWorldScan(); await loadCoverage(); await pollLive();
   }catch(e){ status.textContent='Scanner update failed: '+e.message; }
+  finally{ button.disabled=false; }
 }
 
 function clearMapLayers(layers){
@@ -361,6 +402,7 @@ function renderHistoricalAnomalies(events=historicalEvents){
       '<div class="pr"><span class="pk">Observed</span><b>'+esc(event.time)+'</b></div>'+
       '<div class="pr"><span class="pk">Layer / detector</span><b>'+esc(event.layer||'--')+' / '+esc(event.detector||'--')+'</b></div>'+
       '<div class="pr"><span class="pk">Evidence</span><span>'+esc(event.description||event.anomaly_type||'--')+'</span></div>'+
+      '<button class="view-hist" data-aircraft-details="'+esc(event.icao24||'')+'" data-close-popup="1">Aircraft details</button>'+
       '<div style="color:'+HISTORICAL_COLOR+';font-size:10px;margin-top:6px">Historical public-feed evidence; not independent spoof confirmation.</div>');
   });
 }
@@ -371,13 +413,18 @@ function renderHotspots(hotspots=hotspotData){
   if(!document.getElementById('hotspot-layer').checked) return;
   hotspotData.forEach(hotspot=>{
     const count=Number(hotspot.event_count)||1;
-    const color=(hotspot.max_risk||0)>=76?'#ef4444':'#f97316';
+    const confidence=hotspot.confidence||'emerging';
+    const color={critical:'#ef4444',confirmed:'#f97316',emerging:'#eab308'}[confidence]||'#eab308';
     const layer=L.circle([hotspot.lat,hotspot.lon],{
       radius:Math.min(180000,25000+Math.sqrt(count)*22000),
       color,fillColor:color,fillOpacity:Math.min(0.42,0.10+count/80),weight:1
     }).addTo(map);
     layer.bindPopup('<div class="pt">Anomaly hotspot</div>'+
-      '<div class="pr"><span class="pk">Events</span><b>'+count+'</b></div>'+
+      '<div class="pr"><span class="pk">Confidence</span><b>'+esc(confidence.toUpperCase())+'</b></div>'+
+      '<div class="pr"><span class="pk">Evidence window</span><b>'+esc(hotspotWindowHours)+' hours</b></div>'+
+      '<div class="pr"><span class="pk">Active within</span><b>'+esc(hotspotRecencyHours)+' hours</b></div>'+
+      '<div class="pr"><span class="pk">Deduplicated events</span><b>'+count+'</b></div>'+
+      '<div class="pr"><span class="pk">Raw observations</span><b>'+esc(hotspot.raw_event_count||count)+'</b></div>'+
       '<div class="pr"><span class="pk">Aircraft</span><b>'+esc(hotspot.aircraft_count||0)+'</b></div>'+
       '<div class="pr"><span class="pk">Peak risk</span><b>'+esc(hotspot.max_risk||0)+'/100</b></div>');
     hotspotLayers.push(layer);
@@ -393,7 +440,10 @@ async function loadHistoricalAnomalies(){
     renderHistoricalAnomalies(historicalEvents);
     const hotspots=await fetch(API+'/api/anomalies/hotspots?hours='+hours+'&precision=1');
     if(!hotspots.ok) throw new Error('hotspots HTTP '+hotspots.status);
-    hotspotData=(await hotspots.json()).hotspots||[];
+    const hotspotResponse=await hotspots.json();
+    hotspotData=hotspotResponse.hotspots||[];
+    hotspotWindowHours=hotspotResponse.hotspot_hours||24;
+    hotspotRecencyHours=hotspotResponse.recency_hours||2;
     renderHotspots(hotspotData);
   }catch(e){ console.warn('[anomaly-history] load failed:',e.message); }
 }
@@ -484,7 +534,7 @@ async function updateLayerTriggers(){
       return;
     }
     body.innerHTML=data.triggers.map(t=>'<tr>'+
-      '<td style="font-family:var(--mono);font-weight:600">'+esc(t.aircraft_id)+'</td>'+
+      '<td><button class="view-hist" data-aircraft-details="'+esc(t.aircraft_id)+'">'+esc(t.aircraft_id)+'</button></td>'+
       '<td>'+esc(t.detector)+'</td><td>'+esc(t.type.replace(/_/g,' '))+'</td>'+
       '<td>+'+esc(t.score_delta)+'</td><td style="font-family:var(--mono);font-size:10px">'+esc(JSON.stringify(t.evidence))+'</td></tr>').join('');
   } catch(e) {
@@ -850,11 +900,18 @@ function switchTab(name) {
 
 window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('click', event => {
-    const target=event.target.closest('[data-open-panel]');
-    if(!target) return;
-    if(target.dataset.closePopup==='1') map.closePopup();
-    openPanel(target.dataset.openPanel);
-    if(target.dataset.switchTab) switchTab(target.dataset.switchTab);
+    const detailTarget=event.target.closest('[data-aircraft-details]');
+    if(detailTarget){
+      if(detailTarget.dataset.closePopup==='1') map.closePopup();
+      switchTab('map');
+      openAircraftDetails(detailTarget.dataset.aircraftDetails);
+      return;
+    }
+    const panelTarget=event.target.closest('[data-open-panel]');
+    if(!panelTarget) return;
+    if(panelTarget.dataset.closePopup==='1') map.closePopup();
+    openPanel(panelTarget.dataset.openPanel);
+    if(panelTarget.dataset.switchTab) switchTab(panelTarget.dataset.switchTab);
   });
   initMap();
   loadCoverage();

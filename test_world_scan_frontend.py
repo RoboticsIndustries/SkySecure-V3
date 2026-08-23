@@ -24,6 +24,8 @@ class WorldScanFrontendTests(unittest.TestCase):
         self.assertIn("renderHistoricalAnomalies", APP)
         self.assertIn("renderHotspots", APP)
         self.assertIn("#a855f7", APP)
+        self.assertIn("Evidence window", APP)
+        self.assertIn("Active within", APP)
 
     def test_historical_markers_remain_a_distinct_layer_for_live_icaos(self):
         history_renderer = APP.split("function renderHistoricalAnomalies", 1)[1].split(
@@ -43,6 +45,19 @@ class WorldScanFrontendTests(unittest.TestCase):
         self.assertIn("updateWorldScan", APP)
         self.assertIn("X-SkySecure-Operator-Key", APP)
         self.assertIn("dwell_seconds", APP)
+
+    def test_world_scan_reprompts_and_retries_after_expired_operator_key(self):
+        self.assertIn("operatorFetch", APP)
+        self.assertIn("if(r.status===403)", APP)
+        self.assertIn("if(r.status===503)", APP)
+        self.assertIn("forcePrompt", APP)
+        self.assertIn("Scanner authorization failed", APP)
+
+    def test_anomaly_aircraft_identifiers_open_internal_aircraft_details(self):
+        self.assertIn("data-aircraft-details", APP)
+        self.assertIn("openAircraftDetails", APP)
+        self.assertIn("historicalEvents.filter", APP)
+        self.assertNotIn("target=\"_blank\"", APP)
 
 
 if __name__ == "__main__":

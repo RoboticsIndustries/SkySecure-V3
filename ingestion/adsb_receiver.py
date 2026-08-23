@@ -28,6 +28,8 @@ POLL_INTERVAL = 15   # seconds — stay well within OpenSky rate limits
 REDIS_TTL     = 60   # seconds — aircraft expire if not refreshed
 MAX_PROVIDER_RECORDS = 10_000
 REDIS_PIPELINE_CHUNK = 500
+COVERAGE_PUBLISH_CHUNK = 25
+COVERAGE_LOCK_HANDOFF_SECONDS = 0.15
 
 def adsb_lol_fallback_url(
     lat: float | None = None,
@@ -177,6 +179,59 @@ def _parse_feed_state(
     return aircraft, message
 
 
+async def publish_coverage_batch(
+    redis_client: Any,
+    producer: Any,
+    kafka_messages: list[tuple[bytes, bytes, dict]],
+    coverage_token: bytes,
+) -> tuple[int, bool]:
+    """Publish bounded chunks while allowing operator coverage changes between them."""
+    published = 0
+    for chunk_start in range(0, len(kafka_messages), COVERAGE_PUBLISH_CHUNK):
+        chunk = kafka_messages[chunk_start:chunk_start + COVERAGE_PUBLISH_CHUNK]
+        lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
+        async with lock:
+            _, final_token = await load_coverage_area_record(redis_client)
+            if final_token != coverage_token:
+                log.info("Coverage changed during processing; discarding stale batch remainder")
+                return published, False
+            redis_batch = []
+            for key, value, ac in chunk:
+                await lock.extend(30, replace_ttl=True)
+                try:
+                    await asyncio.wait_for(
+                        producer.send_and_wait(
+                            topic=settings.TOPIC_RAW_ADSB,
+                            key=key,
+                            value=value,
+                        ),
+                        timeout=2.0,
+                    )
+                    redis_batch.append(ac)
+                    published += 1
+                except asyncio.TimeoutError:
+                    log.warning("Kafka send timed out for %s", key.decode(errors="ignore"))
+                except Exception as exc:
+                    log.warning(
+                        "Kafka send failed for %s: %s",
+                        key.decode(errors="ignore"), exc,
+                    )
+            if redis_batch:
+                await lock.extend(30, replace_ttl=True)
+                pipe = redis_client.pipeline()
+                for pending in redis_batch:
+                    pipe.setex(
+                        f"ac:{pending['icao']}", REDIS_TTL,
+                        json.dumps(pending).encode(),
+                    )
+                await asyncio.wait_for(pipe.execute(), timeout=5.0)
+        if chunk_start + len(chunk) < len(kafka_messages):
+            # A short gap prevents this producer from immediately reacquiring
+            # the distributed lock ahead of waiting operator/API requests.
+            await asyncio.sleep(COVERAGE_LOCK_HANDOFF_SECONDS)
+    return published, True
+
+
 async def run() -> None:
     logging.basicConfig(level=settings.LOG_LEVEL,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -262,51 +317,9 @@ async def run() -> None:
                         icao = ac["icao"]
                         kafka_messages.append((icao.encode(), msg.to_bytes(), ac))
 
-                    lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=30, blocking_timeout=5)
-                    async with lock:
-                        _, final_token = await load_coverage_area_record(redis_client)
-                        if final_token != coverage_token:
-                            log.info("Coverage changed during processing; discarding stale batch")
-                            continue
-                        redis_batch = []
-                        for key, value, ac in kafka_messages:
-                            await lock.extend(30, replace_ttl=True)
-                            try:
-                                await asyncio.wait_for(
-                                    producer.send_and_wait(
-                                        topic=settings.TOPIC_RAW_ADSB,
-                                        key=key,
-                                        value=value,
-                                    ),
-                                    timeout=2.0,
-                                )
-                                redis_batch.append(ac)
-                                published += 1
-                                if len(redis_batch) >= REDIS_PIPELINE_CHUNK:
-                                    pipe = redis_client.pipeline()
-                                    for pending in redis_batch:
-                                        pipe.setex(
-                                            f"ac:{pending['icao']}", REDIS_TTL,
-                                            json.dumps(pending).encode(),
-                                        )
-                                    await asyncio.wait_for(pipe.execute(), timeout=5.0)
-                                    redis_batch.clear()
-                            except asyncio.TimeoutError:
-                                log.warning("Kafka send timed out for %s", key.decode(errors="ignore"))
-                            except Exception as exc:
-                                log.warning(
-                                    "Kafka send failed for %s: %s",
-                                    key.decode(errors="ignore"), exc,
-                                )
-                        if redis_batch:
-                            await lock.extend(30, replace_ttl=True)
-                            pipe = redis_client.pipeline()
-                            for pending in redis_batch:
-                                pipe.setex(
-                                    f"ac:{pending['icao']}", REDIS_TTL,
-                                    json.dumps(pending).encode(),
-                                )
-                            await asyncio.wait_for(pipe.execute(), timeout=5.0)
+                    published, _completed = await publish_coverage_batch(
+                        redis_client, producer, kafka_messages, coverage_token
+                    )
                     log.info("Wrote %d aircraft to Redis (ac:*)", published)
 
             except Exception as e:

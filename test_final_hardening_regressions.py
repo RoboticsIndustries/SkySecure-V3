@@ -1180,6 +1180,36 @@ class AlertDeliveryStateMachineRegressionTests(unittest.IsolatedAsyncioTestCase)
         complete.assert_not_awaited()
         consumer.commit.assert_not_awaited()
 
+    async def test_durable_alert_commits_when_optional_live_push_is_contended(self):
+        msg = self._message()
+        consumer = _FiniteConsumer([msg])
+        persist = AsyncMock()
+        complete = AsyncMock()
+        release = AsyncMock()
+        publish = AsyncMock(side_effect=RuntimeError(
+            "Unable to acquire lock within the time specified"
+        ))
+
+        with (
+            patch("api.main.AIOKafkaConsumer", return_value=consumer),
+            patch("api.main.postgres_pool", AsyncMock()),
+            patch("api.main.persist_anomaly_snapshot", persist),
+            patch("api.main.load_coverage_area", new=AsyncMock(return_value=object())),
+            patch("api.main._track_in_coverage", return_value=True),
+            patch("api.main._reserve_alert_effect", new=AsyncMock(return_value="lease-token")),
+            patch("api.main._release_alert_effect", release, create=True),
+            patch("api.main._complete_alert_effect", complete, create=True),
+            patch("api.main._publish_alert", publish),
+            patch("api.main.TDOA_AVAILABLE", False),
+        ):
+            await alert_consumer_loop()
+
+        persist.assert_awaited_once()
+        publish.assert_awaited_once()
+        complete.assert_awaited_once_with(msg, "lease-token")
+        release.assert_not_awaited()
+        consumer.commit.assert_awaited_once()
+
     async def test_completed_effect_is_suppressed_and_offsets_commit_after_completion(self):
         first = self._message()
         replay = self._message()

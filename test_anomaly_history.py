@@ -144,18 +144,40 @@ class AnomalyHistoryPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["hotspots"][0]["last_seen"], "2026-08-20T12:00:00+00:00")
         sql, hours, precision = pool.fetch.await_args.args
         self.assertIn("GROUP BY", sql)
-        self.assertEqual((hours, precision), (168, 1))
+        self.assertEqual((hours, precision), (24, 1))
 
-    async def test_hotspot_endpoint_supports_all_retained_history(self):
+    async def test_hotspots_require_multi_aircraft_sustained_recent_clusters(self):
         pool = AsyncMock()
         pool.fetch.return_value = []
+        api_main._hotspot_cache.clear()
+
+        with patch("api.main.postgres_pool", pool):
+            result = await api_main.get_anomaly_hotspots(hours=168, precision=1)
+
+        sql, effective_hours, precision = pool.fetch.await_args.args
+        self.assertIn("date_bin(INTERVAL '10 minutes'", sql)
+        self.assertIn("COUNT(DISTINCT icao24) >= 3", sql)
+        self.assertIn("COUNT(*) >= 10", sql)
+        self.assertIn("INTERVAL '15 minutes'", sql)
+        self.assertIn("INTERVAL '2 hours'", sql)
+        self.assertEqual(effective_hours, 24)
+        self.assertEqual(precision, 1)
+        self.assertEqual(result["hotspot_hours"], 24)
+        self.assertEqual(result["recency_hours"], 2)
+
+    async def test_all_retained_events_only_build_hotspots_from_last_day(self):
+        pool = AsyncMock()
+        pool.fetch.return_value = []
+        api_main._hotspot_cache.clear()
+
         with patch("api.main.postgres_pool", pool):
             result = await api_main.get_anomaly_hotspots(hours=0, precision=1)
 
-        sql, precision = pool.fetch.await_args.args
-        self.assertNotIn("INTERVAL '1 hour'", sql)
-        self.assertEqual(precision, 1)
+        _sql, effective_hours, precision = pool.fetch.await_args.args
+        self.assertEqual((effective_hours, precision), (24, 1))
         self.assertEqual(result["hours"], 0)
+        self.assertEqual(result["hotspot_hours"], 24)
+
 
     async def test_hotspot_endpoint_rejects_arbitrary_expensive_windows(self):
         with self.assertRaises(api_main.HTTPException) as raised:

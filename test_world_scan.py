@@ -80,6 +80,75 @@ class WorldScanTests(unittest.TestCase):
 
 
 class WorldScanRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_world_scan_busy_lock_returns_retryable_service_unavailable(self):
+        previous_redis = api_main.redis_client
+        api_main.redis_client = object()
+        try:
+            with patch(
+                "api.main.configure_world_scan",
+                new=AsyncMock(side_effect=api_main.LockError("busy")),
+            ):
+                with self.assertRaises(api_main.HTTPException) as raised:
+                    await api_main.set_world_scan(
+                        api_main.WorldScanCommand(enabled=True, dwell_seconds=360)
+                    )
+        finally:
+            api_main.redis_client = previous_redis
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("retry", raised.exception.detail.lower())
+
+    async def test_ingestor_releases_coverage_lock_between_bounded_publish_chunks(self):
+        class Pipeline:
+            def setex(self, *_args): pass
+            async def execute(self): return []
+
+        class ChunkRedis:
+            def __init__(self):
+                self.token = b"first"
+                self.entries = 0
+
+            def pipeline(self): return Pipeline()
+
+            def lock(self, *_args, **_kwargs):
+                owner = self
+                class Lock:
+                    async def __aenter__(self):
+                        owner.entries += 1
+                        return self
+                    async def __aexit__(self, *_args):
+                        if owner.entries == 1:
+                            owner.token = b"changed"
+                        return False
+                    async def extend(self, *_args, **_kwargs): return True
+                return Lock()
+
+        redis = ChunkRedis()
+        producer = AsyncMock()
+        messages = [
+            (f"A{index:05X}".encode(), b"payload", {"icao": f"A{index:05X}"})
+            for index in range(30)
+        ]
+
+        async def load_token(client):
+            return object(), client.token
+
+        with (
+            patch(
+                "ingestion.adsb_receiver.load_coverage_area_record",
+                side_effect=load_token,
+            ),
+            patch("ingestion.adsb_receiver.asyncio.sleep", new=AsyncMock()) as handoff,
+        ):
+            published, completed = await adsb_receiver.publish_coverage_batch(
+                redis, producer, messages, b"first"
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(redis.entries, 2)
+        self.assertEqual(published, adsb_receiver.COVERAGE_PUBLISH_CHUNK)
+        handoff.assert_awaited_once_with(adsb_receiver.COVERAGE_LOCK_HANDOFF_SECONDS)
+
     async def test_ingestor_ticks_scanner_before_loading_cycle_coverage(self):
         redis = FakeRedis()
         area = world_scan.tile_area(3)

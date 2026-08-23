@@ -1193,12 +1193,18 @@ async def set_world_scan(command: WorldScanCommand):
     global _live_cache
     if redis_client is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
-    state = await configure_world_scan(
-        redis_client,
-        enabled=command.enabled,
-        dwell_seconds=command.dwell_seconds,
-        now=time.time(),
-    )
+    try:
+        state = await configure_world_scan(
+            redis_client,
+            enabled=command.enabled,
+            dwell_seconds=command.dwell_seconds,
+            now=time.time(),
+        )
+    except LockError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Coverage update is busy; retry world scan control",
+        ) from exc
     _live_cache = {"ts": 0, "aircraft": [], "coverage_token": b""}
     return {
         "status": "updated",
@@ -1507,44 +1513,62 @@ async def get_anomaly_hotspots(
         cached = _hotspot_cache.get(cache_key)
         if cached and now - cached[0] < HOTSPOT_CACHE_TTL_SECONDS:
             return cached[1]
-        if hours:
-            query = postgres_pool.fetch(
-                """
+        # Individual events remain queryable for the selected history window, but
+        # hotspot circles represent sustained clusters over at most 24 hours
+        # that have also shown activity during the last two hours.
+        # Ten-minute aircraft/detector buckets prevent a noisy detector from
+        # manufacturing a hotspot by repeating the same alert every frame.
+        effective_hours = 24 if hours == 0 else min(hours, 24)
+        query = postgres_pool.fetch(
+            """
+            WITH deduplicated AS (
                 SELECT round(lat::numeric, $2)::double precision AS lat,
                        round(lon::numeric, $2)::double precision AS lon,
-                       COUNT(*)::integer AS event_count,
+                       icao24,
+                       detector,
+                       date_bin(INTERVAL '10 minutes', time, TIMESTAMPTZ '2000-01-01') AS event_bucket,
+                       COUNT(*)::integer AS raw_event_count,
                        MAX(risk_score)::integer AS max_risk,
-                       COUNT(DISTINCT icao24)::integer AS aircraft_count,
-                       MAX(time) AS last_seen,
-                       array_agg(DISTINCT anomaly_type ORDER BY anomaly_type) AS anomaly_types
+                       MAX(time) AS event_time,
+                       (array_agg(anomaly_type ORDER BY time DESC))[1] AS anomaly_type
                 FROM anomaly_events
                 WHERE lat IS NOT NULL AND lon IS NOT NULL
                   AND time >= NOW() - ($1 * INTERVAL '1 hour')
-                GROUP BY round(lat::numeric, $2), round(lon::numeric, $2)
-                ORDER BY event_count DESC, max_risk DESC
-                LIMIT 2000
-                """,
-                hours,
-                precision,
-            )
-        else:
-            query = postgres_pool.fetch(
-                """
-                SELECT round(lat::numeric, $1)::double precision AS lat,
-                       round(lon::numeric, $1)::double precision AS lon,
+                GROUP BY round(lat::numeric, $2), round(lon::numeric, $2),
+                         icao24, detector, event_bucket
+            ), clusters AS (
+                SELECT lat,
+                       lon,
                        COUNT(*)::integer AS event_count,
-                       MAX(risk_score)::integer AS max_risk,
+                       SUM(raw_event_count)::integer AS raw_event_count,
+                       MAX(max_risk)::integer AS max_risk,
                        COUNT(DISTINCT icao24)::integer AS aircraft_count,
-                       MAX(time) AS last_seen,
+                       COUNT(DISTINCT detector)::integer AS detector_count,
+                       MIN(event_time) AS first_seen,
+                       MAX(event_time) AS last_seen,
                        array_agg(DISTINCT anomaly_type ORDER BY anomaly_type) AS anomaly_types
-                FROM anomaly_events
-                WHERE lat IS NOT NULL AND lon IS NOT NULL
-                GROUP BY round(lat::numeric, $1), round(lon::numeric, $1)
-                ORDER BY event_count DESC, max_risk DESC
-                LIMIT 2000
-                """,
-                precision,
+                FROM deduplicated
+                GROUP BY lat, lon
+                HAVING COUNT(DISTINCT icao24) >= 3
+                   AND COUNT(*) >= 10
+                   AND MAX(event_time) - MIN(event_time) >= INTERVAL '15 minutes'
+                   AND MAX(event_time) >= NOW() - INTERVAL '2 hours'
             )
+            SELECT *,
+                   CASE
+                       WHEN aircraft_count >= 5 AND event_count >= 20 AND max_risk >= 76
+                           THEN 'critical'
+                       WHEN aircraft_count >= 5 AND event_count >= 20
+                           THEN 'confirmed'
+                       ELSE 'emerging'
+                   END AS confidence
+            FROM clusters
+            ORDER BY aircraft_count DESC, event_count DESC, max_risk DESC
+            LIMIT 2000
+            """,
+            effective_hours,
+            precision,
+        )
         try:
             rows = await asyncio.wait_for(
                 query, timeout=HOTSPOT_QUERY_TIMEOUT_SECONDS,
@@ -1560,7 +1584,13 @@ async def get_anomaly_hotspots(
             if isinstance(hotspot.get("last_seen"), datetime):
                 hotspot["last_seen"] = hotspot["last_seen"].isoformat()
             hotspots.append(hotspot)
-        result = {"count": len(hotspots), "hours": hours, "hotspots": hotspots}
+        result = {
+            "count": len(hotspots),
+            "hours": hours,
+            "hotspot_hours": effective_hours,
+            "recency_hours": 2,
+            "hotspots": hotspots,
+        }
         _hotspot_cache[cache_key] = (time.monotonic(), result)
         return result
 
@@ -2240,7 +2270,18 @@ async def alert_consumer_loop() -> None:
                             except Exception as e:
                                 log.warning("L1 validation failed in alert loop: %s", e)
 
-                        await _publish_alert(ac, [a.to_api_dict() for a in sv.anomalies])
+                        try:
+                            await _publish_alert(
+                                ac, [a.to_api_dict() for a in sv.anomalies]
+                            )
+                        except Exception as publish_error:
+                            # Durable history is authoritative; a contended map
+                            # lock or disconnected browser must not terminate the
+                            # Kafka consumer or tear down API dependencies.
+                            log.warning(
+                                "Optional live alert delivery skipped after durable persistence: %s",
+                                publish_error,
+                            )
                     await _complete_alert_effect(msg, token)
                     completed = True
                     await commit_record(consumer, msg)
