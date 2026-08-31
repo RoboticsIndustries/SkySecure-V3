@@ -241,7 +241,7 @@ function drawCoverageArea(area){
   if(coverageCircle) map.removeLayer(coverageCircle);
   coverageCircle=L.circle([area.latitude,area.longitude],{
     radius:area.radius_nm*1852,color:'#2563eb',fillColor:'#3b82f6',
-    fillOpacity:0.035,weight:2,dashArray:'7 5'
+    fillOpacity:0.035,weight:2,dashArray:'7 5',interactive:false
   }).addTo(map);
 }
 

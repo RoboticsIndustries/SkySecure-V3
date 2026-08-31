@@ -40,6 +40,12 @@ class WorldScanFrontendTests(unittest.TestCase):
         )[0]
         self.assertNotIn("renderHistoricalAnomalies", aircraft_renderer)
 
+    def test_coverage_overlay_does_not_capture_aircraft_clicks(self):
+        coverage_renderer = APP.split("function drawCoverageArea", 1)[1].split(
+            "function fillCoverage", 1
+        )[0]
+        self.assertIn("interactive:false", coverage_renderer)
+
     def test_dashboard_can_start_and_stop_operator_authorized_world_scan(self):
         self.assertTrue("'/api/world-scan'" in APP or '"/api/world-scan"' in APP)
         self.assertIn("updateWorldScan", APP)
