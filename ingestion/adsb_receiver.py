@@ -90,7 +90,7 @@ def _parse_adsb_lol_states(data: dict, received_at: Optional[float] = None) -> l
         vertical_fpm = _finite_number(raw.get("baro_rate"))
         # Preserve the 17-field OpenSky layout and append integrity metadata
         # supplied by adsb.lol. OpenSky leaves these extension slots absent.
-        state: list[Any] = [None] * 19
+        state: list[Any] = [None] * 20
         state[0] = icao
         state[1] = str(raw.get("flight") or "").strip() or None
         age = _finite_number(raw.get("seen_pos"))
@@ -108,8 +108,20 @@ def _parse_adsb_lol_states(data: dict, received_at: Optional[float] = None) -> l
         nac_p = _finite_number(raw.get("nac_p"))
         state[17] = int(nic) if nic is not None else None
         state[18] = int(nac_p) if nac_p is not None else None
+        squawk = raw.get("squawk")
+        state[19] = str(squawk).strip() if squawk is not None else None
         states.append(state)
     return states
+
+def _squawk_from_state(state: list[Any] | tuple[Any, ...]) -> Optional[str]:
+    """Read a transponder squawk code from OpenSky slot 14 or extension slot 19."""
+    for index in (14, 19):
+        if len(state) <= index or state[index] is None:
+            continue
+        candidate = str(state[index]).strip()
+        if len(candidate) == 4 and all(char in "01234567" for char in candidate):
+            return candidate
+    return None
 
 
 def _integrity_from_state(state: list[Any] | tuple[Any, ...]) -> tuple[Optional[int], Optional[int]]:
@@ -161,18 +173,19 @@ def _parse_feed_state(
     vertical_rate = int(vertical_ms * 196.85) if vertical_ms is not None else None
     callsign = state[1].strip().upper() if isinstance(state[1], str) else None
     nic, nac_p = _integrity_from_state(state)
+    squawk = _squawk_from_state(state)
     message = RawADSBMessage(
         receiver_id=source, recv_time=event_time, icao24=icao,
         raw_message="", msg_type=17, callsign=callsign or None,
         lat=lat, lon=lon, altitude_baro=altitude, velocity=velocity,
         heading=heading, vertical_rate=vertical_rate,
-        on_ground=state[8] is True, nic=nic, nac_p=nac_p,
+        on_ground=state[8] is True, nic=nic, nac_p=nac_p, squawk=squawk,
     )
     aircraft = {
         "icao": icao, "cs": callsign or None, "lat": lat, "lon": lon,
         "alt": altitude, "vel": velocity, "hdg": heading,
         "vr": vertical_rate, "gnd": state[8] is True,
-        "nic": nic, "nac_p": nac_p, "ts": event_time, "src": source,
+        "nic": nic, "nac_p": nac_p, "sqk": squawk, "ts": event_time, "src": source,
         "risk": 0, "anoms": [], "cls": "CIVILIAN", "conf": 0.85,
         "mil": 0.0, "band": "NORMAL", "trail": [],
     }

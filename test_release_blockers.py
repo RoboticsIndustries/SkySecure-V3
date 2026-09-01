@@ -89,9 +89,9 @@ class FinalReleaseBlockerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("L2/L3 aren't fused", running)
         self.assertNotIn("L4/L5 have no code path", running)
         self.assertNotIn("docker compose up -d", guide)
-        six = "fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend"
-        self.assertIn(f"docker compose build {six}", readme)
-        self.assertIn(f"docker compose up -d --no-deps --force-recreate {six}", readme)
+        seven = "fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor frontend"
+        self.assertIn(f"docker compose build {seven}", readme)
+        self.assertIn(f"docker compose up -d --no-deps --force-recreate {seven}", readme)
         env_path = Path(".env.example")
         if env_path.exists():
             env_example = env_path.read_text()

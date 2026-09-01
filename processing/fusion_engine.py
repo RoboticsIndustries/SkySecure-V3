@@ -245,6 +245,7 @@ class FusionEngine:
             velocity=msg.velocity,
             heading=msg.heading,
             vertical_rate=msg.vertical_rate,
+            on_ground=msg.on_ground,
             weight=adsb_confidence,
             confidence=adsb_confidence,
             timestamp=msg.recv_time,
@@ -293,6 +294,7 @@ class FusionEngine:
         if is_current_adsb_event:
             sv.nic = msg.nic
             sv.nac_p = msg.nac_p
+            sv.squawk = msg.squawk
         if is_current_event and msg.callsign:
             sv.callsign = msg.callsign
         if is_current_event and msg.on_ground is not None:

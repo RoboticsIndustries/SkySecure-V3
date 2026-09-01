@@ -32,8 +32,11 @@ const AIRPORTS=[
   {iata:'MEX',name:'Mexico City',       lat:19.4361,lon:-99.072 },
 ];
 
+const EMERGENCY_SQUAWKS={'7500':'HIJACK','7600':'RADIO FAILURE','7700':'EMERGENCY'};
+
 let allAC=[],markers={},aptLayers=[],map,coverageCircle,currentCoverage=null;
 let historicalEvents=[],historicalLayerGroup=null,hotspotData=[],hotspotLayers=[],worldScanEnabled=false;
+let conflictLayerGroup=null,_conflictAnalysis={conflicts:[]};
 let hotspotWindowHours=24,hotspotRecencyHours=2;
 const HISTORICAL_COLOR='#a855f7';
 let ch1=null,ch2=null;
@@ -42,6 +45,13 @@ const MAX_PTS=120;
 let openIcao=null,hpSpd=null,hpAlt=null,hpHdg=null;
 let aiRC=null,aiSC=null;
 let csvRows=[],csvHeaders=[];
+let watchEvents=[],watchSummary=null,watchKindFilter='ALL',watchGhostGroup=null;
+
+if(window.Chart){
+  Chart.defaults.color='#8b9bb4';
+  Chart.defaults.borderColor='rgba(56,189,248,0.08)';
+  Chart.defaults.font.family="'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace";
+}
 
 function esc(value){
   return String(value??'').replace(/[&<>'"]/g,ch=>({
@@ -76,12 +86,13 @@ function checkMil(ac){
 }
 
 function mkColor(ac){
+  if(ac.sqk&&EMERGENCY_SQUAWKS[ac.sqk]) return '#ffb020';
   const sp=spoofScore(ac);
-  if(sp>=60)                   return '#ef4444';
+  if(sp>=60)                   return '#ff2d55';
   if(sp>=30)                   return '#f97316';
-  if(checkMil(ac))             return '#ef4444';
-  if(ac.cls==='DARK_AIRCRAFT') return '#8b5cf6';
-  return '#22c55e';
+  if(checkMil(ac))             return '#ff2d55';
+  if(ac.cls==='DARK_AIRCRAFT') return '#a855f7';
+  return '#2fe6a7';
 }
 
 // ── History ───────────────────────────────────────────────────
@@ -161,6 +172,7 @@ function renderPanel(icao){
     '<span class="badge '+(mil?'mil':sp>=30?'spoof':'civil')+'">'+esc(cls)+'</span> '+
     '<span class="badge '+(sp>=60?'spoof':sp>=30?'sus':'clean')+'">Spoof '+sp+'%</span> '+
     '<span class="badge gray">Risk '+(ac.risk||0)+'/100</span>'+
+    (ac.sqk?'<span class="badge sus">SQK '+esc(ac.sqk)+'</span>':'')+
     (evts.length?'<span class="badge spoof">'+evts.length+' events</span>':'');
   const labels=hist.map(p=>p.ts.substr(0,8));
   const vels=hist.map(p=>p.vel),alts=hist.map(p=>p.alt),hdgs=hist.map(p=>p.hdg);
@@ -174,26 +186,26 @@ function renderPanel(icao){
   const opts=(unit)=>({responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>(c.dataset.label==='Anomaly'?'ANOMALY: ':'')+
       (c.parsed.y!=null?Math.round(c.parsed.y)+' '+unit:'--')}}},
-    scales:{x:{ticks:{font:{size:8},maxRotation:0,maxTicksLimit:6},grid:{color:'#f3f4f6'}},
-            y:{ticks:{font:{size:9}},grid:{color:'#f3f4f6'}}}});
+    scales:{x:{ticks:{font:{size:8},maxRotation:0,maxTicksLimit:6},grid:{color:'rgba(56,189,248,0.07)'}},
+            y:{ticks:{font:{size:9}},grid:{color:'rgba(56,189,248,0.07)'}}}});
   if(hpSpd) hpSpd.destroy();
   hpSpd=new Chart(document.getElementById('hp-spd').getContext('2d'),{data:{labels,datasets:[
-    {type:'line',label:'Speed',data:vels,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.07)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true},
-    {type:'scatter',label:'Anomaly',data:sA,backgroundColor:'#ef4444',pointRadius:7,pointStyle:'triangle'}
+    {type:'line',label:'Speed',data:vels,borderColor:'#22d3ee',backgroundColor:'rgba(34,211,238,0.08)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true},
+    {type:'scatter',label:'Anomaly',data:sA,backgroundColor:'#ff2d55',pointRadius:7,pointStyle:'triangle'}
   ]},options:opts('kts')});
   if(hpAlt) hpAlt.destroy();
   hpAlt=new Chart(document.getElementById('hp-alt').getContext('2d'),{data:{labels,datasets:[
-    {type:'line',label:'Altitude',data:alts,borderColor:'#8b5cf6',backgroundColor:'rgba(139,92,246,0.07)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true},
-    {type:'scatter',label:'Anomaly',data:aA,backgroundColor:'#ef4444',pointRadius:7,pointStyle:'triangle'}
+    {type:'line',label:'Altitude',data:alts,borderColor:'#a855f7',backgroundColor:'rgba(168,85,247,0.08)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true},
+    {type:'scatter',label:'Anomaly',data:aA,backgroundColor:'#ff2d55',pointRadius:7,pointStyle:'triangle'}
   ]},options:opts('ft')});
   if(hpHdg) hpHdg.destroy();
   hpHdg=new Chart(document.getElementById('hp-hdg').getContext('2d'),{type:'line',data:{labels,datasets:[
-    {label:'Heading',data:hdgs,borderColor:'#f59e0b',backgroundColor:'rgba(245,158,11,0.07)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true}
+    {label:'Heading',data:hdgs,borderColor:'#ffb020',backgroundColor:'rgba(255,176,32,0.08)',borderWidth:2,pointRadius:0,fill:true,tension:0.3,spanGaps:true}
   ]},options:opts('deg')});
   document.getElementById('hp-evts').innerHTML=evts.length?evts.map(e=>
-    '<div class="evt '+e.sev+'"><div class="evtdot" style="background:'+(e.sev==='red'?'#ef4444':'#f97316')+'"></div>'+
+    '<div class="evt '+e.sev+'"><div class="evtdot" style="background:'+(e.sev==='red'?'#ff2d55':'#f97316')+'"></div>'+
     '<div><div class="evttime">'+esc(e.ts)+'</div><div class="evtmsg">'+esc(e.msg)+'</div></div></div>'
-  ).join(''):'<div style="color:#9ca3af;font-size:12px">No anomalies detected yet</div>';
+  ).join(''):'<div class="dim">No anomalies detected yet</div>';
 }
 
 // ── Map ───────────────────────────────────────────────────────
@@ -203,6 +215,8 @@ function initMap(){
     attribution:'OpenStreetMap / CARTO',subdomains:'abcd',maxZoom:19
   }).addTo(map);
   historicalLayerGroup=L.layerGroup().addTo(map);
+  conflictLayerGroup=L.layerGroup().addTo(map);
+  watchGhostGroup=L.layerGroup().addTo(map);
   const sel=document.getElementById('apt-sel');
   AIRPORTS.forEach(a=>{
     const o=document.createElement('option');
@@ -222,9 +236,9 @@ function drawAirports(){
   aptLayers.forEach(l=>map.removeLayer(l)); aptLayers=[];
   if(!document.getElementById('chk-apt').checked) return;
   AIRPORTS.forEach(a=>{
-    const c=L.circle([a.lat,a.lon],{radius:27780,color:'#3b82f6',fillColor:'#3b82f6',fillOpacity:0.04,weight:1,dashArray:'4 4',opacity:0.3}).addTo(map);
+    const c=L.circle([a.lat,a.lon],{radius:27780,color:'#22d3ee',fillColor:'#22d3ee',fillOpacity:0.03,weight:1,dashArray:'4 4',opacity:0.3}).addTo(map);
     const lbl=L.marker([a.lat,a.lon],{icon:L.divIcon({className:'',
-      html:'<div style="color:#93c5fd;font-size:10px;font-weight:600;white-space:nowrap;text-shadow:0 1px 3px #000">'+a.iata+'</div>',
+      html:'<div style="color:#67e8f9;font-size:10px;font-weight:600;white-space:nowrap;text-shadow:0 1px 3px #000">'+a.iata+'</div>',
       iconAnchor:[10,0]})}).addTo(map);
     aptLayers.push(c,lbl);
   });
@@ -240,8 +254,8 @@ function flyTo(){
 function drawCoverageArea(area){
   if(coverageCircle) map.removeLayer(coverageCircle);
   coverageCircle=L.circle([area.latitude,area.longitude],{
-    radius:area.radius_nm*1852,color:'#2563eb',fillColor:'#3b82f6',
-    fillOpacity:0.035,weight:2,dashArray:'7 5',interactive:false
+    radius:area.radius_nm*1852,color:'#22d3ee',fillColor:'#22d3ee',
+    fillOpacity:0.03,weight:1.5,dashArray:'7 5',interactive:false
   }).addTo(map);
 }
 
@@ -418,7 +432,7 @@ function renderHotspots(hotspots=hotspotData){
     const aircraftLinks=aircraftIds.slice(0,20).map(icao=>
       '<button class="view-hist" data-aircraft-details="'+esc(icao)+'" data-close-popup="1">'+esc(icao)+' details</button>'
     ).join('')+(aircraftIds.length>20?'<div style="font-size:10px;margin-top:4px">+'+esc(aircraftIds.length-20)+' more aircraft</div>':'');
-    const color={critical:'#ef4444',confirmed:'#f97316',emerging:'#eab308'}[confidence]||'#eab308';
+    const color={critical:'#ff2d55',confirmed:'#f97316',emerging:'#ffb020'}[confidence]||'#ffb020';
     const layer=L.circle([hotspot.lat,hotspot.lon],{
       radius:Math.min(180000,25000+Math.sqrt(count)*22000),
       color,fillColor:color,fillOpacity:Math.min(0.42,0.10+count/80),weight:1
@@ -492,18 +506,132 @@ function renderAircraft(ac){
 }
 
 function buildPopup(a){
-  const sp=spoofScore(a),col=sp>=60?'#ef4444':sp>=30?'#f97316':'#22c55e';
+  const sp=spoofScore(a),col=sp>=60?'#ff2d55':sp>=30?'#f97316':'#2fe6a7';
   const cls=checkMil(a)?'CONFIRMED MILITARY':(a.cls||'UNKNOWN').replace(/_/g,' ');
   const evts=acEvents[a.icao]||[];
   return '<div class="pt">'+esc(a.icao)+(a.cs?' - '+esc(a.cs):'')+'</div>'+
     '<div class="pr"><span class="pk">Classification</span><b>'+esc(cls)+'</b></div>'+
     '<div class="pr"><span class="pk">Spoof probability</span><b style="color:'+col+'">'+sp+'%</b></div>'+
+    (a.sqk?'<div class="pr"><span class="pk">Squawk</span><b style="color:#ffb020">'+esc(a.sqk)+(EMERGENCY_SQUAWKS[a.sqk]?' — '+EMERGENCY_SQUAWKS[a.sqk]:'')+'</b></div>':'')+
     '<div class="pr"><span class="pk">Altitude</span><span>'+(a.alt?a.alt.toLocaleString()+' ft':'--')+'</span></div>'+
     '<div class="pr"><span class="pk">Speed</span><span>'+(a.vel?Math.round(a.vel)+' kts':'--')+'</span></div>'+
     '<div class="pr"><span class="pk">Heading</span><span>'+(a.hdg?Math.round(a.hdg)+'deg':'--')+'</span></div>'+
     '<div class="pr"><span class="pk">Risk score</span><span>'+esc(a.risk||0)+'/100</span></div>'+
-    (evts.length?'<div class="pr"><span class="pk" style="color:#ef4444">Events</span><span style="color:#ef4444;font-weight:700">'+evts.length+'</span></div>':'')+
+    (evts.length?'<div class="pr"><span class="pk" style="color:#ff2d55">Events</span><span style="color:#ff2d55;font-weight:700">'+evts.length+'</span></div>':'')+
     '<button class="view-hist" data-open-panel="'+esc(a.icao)+'" data-close-popup="1">View History and Charts</button>';
+}
+
+// ── Watch: transponder shutoff + military activity ────────────
+const WATCH_KIND_LABEL={
+  TRANSPONDER_OFF:'TRANSPONDER OFF',
+  EMERGENCY_SQUAWK:'EMERGENCY SQUAWK',
+  MIL_CONCENTRATION:'MIL CONCENTRATION',
+  MIL_HIGH_PERFORMANCE:'HIGH PERFORMANCE',
+};
+
+function watchTime(value){
+  const d=new Date(value);
+  if(isNaN(d)) return String(value||'--');
+  return d.toISOString().substr(11,8)+'Z';
+}
+
+async function loadWatchSummary(){
+  const status=document.getElementById('watch-status');
+  try{
+    const r=await fetch(API+'/api/watch/summary');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    watchSummary=await r.json();
+    if(watchSummary.analysis_available===false){
+      status.textContent='Watch monitor starting — no snapshot yet';
+      status.className='watch-status';
+      return;
+    }
+    status.textContent='Live — scanned '+new Date(watchSummary.generated_at*1000).toISOString().substr(11,8)+' UTC';
+    status.className='watch-status ok';
+    document.getElementById('w-tracks').textContent=watchSummary.tracks_observed??'--';
+    document.getElementById('w-fresh').textContent=watchSummary.tracks_fresh??'--';
+    document.getElementById('w-ledger').textContent=watchSummary.ledger_size??'--';
+    const concentrations=Array.isArray(watchSummary.active_concentrations)?watchSummary.active_concentrations:[];
+    document.getElementById('w-conc').textContent=concentrations.length;
+    document.getElementById('w-persist').textContent=watchSummary.history_persistence?'PostgreSQL':'Redis only';
+    const wrap=document.getElementById('watch-conc-wrap');
+    if(concentrations.length){
+      wrap.style.display='block';
+      document.getElementById('watch-conc-list').innerHTML=concentrations.map(c=>
+        '<div class="conc-card"><b>'+esc(c.peak||0)+' aircraft</b> near '+esc(c.cell)+
+        ' · since '+watchTime((c.started||0)*1000)+' · peak '+esc(c.peak||0)+
+        '<br><span class="dim">'+esc((c.members||[]).join(', '))+'</span></div>'
+      ).join('');
+    } else {
+      wrap.style.display='none';
+    }
+  }catch(e){
+    watchSummary=null;
+    status.textContent='Watch monitor unreachable';
+    status.className='watch-status bad';
+  }
+}
+
+async function loadWatchEvents(){
+  try{
+    const hours=Number(document.getElementById('watch-hours').value);
+    const kind=watchKindFilter==='ALL'?'':'&kind='+encodeURIComponent(watchKindFilter);
+    const r=await fetch(API+'/api/watch/events?hours='+hours+'&limit=300'+kind);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    watchEvents=(await r.json()).events||[];
+    renderWatchFeed();
+    renderWatchGhosts();
+  }catch(e){
+    console.warn('[watch] events load failed:',e.message);
+  }
+}
+
+function renderWatchFeed(){
+  const feed=document.getElementById('watch-feed');
+  const pip=document.getElementById('watch-pip');
+  if(pip) pip.textContent=watchEvents.length>99?'99+':String(watchEvents.length);
+  if(!watchEvents.length){
+    feed.innerHTML='<div class="dim watch-empty">No watch events in this window. The monitor emits only with live-coverage proof.</div>';
+    return;
+  }
+  feed.innerHTML=watchEvents.map(event=>{
+    const kind=event.kind||'';
+    return '<div class="wevent k-'+esc(kind)+'" data-watch-lat="'+esc(event.lat??'')+'" data-watch-lon="'+esc(event.lon??'')+'">'+
+      '<div class="wt">'+watchTime(event.time)+'</div>'+
+      '<div class="wk">'+esc(WATCH_KIND_LABEL[kind]||kind)+'</div>'+
+      '<div class="ws">'+esc(event.summary||'')+'</div>'+
+      '<div class="wsev">SEV<b>'+esc(event.severity??'-')+'</b></div>'+
+    '</div>';
+  }).join('');
+}
+
+function renderWatchGhosts(){
+  if(!watchGhostGroup) return;
+  watchGhostGroup.clearLayers();
+  if(!document.getElementById('watch-ghosts').checked) return;
+  watchEvents.forEach(event=>{
+    if(event.lat==null||event.lon==null) return;
+    if(event.kind==='TRANSPONDER_OFF'){
+      const peers=event.meta?.live_peers_within_nm?.count;
+      L.circle([event.lat,event.lon],{
+        radius:30000,color:'#ff2d55',weight:1.5,dashArray:'5 5',
+        fillColor:'#ff2d55',fillOpacity:0.08
+      }).addTo(watchGhostGroup);
+      const marker=L.marker([event.lat,event.lon],{icon:L.divIcon({className:'',
+        html:'<div style="color:#ff2d55;font-size:15px;font-weight:700;text-shadow:0 0 9px #ff2d55">✕</div>',
+        iconAnchor:[7,8]})}).addTo(watchGhostGroup);
+      marker.bindPopup('<div class="pt">Last known — '+esc(event.callsign||event.icao24||'unknown')+'</div>'+
+        '<div class="pr"><span class="pk">Vanished</span><b>'+watchTime(event.time)+'</b></div>'+
+        '<div class="pr"><span class="pk">Last altitude</span><span>'+esc(event.meta?.last_alt_ft??'--')+' ft</span></div>'+
+        '<div class="pr"><span class="pk">Live peers nearby</span><span>'+esc(peers??'--')+'</span></div>'+
+        '<div style="color:#ff2d55;font-size:10px;margin-top:6px">Suspected transponder shutoff under proven-live coverage.</div>');
+    } else if(event.kind==='MIL_CONCENTRATION'){
+      L.circle([event.lat,event.lon],{
+        radius:60000,color:'#f97316',weight:1,dashArray:'3 4',
+        fillColor:'#f97316',fillOpacity:0.05
+      }).addTo(watchGhostGroup);
+    }
+  });
 }
 
 // ── Detection layer telemetry ─────────────────────────────────
@@ -518,11 +646,11 @@ async function updateLayerSummary(){
       el.textContent=(layer.triggered||0)+' / '+(layer.evaluated||0)+' / '+(layer.skipped||0);
       const reasons=Object.entries(layer.skipped_reasons||{}).map(([reason,count])=>count+'× '+reason);
       el.title=(layer.trigger_count||0)+' total triggers'+(reasons.length?'; skipped: '+reasons.join('; '):'');
-      el.style.color=layer.triggered?'#ef4444':layer.evaluated?'#22c55e':'#9ca3af';
+      el.style.color=layer.triggered?'#ff2d55':layer.evaluated?'#2fe6a7':'#5c6b84';
     });
   } catch(e) {
     ['L1','L2','L3','L4','L5'].forEach(name=>{
-      const el=document.getElementById('layer-'+name); if(el){el.textContent='offline';el.style.color='#9ca3af';}
+      const el=document.getElementById('layer-'+name); if(el){el.textContent='offline';el.style.color='#5c6b84';}
     });
   }
 }
@@ -535,7 +663,7 @@ async function updateLayerTriggers(){
     if(!r.ok) throw new Error('HTTP '+r.status);
     const data=await r.json();
     if(!data.triggers.length){
-      body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#9ca3af">No '+esc(layer)+' triggers in current tracks</td></tr>';
+      body.innerHTML='<tr><td colspan="5" class="td-dim">No '+esc(layer)+' triggers in current tracks</td></tr>';
       return;
     }
     body.innerHTML=data.triggers.map(t=>'<tr>'+
@@ -543,7 +671,7 @@ async function updateLayerTriggers(){
       '<td>'+esc(t.detector)+'</td><td>'+esc(t.type.replace(/_/g,' '))+'</td>'+
       '<td>+'+esc(t.score_delta)+'</td><td style="font-family:var(--mono);font-size:10px">'+esc(JSON.stringify(t.evidence))+'</td></tr>').join('');
   } catch(e) {
-    body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#991b1b">Layer telemetry unavailable</td></tr>';
+    body.innerHTML='<tr><td colspan="5" class="td-dim" style="color:#ff2d55">Layer telemetry unavailable</td></tr>';
   }
 }
 
@@ -560,23 +688,23 @@ function updateEDA(ac){
   if(ch1) ch1.destroy();
   ch1=new Chart(document.getElementById('ch-cls').getContext('2d'),{
     type:'doughnut',data:{labels:['Civilian','Likely Military','Confirmed Military','Dark','Unknown'],
-    datasets:[{data:Object.values(cc),backgroundColor:['#22c55e','#f97316','#ef4444','#8b5cf6','#9ca3af'],borderWidth:0}]},
+    datasets:[{data:Object.values(cc),backgroundColor:['#2fe6a7','#f97316','#ff2d55','#a855f7','#5c6b84'],borderWidth:0}]},
     options:{plugins:{legend:{position:'right',labels:{font:{size:10},boxWidth:10}}},cutout:'60%'}});
   const bins=new Array(10).fill(0);
   ac.forEach(a=>{const sp=spoofScore(a);bins[Math.min(9,Math.floor(sp/10))]++;});
   if(ch2) ch2.destroy();
   ch2=new Chart(document.getElementById('ch-prob').getContext('2d'),{
     type:'bar',data:{labels:['0-10','10-20','20-30','30-40','40-50','50-60','60-70','70-80','80-90','90-100'],
-    datasets:[{data:bins,backgroundColor:bins.map((_,i)=>i>=6?'#ef4444':i>=3?'#f97316':'#22c55e'),borderRadius:3,borderSkipped:false}]},
+    datasets:[{data:bins,backgroundColor:bins.map((_,i)=>i>=6?'#ff2d55':i>=3?'#f97316':'#2fe6a7'),borderRadius:2,borderSkipped:false}]},
     options:{plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:9}}},y:{beginAtZero:true}}}});
   const tbody=document.getElementById('stb');
   const rows=[...ac].map(a=>({...a,sp:spoofScore(a)})).filter(a=>a.sp>0).sort((a,b)=>b.sp-a.sp).slice(0,50);
-  if(!rows.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:18px">No suspicious aircraft detected.</td></tr>';return;}
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="9" class="td-dim">No suspicious aircraft detected.</td></tr>';return;}
   tbody.innerHTML=rows.map(a=>{
     const cls=checkMil(a)?'CONFIRMED_MILITARY':(a.cls||'UNKNOWN');
     const cb={CIVILIAN:'civil',LIKELY_MILITARY:'likely',CONFIRMED_MILITARY:'mil',DARK_AIRCRAFT:'dark',UNKNOWN:'dark'}[cls]||'civil';
     const sb=a.sp>=60?'spoof':a.sp>=30?'sus':'clean';
-    const bc=a.sp>=60?'#ef4444':a.sp>=30?'#f97316':'#22c55e';
+    const bc=a.sp>=60?'#ff2d55':a.sp>=30?'#f97316':'#2fe6a7';
     const evts=acEvents[a.icao]||[];
     const anomalyText=a.anoms?.join(', ').replace(/_/g,' ')||'--';
     return '<tr style="cursor:pointer" data-open-panel="'+esc(a.icao)+'" data-switch-tab="map">'+
@@ -588,7 +716,7 @@ function updateEDA(ac){
       '<td>'+(a.vel!=null?Math.round(a.vel):'--')+'</td>'+
       '<td><span class="badge '+cb+'">'+esc(cls.replace(/_/g,' '))+'</span></td>'+
       '<td><div class="pb"><div class="pb-bar"><div class="pb-fill" style="width:'+a.sp+'%;background:'+bc+'"></div></div><span class="badge '+sb+'">'+a.sp+'%</span></div></td>'+
-      '<td style="font-size:11px;color:#6b7280;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(evts.length?evts.length+' events | ':'')+esc(anomalyText)+'</td>'+
+      '<td style="font-size:11px;color:var(--text2);max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(evts.length?evts.length+' events | ':'')+esc(anomalyText)+'</td>'+
     '</tr>';
   }).join('');
 }
@@ -611,9 +739,9 @@ function handleCSV(input){
     b.textContent='Loaded '+csvRows.length.toLocaleString()+' rows — '+sp.toLocaleString()+' spoofed, '+(csvRows.length-sp).toLocaleString()+' clean — '+file.name;
     document.getElementById('ai-preview').style.display='block';
     document.getElementById('ai-row-count').textContent='(first 20 rows shown)';
-    document.getElementById('ai-thead').innerHTML='<tr>'+csvHeaders.map(h=>'<th style="padding:6px 10px;font-size:10px;font-weight:600;color:var(--text2);border-bottom:1px solid var(--border);background:var(--bg2)">'+esc(h)+'</th>').join('')+'</tr>';
+    document.getElementById('ai-thead').innerHTML='<tr>'+csvHeaders.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr>';
     document.getElementById('ai-tbody').innerHTML=csvRows.slice(0,20).map(r=>
-      '<tr>'+csvHeaders.map(h=>'<td style="padding:5px 10px;border-bottom:1px solid var(--border);color:'+(r.IsSpoofed==='1'?'#991b1b':'var(--text)')+'">'+esc(r[h]||'--')+'</td>').join('')+'</tr>'
+      '<tr>'+csvHeaders.map(h=>'<td style="color:'+(r.IsSpoofed==='1'?'#ff2d55':'var(--text)')+'">'+esc(r[h]||'--')+'</td>').join('')+'</tr>'
     ).join('');
     document.getElementById('ai-btn').style.display='inline-block';
     buildAICharts(csvRows);
@@ -635,14 +763,14 @@ function buildAICharts(rows){
   });
   if(aiRC) aiRC.destroy();
   aiRC=new Chart(document.getElementById('ai-rc').getContext('2d'),{
-    type:'doughnut',data:{labels:Object.keys(reasons),datasets:[{data:Object.values(reasons),backgroundColor:['#ef4444','#f97316','#8b5cf6','#3b82f6','#f59e0b','#9ca3af'],borderWidth:0}]},
+    type:'doughnut',data:{labels:Object.keys(reasons),datasets:[{data:Object.values(reasons),backgroundColor:['#ff2d55','#f97316','#a855f7','#22d3ee','#ffb020','#5c6b84'],borderWidth:0}]},
     options:{plugins:{legend:{position:'right',labels:{font:{size:10},boxWidth:10}}},cutout:'55%',maintainAspectRatio:false}});
   const bins=new Array(12).fill(0);
   spoofed.forEach(r=>{const s=parseFloat(r.Speed_knots);if(!isNaN(s)&&s>=0) bins[Math.min(11,Math.floor(s/100))]++;});
   if(aiSC) aiSC.destroy();
   aiSC=new Chart(document.getElementById('ai-sc').getContext('2d'),{
     type:'bar',data:{labels:['0-100','100-200','200-300','300-400','400-500','500-600','600-700','700-800','800-900','900-1000','1000-1100','1100+'],
-    datasets:[{data:bins,backgroundColor:bins.map((_,i)=>i>=10?'#ef4444':i>=8?'#f97316':'#3b82f6'),borderRadius:3,borderSkipped:false}]},
+    datasets:[{data:bins,backgroundColor:bins.map((_,i)=>i>=10?'#ff2d55':i>=8?'#f97316':'#22d3ee'),borderRadius:2,borderSkipped:false}]},
     options:{plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:8},maxRotation:45}},y:{beginAtZero:true}},maintainAspectRatio:false}});
   const tot=rows.length,nSp=spoofed.length;
   const msgTypes={};
@@ -650,9 +778,9 @@ function buildAICharts(rows){
   const topMsg=Object.entries(msgTypes).sort((a,b)=>b[1]-a[1])[0];
   document.getElementById('ai-stat-grid').innerHTML=[
     ['Total records',tot.toLocaleString(),'var(--text)'],
-    ['Labeled suspicious',nSp.toLocaleString(),'#ef4444'],
+    ['Labeled suspicious',nSp.toLocaleString(),'#ff2d55'],
     ['Label rate',((nSp/tot)*100).toFixed(1)+'%','#f97316'],
-    ['Top msg type',topMsg?topMsg[0]:'--','#8b5cf6'],
+    ['Top msg type',topMsg?topMsg[0]:'--','#a855f7'],
   ].map(([l,v,c])=>'<div class="sc"><div class="v" style="color:'+c+'">'+esc(v)+'</div><div class="l">'+esc(l)+'</div></div>').join('');
 }
 
@@ -664,7 +792,6 @@ async function runAIAnalysis(){
   try{
     setP('Sampling dataset...');
     const spoofed=csvRows.filter(r=>r.IsSpoofed==='1').slice(0,40);
-    const clean=csvRows.filter(r=>r.IsSpoofed!=='1').slice(0,15);
     const tot=csvRows.length,nSp=csvRows.filter(r=>r.IsSpoofed==='1').length;
     const reasons={};
     spoofed.forEach(r=>{
@@ -703,14 +830,14 @@ async function runAIAnalysis(){
     buildAICharts(csvRows);
     document.getElementById('ai-table').innerHTML=explained.map(r=>
       '<tr>'+
-      '<td style="font-weight:600;font-family:var(--mono);font-size:11px;color:#991b1b">'+esc(r.AircraftID)+'</td>'+
+      '<td style="font-weight:600;font-family:var(--mono);font-size:11px;color:#ff2d55">'+esc(r.AircraftID)+'</td>'+
       '<td>'+esc(r.FlightNumber||'--')+'</td>'+
       '<td style="font-family:var(--mono);font-size:11px">'+esc(r.Latitude||'--')+' / '+esc(r.Longitude||'--')+'</td>'+
-      '<td style="color:'+(r.Altitude_ft==='999999'?'#ef4444':'var(--text)')+'">'+esc(r.Altitude_ft||'--')+'</td>'+
-      '<td style="color:'+(parseFloat(r.Speed_knots)<0?'#ef4444':'var(--text)')+'">'+esc(r.Speed_knots||'--')+'</td>'+
+      '<td style="color:'+(r.Altitude_ft==='999999'?'#ff2d55':'var(--text)')+'">'+esc(r.Altitude_ft||'--')+'</td>'+
+      '<td style="color:'+(parseFloat(r.Speed_knots)<0?'#ff2d55':'var(--text)')+'">'+esc(r.Speed_knots||'--')+'</td>'+
       '<td style="font-size:11px;color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(r.MessageContent||'--')+'</td>'+
-      '<td style="font-size:11px;color:#991b1b;max-width:200px">'+esc(r._reason)+'</td>'+
-      '<td><div class="pb"><div class="pb-bar"><div class="pb-fill" style="width:'+r._conf+'%;background:'+(r._conf>90?'#ef4444':'#f97316')+'"></div></div><b style="font-size:11px;color:'+(r._conf>90?'#ef4444':'#f97316')+'">'+r._conf+'%</b></div></td>'+
+      '<td style="font-size:11px;color:#ff2d55;max-width:200px">'+esc(r._reason)+'</td>'+
+      '<td><div class="pb"><div class="pb-bar"><div class="pb-fill" style="width:'+r._conf+'%;background:'+(r._conf>90?'#ff2d55':'#f97316')+'"></div></div><b style="font-size:11px;color:'+(r._conf>90?'#ff2d55':'#f97316')+'">'+r._conf+'%</b></div></td>'+
       '</tr>'
     ).join('');
   } catch(err){
@@ -734,7 +861,7 @@ function analyzeManual(){
     risk:0,anoms:[],cls:'UNKNOWN'};
   const sp=spoofScore(a),mil=checkMil(a);
   const cls=mil?'CONFIRMED MILITARY':sp>=60?'HEURISTIC ALERT':sp>=30?'SUSPICIOUS':'CIVILIAN';
-  const col=sp>=60?'#ef4444':sp>=30?'#f97316':'#22c55e';
+  const col=sp>=60?'#ff2d55':sp>=30?'#f97316':'#2fe6a7';
   const reasons=[];
   if(a.lat<-90||a.lat>90)   reasons.push('Latitude out of valid range (-90 to 90)');
   if(a.lon<-180||a.lon>180) reasons.push('Longitude out of valid range (-180 to 180)');
@@ -753,7 +880,7 @@ function analyzeManual(){
     '<div class="rr"><span class="k">Speed</span><span>'+(isNaN(a.vel)?'--':a.vel+' kts')+'</span></div>'+
     (reasons.length?'<div class="rr" style="flex-direction:column;gap:4px"><span class="k">Detection reasons</span>'+
       reasons.map(r=>'<span style="color:#ef4444;font-size:12px">+ '+esc(r)+'</span>').join('')+'</div>':
-    '<div class="rr"><span class="k">Detection reasons</span><span style="color:#22c55e">No anomalies detected</span></div>');
+    '<div class="rr"><span class="k">Detection reasons</span><span style="color:#2fe6a7">No anomalies detected</span></div>');
 }
 
 // ── WebSocket + REST polling ──────────────────────────────────
@@ -793,9 +920,10 @@ function normalise(raw, src) {
   const hdg    = raw.track ?? raw.heading ?? raw.true_track ?? null;
   const vr     = raw.baro_rate ?? raw.vertical_rate ?? null;
   const cs     = (raw.flight ?? raw.callsign ?? raw.FlightNumber ?? '').trim() || null;
+  const sqk    = (raw.sqk ?? raw.squawk ?? '').toString().trim() || null;
 
   return {
-    icao, cs,
+    icao, cs, sqk,
     lat, lon,
     alt: alt != null ? parseInt(alt) : null,
     vel: vel != null ? parseFloat(vel) : null,
@@ -810,10 +938,39 @@ function normalise(raw, src) {
 function updateSourceStatus(key, count, ok) {
   const el = document.getElementById('src-' + key);
   if (!el) return;
-  el.style.color   = ok ? '#166534' : '#991b1b';
-  el.style.fontWeight = ok ? '600' : '400';
-  el.textContent   = ({ backend: 'Docker backend', live: 'Server live feed' }[key] || key)
-                   + ': ' + (ok ? count.toLocaleString() + ' aircraft' : 'failed');
+  el.className = 'src ' + (ok ? 'ok' : 'bad');
+  const label=({ backend: 'Docker backend', live: 'Server live feed', conflicts: 'Passive conflicts' }[key] || key);
+  const unit=key==='conflicts' ? ' projections' : ' aircraft';
+  el.textContent=label+': '+(ok ? count.toLocaleString()+unit : 'failed');
+}
+
+function conflictLineEndpoints(first,second){
+  const firstLat=Number(first.lat),firstLon=Number(first.lon);
+  const secondLat=Number(second.lat); let secondLon=Number(second.lon);
+  const delta=secondLon-firstLon;
+  if(delta>180) secondLon-=360;
+  else if(delta<-180) secondLon+=360;
+  return [[firstLat,firstLon],[secondLat,secondLon]];
+}
+
+function renderConflicts(){
+  if(!conflictLayerGroup) return;
+  conflictLayerGroup.clearLayers();
+  const conflicts=Array.isArray(_conflictAnalysis.conflicts) ? _conflictAnalysis.conflicts : [];
+  const counter=document.getElementById('cconf');
+  if(counter) counter.textContent=conflicts.length.toLocaleString();
+  const toggle=document.getElementById('chk-conflicts');
+  if(toggle&&!toggle.checked) return;
+  conflicts.slice(0,500).forEach(conflict=>{
+    const pair=Array.isArray(conflict.pair) ? conflict.pair : [];
+    const first=_backendCache[pair[0]],second=_backendCache[pair[1]];
+    if(!first||!second||!Number.isFinite(Number(first.lat))||!Number.isFinite(Number(first.lon))||
+       !Number.isFinite(Number(second.lat))||!Number.isFinite(Number(second.lon))) return;
+    const critical=conflict.severity==='PREDICTED_LOSS_OF_SEPARATION';
+    L.polyline(conflictLineEndpoints(first,second),{
+      color:critical?'#ff2d55':'#ffb020',weight:critical?3:2,dashArray:'6 5',opacity:0.9,interactive:false
+    }).addTo(conflictLayerGroup);
+  });
 }
 
 function mergeAndRender() {
@@ -821,6 +978,7 @@ function mergeAndRender() {
   Object.assign(merged, _backendCache);
   const aircraft = Object.values(merged).filter(insideCoverage);
   renderAircraft(aircraft);
+  renderConflicts();
   updateEDA(aircraft);
   const b = document.getElementById('banner');
   b.className   = 'banner green';
@@ -841,7 +999,12 @@ function connectWS() {
       if (m.type === 'snapshot' && Array.isArray(m.aircraft)) {
         _backendCache = {};
         m.aircraft.forEach(a => { if (a.icao) _backendCache[a.icao] = a; });
+        _conflictAnalysis=m.conflict_analysis&&typeof m.conflict_analysis==='object'
+          ? m.conflict_analysis : {conflicts:[]};
         updateSourceStatus('backend', m.aircraft.length, true);
+        const conflictReady=_conflictAnalysis.analysis_available!==false;
+        updateSourceStatus('conflicts',conflictReady?
+          (Array.isArray(_conflictAnalysis.conflicts)?_conflictAnalysis.conflicts.length:0):0,conflictReady);
         mergeAndRender();
       }
     } catch (err) {}
@@ -850,6 +1013,8 @@ function connectWS() {
     setWS('disconnected');
     _backendAlive = false;
     _backendCache = {};
+    _conflictAnalysis={conflicts:[]};
+    updateSourceStatus('conflicts', 0, false);
     mergeAndRender();
     setTimeout(connectWS, 5000);
   };
@@ -880,12 +1045,6 @@ async function pollLive() {
   }
 }
 
-function onData(aircraft) {
-  _backendCache = {};
-  aircraft.forEach(a => { if (a.icao) _backendCache[a.icao] = a; });
-  mergeAndRender();
-}
-
 function setWS(s) {
   document.getElementById('wsd').className   = 'wsd ' + s;
   document.getElementById('wslbl').textContent = {
@@ -899,12 +1058,57 @@ function switchTab(name) {
   document.querySelectorAll('.tc').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  document.querySelectorAll('.tab')[{map:0,eda:1,ai:2,code:3,manual:4}[name]].classList.add('active');
+  const tab=document.querySelector('.tab[data-tab="'+name+'"]');
+  if(tab) tab.classList.add('active');
   if (name === 'map') setTimeout(() => map.invalidateSize(), 50);
 }
 
+function tickClock(){
+  const el=document.getElementById('utc-clock');
+  if(el) el.textContent=new Date().toISOString().substr(11,8)+' UTC';
+}
+
+function wireControls(){
+  document.querySelectorAll('.tab').forEach(tab=>
+    tab.addEventListener('click',()=>switchTab(tab.dataset.tab)));
+  document.getElementById('hp-close').addEventListener('click',closePanel);
+  document.getElementById('chk-spoof').addEventListener('change',applyFilters);
+  document.getElementById('chk-mil').addEventListener('change',applyFilters);
+  document.getElementById('chk-apt').addEventListener('change',drawAirports);
+  document.getElementById('chk-conflicts').addEventListener('change',renderConflicts);
+  document.getElementById('watch-ghosts').addEventListener('change',renderWatchGhosts);
+  document.getElementById('apt-sel').addEventListener('change',flyTo);
+  document.getElementById('coverage-airport').addEventListener('change',selectCoverageAirport);
+  document.getElementById('coverage-map-center').addEventListener('click',useMapCenterForCoverage);
+  document.getElementById('coverage-apply').addEventListener('click',applyCoverage);
+  document.getElementById('world-scan-toggle').addEventListener('click',updateWorldScan);
+  document.getElementById('history-window').addEventListener('change',loadHistoricalAnomalies);
+  document.getElementById('history-markers').addEventListener('change',()=>renderHistoricalAnomalies());
+  document.getElementById('hotspot-layer').addEventListener('change',()=>renderHotspots());
+  document.getElementById('layer-select').addEventListener('change',updateLayerTriggers);
+  document.getElementById('ai-dropzone').addEventListener('click',()=>document.getElementById('ai-file').click());
+  document.getElementById('ai-file').addEventListener('change',function(){handleCSV(this);});
+  document.getElementById('ai-btn').addEventListener('click',runAIAnalysis);
+  document.getElementById('m-analyze').addEventListener('click',analyzeManual);
+  document.getElementById('watch-hours').addEventListener('change',loadWatchEvents);
+  document.querySelectorAll('.wfilter').forEach(button=>
+    button.addEventListener('click',()=>{
+      document.querySelectorAll('.wfilter').forEach(b=>b.classList.remove('active'));
+      button.classList.add('active');
+      watchKindFilter=button.dataset.wkind;
+      loadWatchEvents();
+    }));
+}
+
 window.addEventListener('DOMContentLoaded', () => {
+  wireControls();
   document.addEventListener('click', event => {
+    const watchTarget=event.target.closest('[data-watch-lat]');
+    if(watchTarget&&watchTarget.dataset.watchLat){
+      switchTab('map');
+      map.flyTo([Number(watchTarget.dataset.watchLat),Number(watchTarget.dataset.watchLon)],8,{duration:0.8});
+      return;
+    }
     const detailTarget=event.target.closest('[data-aircraft-details]');
     if(detailTarget){
       if(detailTarget.dataset.closePopup==='1') map.closePopup();
@@ -930,9 +1134,15 @@ window.addEventListener('DOMContentLoaded', () => {
   pollLive();
   setInterval(pollLive, 12000);
 
+  loadWatchSummary();
+  loadWatchEvents();
+  setInterval(()=>{ loadWatchSummary(); loadWatchEvents(); }, 20000);
+
   updateLayerSummary();
   updateLayerTriggers();
   setInterval(()=>{ updateLayerSummary(); updateLayerTriggers(); }, 15000);
   setInterval(()=>{ loadWorldScan(); loadCoverage(); }, 30000);
   setInterval(loadHistoricalAnomalies, 60000);
+  tickClock();
+  setInterval(tickClock, 1000);
 });

@@ -230,6 +230,7 @@ class SourceReport(FiniteBaseModel):
     velocity:   Optional[float] = None
     heading:    Optional[float] = None
     vertical_rate: Optional[int] = None
+    on_ground:  Optional[bool]  = None
     weight:     float           = 1.0
     confidence: float           = 1.0
     timestamp:  float           = Field(default_factory=time.time)
@@ -290,6 +291,7 @@ class StateVector(FiniteBaseModel):
     vertical_rate:  Optional[int]   = None
     nic:            Optional[int]   = None
     nac_p:          Optional[int]   = None
+    squawk:         Optional[str]   = None
     on_ground:      bool            = False
 
     # Data provenance
@@ -367,6 +369,7 @@ class StateVector(FiniteBaseModel):
             "vr":       self.vertical_rate,
             "nic":      self.nic,
             "nac_p":    self.nac_p,
+            "sqk":      self.squawk,
             "gnd":      self.on_ground,
             "src":      self.primary_source.value,
             "conf":     round(self.confidence, 3),

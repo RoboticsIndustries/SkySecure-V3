@@ -82,6 +82,27 @@ class Settings(BaseSettings):
     MIL_BASE_RADIUS_NM:      float = 50.0
     MIL_SCORE_THRESHOLD:     float = 0.5
 
+    # ─── Watch Monitor (transponder-off + military activity) ───
+    WATCH_SCAN_INTERVAL_SEC:    int   = 15
+    WATCH_FRESH_SEC:            int   = 45      # state vector counts as live
+    WATCH_SILENCE_SEC:          int   = 120     # airborne track silent this long → candidate
+    WATCH_MIN_ALT_FT:           int   = 1500    # below this, loss is consistent with landing
+    WATCH_MIN_SPEED_KTS:        float = 60.0    # below this, loss is consistent with taxi/park
+    WATCH_MIN_UPDATES:          int   = 3       # dwell before a track is disappearance-eligible
+    WATCH_PEER_RADIUS_NM:       float = 30.0    # coverage-liveness proof radius
+    WATCH_MIN_PEERS:            int   = 3       # live peers required to rule out feed outage
+    WATCH_LEDGER_TTL_SEC:       int   = 21600   # 6h track ledger retention
+    WATCH_LEDGER_MAX:           int   = 20000
+    WATCH_MIL_SCORE_MIN:        float = 0.5
+    WATCH_MIL_CONCENTRATION_RADIUS_NM: float = 60.0
+    WATCH_MIL_CONCENTRATION_MIN:      int   = 4
+    WATCH_MIL_CONCENTRATION_HOLD_SEC: int   = 900   # sustained window before a cell clears
+    WATCH_HIGH_PERF_SPEED_KTS:  float = 540.0
+    WATCH_HIGH_PERF_MAX_ALT_FT: int   = 20000
+    WATCH_HIGH_PERF_VRATE_FPM:  int   = 6000
+    WATCH_EVENT_DEDUP_SEC:      int   = 900
+    WATCH_RECENT_EVENTS_MAX:    int   = 300
+
     # ─── API ───────────────────────────────────────────────────
     API_HOST:                str   = "0.0.0.0"
     API_PORT:                int   = 8000

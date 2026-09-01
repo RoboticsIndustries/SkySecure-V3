@@ -47,6 +47,10 @@ from models import RawADSBMessage, StateVector, RiskBand, Classification, Detect
 from config import settings, KAFKA_CONSUMER_STABILITY
 from kafka_offsets import commit_record
 from receiver_auth import validate_receiver_credentials as validate_receiver_key_map
+from processing.conflict_schema import (
+    conflict_snapshot_schema_is_valid,
+    unavailable_conflict_snapshot,
+)
 from processing.mlat_solver import (
     geodetic_to_ecef, physical_reception_key, receiver_geometry_is_safe,
     validate_receiver_configuration,
@@ -102,6 +106,68 @@ HOTSPOT_ALLOWED_HOURS = frozenset({0, 1, 24, 168, 720})
 mlat_reception_producer: Optional[AIOKafkaProducer] = None
 _ws_clients: set[WebSocket] = set()
 _track_snapshot: List[Dict[str, Any]] = []
+CONFLICT_SNAPSHOT_KEY = "conflict:latest"
+MAX_CONFLICT_SNAPSHOT_BYTES = 1_000_000
+def _unavailable_conflict_snapshot(reason: str) -> Dict[str, Any]:
+    return unavailable_conflict_snapshot(0.0, reason)
+
+
+_conflict_snapshot: Dict[str, Any] = _unavailable_conflict_snapshot(
+    "monitor_snapshot_unavailable"
+)
+
+
+async def _load_shared_conflict_snapshot() -> Dict[str, Any]:
+    if redis_client is None:
+        return _unavailable_conflict_snapshot("redis_unavailable")
+    try:
+        raw = await redis_client.get(CONFLICT_SNAPSHOT_KEY)
+    except Exception:
+        return _unavailable_conflict_snapshot("conflict_snapshot_read_failed")
+    if not raw:
+        return _unavailable_conflict_snapshot("monitor_snapshot_unavailable")
+    if len(raw) > MAX_CONFLICT_SNAPSHOT_BYTES:
+        return _unavailable_conflict_snapshot("monitor_snapshot_too_large")
+    try:
+        snapshot = orjson.loads(raw)
+    except Exception:
+        return _unavailable_conflict_snapshot("malformed_monitor_snapshot")
+    if not isinstance(snapshot, dict):
+        return _unavailable_conflict_snapshot("malformed_monitor_snapshot")
+    if not conflict_snapshot_schema_is_valid(snapshot):
+        return _unavailable_conflict_snapshot("invalid_conflict_snapshot_schema")
+    conflicts = snapshot["conflicts"]
+    if any(
+        not isinstance(item, dict)
+        or item.get("operational_advisory") is not False
+        or any(field in item for field in ("command", "climb", "descend"))
+        for item in conflicts
+    ):
+        return _unavailable_conflict_snapshot("malformed_monitor_snapshot")
+    return snapshot
+
+
+def _conflicts_for_tracks(
+    analysis: Dict[str, Any], tracks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Scope cached pair evidence to the exact published track snapshot."""
+    aircraft = {
+        str(track.get("icao") or "").upper()
+        for track in tracks
+        if isinstance(track, dict) and track.get("icao")
+    }
+    scoped = dict(analysis)
+    scoped["conflicts"] = [
+        conflict
+        for conflict in analysis.get("conflicts", [])
+        if isinstance(conflict, dict)
+        and isinstance(conflict.get("pair"), list)
+        and len(conflict["pair"]) == 2
+        and all(str(icao).upper() in aircraft for icao in conflict["pair"])
+    ]
+    scoped["active_conflict_count"] = len(scoped["conflicts"])
+    scoped["scope"] = "coverage_filtered"
+    return scoped
 _SCAN_CURSORS: Dict[str, int] = {}
 _SCAN_SNAPSHOTS: Dict[str, Dict[Any, None]] = {}
 _SCAN_BUILDING: Dict[str, Dict[Any, None]] = {}
@@ -1596,6 +1662,87 @@ async def get_anomaly_hotspots(
         return result
 
 
+@app.get("/api/watch/events")
+async def get_watch_events(
+    kind: Optional[str] = Query(None),
+    hours: int = Query(24, ge=0, le=8760),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Durable watch events: transponder shutoffs, emergency squawks, military activity."""
+    if postgres_pool is None:
+        raise HTTPException(status_code=503, detail="Watch event store unavailable")
+    allowed_kinds = {
+        "TRANSPONDER_OFF", "EMERGENCY_SQUAWK", "MIL_CONCENTRATION",
+        "MIL_HIGH_PERFORMANCE",
+    }
+    if kind is not None and kind not in allowed_kinds:
+        raise HTTPException(
+            status_code=422,
+            detail=f"kind must be one of {sorted(allowed_kinds)}",
+        )
+    clauses = ["time >= NOW() - ($1 * INTERVAL '1 hour')"]
+    params: List[Any] = [hours if hours else 8760]
+    if kind is not None:
+        clauses.append(f"kind = ${len(params) + 1}")
+        params.append(kind)
+    params.append(limit)
+    rows = await postgres_pool.fetch(
+        f"""
+        SELECT event_id, time, kind, icao24, callsign, severity,
+               summary, lat, lon, meta
+        FROM watch_events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY time DESC
+        LIMIT ${len(params)}
+        """,
+        *params,
+    )
+    events = []
+    for row in rows:
+        event = dict(row)
+        if isinstance(event.get("time"), datetime):
+            event["time"] = event["time"].isoformat()
+        if isinstance(event.get("meta"), str):
+            event["meta"] = orjson.loads(event["meta"])
+        events.append(event)
+    return {"count": len(events), "hours": hours, "events": events}
+
+
+WATCH_SNAPSHOT_KEY = "watch:snapshot"
+WATCH_RECENT_KEY = "watch:events:recent"
+
+
+@app.get("/api/watch/summary")
+async def get_watch_summary():
+    """Live watch-monitor status: analysis health and active concentrations."""
+    unavailable = {
+        "analysis_available": False,
+        "reason": "watch monitor has not published a snapshot yet",
+        "active_concentrations": [],
+        "recent_events": [],
+    }
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    raw = await redis_client.get(WATCH_SNAPSHOT_KEY)
+    if not raw:
+        return unavailable
+    try:
+        snapshot = orjson.loads(raw)
+    except (ValueError, TypeError):
+        return unavailable
+    if not isinstance(snapshot, dict) or snapshot.get("analysis_available") is not True:
+        return unavailable
+    recent_raw = await redis_client.lrange(WATCH_RECENT_KEY, 0, 49)
+    recent = []
+    for payload in recent_raw:
+        try:
+            recent.append(orjson.loads(payload))
+        except (ValueError, TypeError):
+            continue
+    snapshot["recent_events"] = recent
+    return snapshot
+
+
 @app.get("/api/stats")
 async def get_stats():
     if redis_client is None:
@@ -1704,6 +1851,12 @@ def _empty_layer_summary() -> Dict[str, Dict[str, Any]]:
     }
 
 
+@app.get("/api/conflicts")
+async def get_conflicts():
+    """Return the latest bounded monitor-owned passive conflict snapshot."""
+    return await _load_shared_conflict_snapshot()
+
+
 @app.get("/api/layers")
 async def get_layer_summary():
     """Return evaluated/skipped/triggered counts for every canonical layer."""
@@ -1765,6 +1918,23 @@ async def get_layer_summary():
             layers["L1"]["detectors"]["cross_source_position"] = (
                 layers["L1"]["detectors"].get("cross_source_position", 0) + 1
             )
+
+    relational_conflicts = _conflict_snapshot.get("conflicts") or []
+    severity_counts: Dict[str, int] = {}
+    for conflict in relational_conflicts:
+        if not isinstance(conflict, dict):
+            continue
+        severity = str(conflict.get("severity") or "UNKNOWN")
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+    layers["L2"]["relational_analysis"] = {
+        "detector": "aircraft_conflict_projection",
+        "mode": "PASSIVE_NON_OPERATIONAL",
+        "evaluated_tracks": int(_conflict_snapshot.get("evaluated_tracks") or 0),
+        "candidate_pairs": int(_conflict_snapshot.get("candidate_pairs") or 0),
+        "conflict_count": len(relational_conflicts),
+        "severity_counts": severity_counts,
+        "truncated": bool(_conflict_snapshot.get("truncated", False)),
+    }
 
     return {"timestamp": time.time(), "tracks": len(vectors), "layers": layers}
 
@@ -1949,6 +2119,22 @@ async def mlat_readiness():
 
 # ─── WebSocket ────────────────────────────────────────────────────────────────
 
+def _build_snapshot_message(
+    tracks: List[Dict[str, Any]], *, now: Optional[float] = None,
+    conflict_analysis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    timestamp = time.time() if now is None else float(now)
+    analysis = _conflict_snapshot if conflict_analysis is None else conflict_analysis
+    return {
+        "type": "snapshot",
+        "ts": timestamp,
+        "count": len(tracks),
+        "aircraft": tracks,
+        "conflict_analysis": analysis,
+        "tdoa_enabled": TDOA_AVAILABLE,
+    }
+
+
 @app.websocket("/ws/tracks")
 async def ws_tracks(websocket: WebSocket):
     if not _websocket_origin_allowed(websocket):
@@ -1964,13 +2150,9 @@ async def ws_tracks(websocket: WebSocket):
         async with lock:
             area = await load_coverage_area(redis_client)
             initial_tracks = [track for track in _track_snapshot if _track_in_coverage(track, area)]
-            payload = orjson.dumps({
-                "type":     "snapshot",
-                "ts":       time.time(),
-                "count":    len(initial_tracks),
-                "aircraft": initial_tracks,
-                "tdoa_enabled": TDOA_AVAILABLE,
-            })
+            payload = orjson.dumps(_build_snapshot_message(
+                initial_tracks, conflict_analysis=_conflict_snapshot,
+            ))
             await asyncio.wait_for(websocket.send_bytes(payload), timeout=1.0)
 
         while True:
@@ -1991,24 +2173,24 @@ async def ws_tracks(websocket: WebSocket):
 # ─── Background: broadcast loop ───────────────────────────────────────────────
 
 async def _publish_track_snapshot(tracks: List[Dict[str, Any]]) -> None:
-    """Atomically publish only tracks belonging to the active coverage area."""
-    global _track_snapshot
+    """Atomically publish tracks plus the shared monitor-owned conflict snapshot."""
+    global _track_snapshot, _conflict_snapshot
     if redis_client is None:
         return
+    shared_conflicts = await _load_shared_conflict_snapshot()
     lock = redis_client.lock(COVERAGE_LOCK_KEY, timeout=10, blocking_timeout=5)
     async with lock:
         area = await load_coverage_area(redis_client)
         tracks = [track for track in tracks if _track_in_coverage(track, area)]
+        shared_conflicts = _conflicts_for_tracks(shared_conflicts, tracks)
         _track_snapshot = tracks
+        _conflict_snapshot = shared_conflicts
+        message = _build_snapshot_message(
+            tracks, conflict_analysis=shared_conflicts,
+        )
         if not _ws_clients:
             return
-        payload = orjson.dumps({
-            "type": "snapshot",
-            "ts": time.time(),
-            "count": len(tracks),
-            "aircraft": tracks,
-            "tdoa_enabled": TDOA_AVAILABLE,
-        })
+        payload = orjson.dumps(message)
         clients = list(_ws_clients)
         await lock.extend(10, replace_ttl=True)
         results = await asyncio.gather(

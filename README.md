@@ -51,12 +51,14 @@ Without receiver hardware, the public-feed, kinematic, trajectory-fallback, inte
 | Public ADS-B collection | Implemented with OpenSky/public-feed fallback behavior and runtime coverage selection |
 | Canonical track fusion | Implemented with source event ordering, per-aircraft serialization, Redis state, PostgreSQL history, and Kafka outbox delivery |
 | L1 public-source comparison | Implemented, rate-limited, and explicitly not physical TDOA |
-| L2 physics/statistical checks | Implemented with restart-persistent baselines |
+| L2 physics/statistical checks | Implemented with restart-persistent baselines and passive public-feed aircraft-pair conflict projection |
 | L3 integrity | NIC and NACp integrity evidence are implemented |
 | L3 trajectory | Heuristic fallback is active unless `/app/data/trajectory_lstm.pt` is installed |
 | L4 receiver intake and solver | Implemented and fail-closed, but operationally unavailable without genuine physical receptions |
 | L4 comparisons | Event-aligned position comparison with a threshold that respects MLAT CEP90 |
 | L5 identity | Duplicate ICAO evidence is implemented |
+| Watch: transponder shutoff | Implemented: airborne tracks that vanish under proven-live coverage (3+ peers within 30 NM still received) emit durable TRANSPONDER_OFF events; landing, taxi, and feed-outage cases are excluded by construction |
+| Watch: military activity | Implemented: emergency squawks (7500/7600/7700), sustained multi-aircraft military concentrations, and unusual military flight profiles (fast-and-low, extreme climb/descent) |
 | External threat intelligence | Not integrated into the deployed Compose runtime |
 | Dashboard/API | Implemented with same-origin REST/WebSocket routing and layer evidence views |
 | Scientific validation | Not complete; requires labeled field data |
@@ -109,8 +111,9 @@ The remaining work is tracked in [REMAINING_IMPROVEMENTS.md](REMAINING_IMPROVEME
 4. PostgreSQL atomically claims the immutable source event, inserts the track point, and stores the exact `fused.tracks` outbox envelope.
 5. The outbox envelope is broker-acknowledged and marked delivered by its lease owner.
 6. Redis is updated only after durable persistence/publication succeeds.
-7. `anomaly-detector` consumes `fused.tracks`, runs L2/L3, computes active-evidence risk, writes enriched `sv:{ICAO}` state, and publishes qualifying alert events.
-8. FastAPI and the dashboard read bounded current snapshots.
+7. `anomaly-detector` consumes `fused.tracks`, runs per-aircraft L2/L3, computes active-evidence risk, writes enriched `sv:{ICAO}` state, and publishes qualifying alert events.
+8. `conflict-monitor` reads bounded canonical `fusion:sv:*` records, selects coherent complete ADS-B source reports, applies bounded pair/lifecycle analysis, and publishes `conflict:latest`.
+9. FastAPI and the dashboard read bounded current snapshots; the API never recomputes pair analysis per client.
 
 ### End-to-end physical MLAT event
 
@@ -155,6 +158,9 @@ The remaining work is tracked in [REMAINING_IMPROVEMENTS.md](REMAINING_IMPROVEME
 - ADS-B source-position conflict detection.
 - Receiver-backed transponder-loss logic only when direct receiver provenance supports it.
 - Redis-backed baseline persistence across detector restarts.
+- Bounded, event-time-aligned CPA/TCPA and projected horizontal/vertical separation for current public-feed aircraft pairs.
+
+The pairwise feature is `PASSIVE_NON_OPERATIONAL` TCAS-inspired conflict analytics. It is not evidence that an aircraft's TCAS/ACAS issued a Traffic Advisory or Resolution Advisory, and it never emits pilot climb/descend commands. Its `MONITOR`, `TRAFFIC_CONFLICT`, and `PREDICTED_LOSS_OF_SEPARATION` labels are conservative SkySecure engineering states, not certified TCAS states.
 
 **Evidence lifecycle:** detector-owned L2 output is replaced each cycle rather than endlessly accumulated. A public aggregator disappearing is treated as coverage loss, not proof that a transponder was switched off.
 
@@ -272,6 +278,7 @@ Risk uses current unique detector evidence plus classification contribution and 
 | `mlat-solver` | Physical reception accumulation and TDOA solving | `raw.mlat` signed reports and accumulator checkpoint |
 | `fusion-engine` | Canonical source fusion | `fusion:sv:{ICAO}`, PostgreSQL event ledger/outbox, `fused.tracks` |
 | `anomaly-detector` | L2/L3 and risk | `sv:{ICAO}`, L2 baselines, alert outbox, `alerts.anomaly` |
+| `conflict-monitor` | Passive relational L2 analysis | `conflict:latest`, bounded confirmation/clearing state |
 | `api` | REST, WebSocket, receiver intake, L1 | API state/caches and receiver liveness markers |
 | `frontend` | Nginx static dashboard and same-origin proxy | Browser presentation only |
 
@@ -315,6 +322,8 @@ Important namespaces include:
 - `mlat:accumulator`: recoverable reception grouping state.
 - `mlat:receiver:last_seen:{receiver}`: acknowledged receiver liveness.
 - `outbox:anomaly-alert:*`: immutable anomaly alert delivery events.
+- `conflict:latest`: shared, short-lived passive aircraft-pair snapshot.
+- `conflict:lifecycle`: bounded restart-persistent confirmation and clearing state.
 
 ### Kafka and ZooKeeper
 
@@ -421,10 +430,10 @@ Do not use unrestricted `docker compose up`, `docker compose down`, or `docker c
 
 Create and verify a PostgreSQL backup outside the repository. Record infrastructure container IDs, restart counts, mounted volumes, topic definitions, consumer offsets, and a live ingestion count.
 
-### 2. Build exactly the six application images
+### 2. Build exactly the seven application images
 
 ```bash
-docker compose build fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+docker compose build fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor frontend
 ```
 
 ### 3. Apply the idempotent migration to the running database
@@ -437,10 +446,10 @@ docker compose exec -T postgres \
 
 The migration must succeed before application recreation.
 
-### 4. Recreate exactly the six applications, without dependencies
+### 4. Recreate exactly the seven applications, without dependencies
 
 ```bash
-docker compose up -d --no-deps --force-recreate fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+docker compose up -d --no-deps --force-recreate fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor frontend
 ```
 
 Do not include:
@@ -482,6 +491,7 @@ The browser stores the operator key in `sessionStorage`, not in repository code.
 | `GET` | `/api/alerts?limit=&min_score=` | Current alert-worthy tracks | Public on loopback |
 | `GET` | `/api/stats` | Current bounded aggregate statistics | Public on loopback |
 | `GET` | `/api/layers` | Per-layer evaluated/triggered/skipped counts | Public on loopback |
+| `GET` | `/api/conflicts` | Latest bounded `PASSIVE_NON_OPERATIONAL` L2 aircraft-pair projections | Public on loopback |
 | `GET` | `/api/layers/{L1-L5}/triggers?limit=` | Current evidence for one layer | Public on loopback |
 | `GET` | `/api/l1/sources` | L1 source availability | Public on loopback |
 | `POST` | `/api/l1/validate` | Manual claim validation | Operator key |
@@ -489,7 +499,7 @@ The browser stores the operator key in `sessionStorage`, not in repository code.
 | `GET` | `/api/mlat/readiness` | Receiver configuration/geometry/liveness readiness | Public on loopback |
 | WebSocket | `/ws/tracks` | Same-origin current track snapshots | Origin checked |
 
-Interactive schemas and exact parameters are available at `/docs`.
+Interactive schemas and exact parameters are available at `/docs`. `GET /api/conflicts` returns the latest bounded `PASSIVE_NON_OPERATIONAL` Layer 2 pair analysis.
 
 ### WebSocket behavior
 
@@ -501,6 +511,11 @@ The server sends an initial message shaped like:
   "ts": 1720000000.0,
   "count": 1,
   "aircraft": [],
+  "conflict_analysis": {
+    "mode": "PASSIVE_NON_OPERATIONAL",
+    "layer": "L2",
+    "conflicts": []
+  },
   "tdoa_enabled": true
 }
 ```
@@ -626,7 +641,7 @@ Follow [docs/kafka-persistence.md](docs/kafka-persistence.md). Quiesce applicati
 
 1. Keep the verified database backup and old application image IDs.
 2. Do not roll back schema by deleting durable tables while newer events may depend on them.
-3. Recreate only the six prior application images with `--no-deps`.
+3. Recreate only the seven prior application images with `--no-deps`.
 4. Preserve infrastructure containers and volumes.
 5. Verify health, offsets, outbox state, and advancing ingestion.
 
@@ -638,7 +653,7 @@ Follow [docs/kafka-persistence.md](docs/kafka-persistence.md). Quiesce applicati
 4. Kafka
 5. `kafka-init`
 6. `fusion-engine` and `mlat-solver`
-7. `adsb-ingestor` and `anomaly-detector`
+7. `adsb-ingestor`, `anomaly-detector`, and `conflict-monitor`
 8. API
 9. frontend
 
@@ -654,7 +669,7 @@ curl -fsS http://127.0.0.1:8000/healthz
 curl -fsS http://127.0.0.1:8000/api/layers
 curl -i http://127.0.0.1:8000/api/mlat/readiness
 docker compose logs --since=5m \
-  fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+  fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor frontend
 ```
 
 A 503 from MLAT readiness is correct when physical receivers are absent.

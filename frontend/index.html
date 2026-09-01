@@ -3,17 +3,17 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>SkySecure V3</title>
+<title>SKYSECURE // V3</title>
 <link rel="stylesheet" href="/vendor/leaflet-1.9.4.min.css"/>
 <link rel="stylesheet" href="/app.css"/>
 </head>
 <body>
 
 <!-- History Panel -->
-<div id="hp">
+<aside id="hp">
   <div class="hph">
     <div><div class="hph-t" id="hp-title">--</div><div class="hph-s" id="hp-sub">--</div></div>
-    <button class="hpx" onclick="closePanel()">x</button>
+    <button class="hpx" id="hp-close" aria-label="Close panel">×</button>
   </div>
   <div class="hpbdg" id="hp-badges"></div>
   <div class="hpbody">
@@ -22,61 +22,68 @@
     <div class="hpsec"><h4>Heading (degrees)</h4><div class="hpcw"><canvas id="hp-hdg"></canvas></div></div>
     <div class="hpsec">
       <h4>Anomaly Event Log</h4>
-      <div class="evtlist" id="hp-evts"><div style="color:#9ca3af;font-size:12px">Collecting data...</div></div>
+      <div class="evtlist" id="hp-evts"><div class="dim">Collecting data...</div></div>
     </div>
   </div>
-</div>
+</aside>
 
 <!-- Header -->
-<div class="hdr">
-  <h1>
-    SkySecure V3 — Live Aircraft Anomaly Monitoring
-    <span style="font-size:12px;font-weight:400;color:#6b7280;display:flex;align-items:center;gap:5px">
+<header class="hdr">
+  <div class="hdr-l">
+    <div class="logo">◈ SKYSECURE<span class="logo-v">V3</span></div>
+    <div class="ws-wrap">
       <span class="wsd connecting" id="wsd"></span>
       <span id="wslbl">Connecting...</span>
-    </span>
-  </h1>
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('map')">Live Aircraft Map</div>
-    <div class="tab"        onclick="switchTab('eda')">EDA and ML</div>
-    <div class="tab"        onclick="switchTab('ai')">Local Dataset Analysis</div>
-    <div class="tab"        onclick="switchTab('code')">Code</div>
-    <div class="tab"        onclick="switchTab('manual')">Manual Packet Entry</div>
+    </div>
   </div>
-</div>
+  <nav class="tabs">
+    <div class="tab active" data-tab="map">Live Map</div>
+    <div class="tab tab-watch" data-tab="watch">Watch <span class="tab-pip" id="watch-pip">0</span></div>
+    <div class="tab" data-tab="eda">EDA &amp; ML</div>
+    <div class="tab" data-tab="ai">Dataset</div>
+    <div class="tab" data-tab="code">Code</div>
+    <div class="tab" data-tab="manual">Manual</div>
+  </nav>
+  <div class="hdr-r" id="utc-clock">--:--:-- UTC</div>
+</header>
 
 <!-- TAB: MAP -->
 <div class="tc active" id="tab-map">
   <div id="banner" class="banner yellow">Starting — waiting for the SkySecure API...</div>
-  <div style="padding:5px 28px;display:flex;gap:16px;flex-shrink:0;background:#f9fafb;border-bottom:1px solid var(--border);font-size:11px;font-family:var(--mono)">
-    <span style="color:var(--text2);font-weight:600">SOURCES:</span>
-    <span id="src-backend"      style="color:#9ca3af">Docker backend: waiting</span>
-    <span id="src-live"         style="color:#9ca3af">Server live feed: waiting</span>
+  <div class="src-strip">
+    <span class="src-label">SOURCES</span>
+    <span id="src-backend"   class="src waiting">Docker backend: waiting</span>
+    <span id="src-live"      class="src waiting">Server live feed: waiting</span>
+    <span id="src-conflicts" class="src waiting">Passive conflicts: waiting</span>
+    <span class="src-warn">Predictions only — not TCAS/ACAS advisories</span>
   </div>
   <div class="ctrl">
-    <label class="chk"><input type="checkbox" id="chk-spoof" onchange="applyFilters()"> Show heuristic anomaly score &gt;= 30%</label>
-    <label class="chk"><input type="checkbox" id="chk-mil"   onchange="applyFilters()"> Military only</label>
-    <label class="chk"><input type="checkbox" id="chk-apt"   checked onchange="drawAirports()"> Airport regions</label>
-    <select id="apt-sel" onchange="flyTo()"><option value="">Jump to airport...</option></select>
+    <label class="chk"><input type="checkbox" id="chk-spoof"> Heuristic score ≥ 30%</label>
+    <label class="chk"><input type="checkbox" id="chk-mil"> Military only</label>
+    <label class="chk"><input type="checkbox" id="chk-apt" checked> Airport regions</label>
+    <label class="chk"><input type="checkbox" id="chk-conflicts" checked> Conflict links</label>
+    <label class="chk"><input type="checkbox" id="watch-ghosts" checked> Watch ghosts</label>
+    <select id="apt-sel"><option value="">Jump to airport...</option></select>
     <div class="chips">
       <div class="chip total"><span id="ct">0</span> total</div>
       <div class="chip civil"><span id="cc">0</span> civil</div>
       <div class="chip mil"><span id="cm">0</span> mil</div>
       <div class="chip dark"><span id="cd">0</span> dark</div>
       <div class="chip spoof"><span id="cs">0</span> suspicious</div>
+      <div class="chip conf"><span id="cconf">0</span> conflicts</div>
     </div>
   </div>
-  <div class="coverage-ctrl">
+  <div class="ctrl ctrl-sub">
     <strong>LIVE COVERAGE</strong>
-    <select id="coverage-airport" onchange="selectCoverageAirport()"><option value="">Choose airport...</option></select>
+    <select id="coverage-airport"><option value="">Choose airport...</option></select>
     <label>Lat <input id="coverage-lat" type="number" min="-90" max="90" step="0.0001"></label>
     <label>Lon <input id="coverage-lon" type="number" min="-180" max="180" step="0.0001"></label>
     <label>Radius NM <input id="coverage-radius" type="number" min="1" max="250" value="250"></label>
-    <button id="coverage-map-center" onclick="useMapCenterForCoverage()">Use map center</button>
-    <button id="coverage-apply" class="primary" onclick="applyCoverage()">Monitor area</button>
-    <span id="coverage-status">Loading current area...</span>
+    <button id="coverage-map-center">Use map center</button>
+    <button id="coverage-apply" class="primary">Monitor area</button>
+    <span id="coverage-status" class="dim">Loading current area...</span>
   </div>
-  <div class="coverage-ctrl">
+  <div class="ctrl ctrl-sub">
     <strong>WORLD SCAN</strong>
     <label>Dwell
       <select id="world-scan-dwell">
@@ -86,20 +93,65 @@
         <option value="900">15 minutes</option>
       </select>
     </label>
-    <button id="world-scan-toggle" class="primary" onclick="updateWorldScan()">Start world scan</button>
-    <span id="world-scan-status">Loading scanner...</span>
-    <strong style="margin-left:14px">HISTORY</strong>
-    <select id="history-window" onchange="loadHistoricalAnomalies()">
+    <button id="world-scan-toggle" class="primary">Start world scan</button>
+    <span id="world-scan-status" class="dim">Loading scanner...</span>
+    <strong class="ctrl-gap">HISTORY</strong>
+    <select id="history-window">
       <option value="1">1 hour</option>
       <option value="24" selected>24 hours</option>
       <option value="168">7 days</option>
       <option value="720">30 days</option>
       <option value="0">All retained</option>
     </select>
-    <label class="chk"><input type="checkbox" id="history-markers" checked onchange="renderHistoricalAnomalies()"> Violet historical events</label>
-    <label class="chk"><input type="checkbox" id="hotspot-layer" checked onchange="renderHotspots()"> Hotspots</label>
+    <label class="chk"><input type="checkbox" id="history-markers" checked> Violet historical events</label>
+    <label class="chk"><input type="checkbox" id="hotspot-layer" checked> Hotspots</label>
   </div>
   <div id="map"></div>
+</div>
+
+<!-- TAB: WATCH -->
+<div class="tc" id="tab-watch">
+  <div class="scroll-tc">
+    <div class="watch-head">
+      <h2>Watch — Transponder &amp; Military Activity</h2>
+      <div class="watch-status" id="watch-status">Waiting for watch monitor...</div>
+    </div>
+    <p class="watch-note">
+      TRANSPONDER_OFF events fire only when an airborne aircraft vanishes while nearby aircraft
+      are still being received — proof the feed was alive at that spot. Consistent with a
+      deliberate shutoff; descent below coverage or provider filtering remain possible.
+      Concentrations are multi-aircraft, deduplicated, sustained, and recent.
+    </p>
+    <div class="sgrid" id="watch-stats">
+      <div class="sc"><div class="v" id="w-tracks">--</div><div class="l">Tracks observed</div></div>
+      <div class="sc"><div class="v" id="w-fresh">--</div><div class="l">Live now</div></div>
+      <div class="sc"><div class="v" id="w-ledger">--</div><div class="l">Airborne ledger</div></div>
+      <div class="sc"><div class="v" id="w-conc">--</div><div class="l">Active concentrations</div></div>
+      <div class="sc"><div class="v" id="w-persist">--</div><div class="l">History persistence</div></div>
+    </div>
+
+    <div class="watch-conc" id="watch-conc-wrap" style="display:none">
+      <h3>Active Military Concentrations</h3>
+      <div id="watch-conc-list"></div>
+    </div>
+
+    <div class="watch-filterbar">
+      <button class="wfilter active" data-wkind="ALL">All</button>
+      <button class="wfilter wk-toff" data-wkind="TRANSPONDER_OFF">Transponder off</button>
+      <button class="wfilter wk-sqk" data-wkind="EMERGENCY_SQUAWK">Emergency squawk</button>
+      <button class="wfilter wk-conc" data-wkind="MIL_CONCENTRATION">Concentrations</button>
+      <button class="wfilter wk-hiperf" data-wkind="MIL_HIGH_PERFORMANCE">High performance</button>
+      <select id="watch-hours">
+        <option value="1">1 hour</option>
+        <option value="24" selected>24 hours</option>
+        <option value="168">7 days</option>
+      </select>
+    </div>
+
+    <div class="watch-feed" id="watch-feed">
+      <div class="dim watch-empty">No watch events in this window. The monitor emits only with live-coverage proof.</div>
+    </div>
+  </div>
 </div>
 
 <!-- TAB: EDA -->
@@ -108,9 +160,9 @@
     <h2>Exploratory Data Analysis and ML Results</h2>
     <div class="sgrid">
       <div class="sc"><div class="v" id="e-tot">--</div><div class="l">Total Tracked</div></div>
-      <div class="sc"><div class="v" id="e-sp" style="color:#ef4444">--</div><div class="l">Heuristically Suspicious</div></div>
-      <div class="sc"><div class="v" id="e-mil" style="color:#f97316">--</div><div class="l">Military / Dark</div></div>
-      <div class="sc"><div class="v" id="e-cl" style="color:#22c55e">--</div><div class="l">Clean Civilian</div></div>
+      <div class="sc"><div class="v c-red" id="e-sp">--</div><div class="l">Heuristically Suspicious</div></div>
+      <div class="sc"><div class="v c-amber" id="e-mil">--</div><div class="l">Military / Dark</div></div>
+      <div class="sc"><div class="v c-green" id="e-cl">--</div><div class="l">Clean Civilian</div></div>
     </div>
     <h3>Detection Layers</h3>
     <div class="sgrid" id="layer-grid">
@@ -120,16 +172,16 @@
       <div class="sc"><div class="v" id="layer-L4">--</div><div class="l">L4 Sensor Fusion · T/E/S</div></div>
       <div class="sc"><div class="v" id="layer-L5">--</div><div class="l">L5 Identity / Intel · T/E/S</div></div>
     </div>
-    <div style="display:flex;align-items:center;gap:10px;margin:16px 0 8px">
-      <h3 style="margin:0">Layer Trigger Evidence</h3>
-      <select id="layer-select" onchange="updateLayerTriggers()">
+    <div class="row-flex">
+      <h3>Layer Trigger Evidence</h3>
+      <select id="layer-select">
         <option>L1</option><option selected>L2</option><option>L3</option><option>L4</option><option>L5</option>
       </select>
     </div>
-    <div class="tw" style="margin-bottom:18px">
+    <div class="tw">
       <table>
         <thead><tr><th>Aircraft</th><th>Detector</th><th>Type</th><th>Score</th><th>Evidence</th></tr></thead>
-        <tbody id="layer-trigger-body"><tr><td colspan="5" style="text-align:center;color:#9ca3af">Waiting for layer telemetry</td></tr></tbody>
+        <tbody id="layer-trigger-body"><tr><td colspan="5" class="td-dim">Waiting for layer telemetry</td></tr></tbody>
       </table>
     </div>
     <div class="crow">
@@ -137,14 +189,14 @@
       <div class="cc"><h4>Spoof Probability Distribution</h4><canvas id="ch-prob"></canvas></div>
     </div>
     <h3>Highest Heuristic Anomaly Scores</h3>
-    <div class="tw" style="margin-top:10px">
+    <div class="tw">
       <table>
         <thead><tr>
           <th>Aircraft ID</th><th>Callsign</th><th>Latitude</th><th>Longitude</th>
           <th>Altitude (ft)</th><th>Speed (kts)</th><th>Classification</th>
           <th>Spoof Probability</th><th>Anomalies</th>
         </tr></thead>
-        <tbody id="stb"><tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:18px">Waiting for data — make sure Docker is running</td></tr></tbody>
+        <tbody id="stb"><tr><td colspan="9" class="td-dim">Waiting for data — make sure Docker is running</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -154,46 +206,46 @@
 <div class="tc" id="tab-ai">
   <div class="scroll-tc">
     <h2>Local Dataset Analysis</h2>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:20px;line-height:1.6">Upload an ACARS or ADS-B CSV dataset for local, deterministic triage. Uploaded telemetry stays in this browser and labels are not independent confirmation of an attack.</p>
+    <p class="dim-p">Upload an ACARS or ADS-B CSV dataset for local, deterministic triage. Uploaded telemetry stays in this browser and labels are not independent confirmation of an attack.</p>
 
-    <div class="dropzone" onclick="document.getElementById('ai-file').click()">
-      <input type="file" id="ai-file" accept=".csv" style="display:none" onchange="handleCSV(this)"/>
-      <div style="font-weight:500;font-size:14px;margin-bottom:4px">Click to upload CSV file</div>
-      <div style="font-size:12px;color:var(--text2)">Supports ACARS packet data — Timestamp, AircraftID, Latitude, Longitude, Altitude_ft, Speed_knots, IsSpoofed</div>
+    <div class="dropzone" id="ai-dropzone">
+      <input type="file" id="ai-file" accept=".csv" style="display:none"/>
+      <div class="dz-t">Click to upload CSV file</div>
+      <div class="dz-s">Supports ACARS packet data — Timestamp, AircraftID, Latitude, Longitude, Altitude_ft, Speed_knots, IsSpoofed</div>
     </div>
 
-    <div id="ai-banner" style="display:none;margin-bottom:14px;max-width:580px" class="banner green"></div>
+    <div id="ai-banner" style="display:none" class="banner green"></div>
 
-    <div id="ai-preview" style="display:none;margin-bottom:20px;max-width:900px">
-      <h3 style="margin-top:0">Data Preview <span id="ai-row-count" style="font-weight:400;color:var(--text2);font-size:12px"></span></h3>
-      <div style="border:1px solid var(--border);border-radius:7px;overflow-x:auto;max-height:200px;overflow-y:auto;margin-top:8px">
-        <table style="width:100%;border-collapse:collapse;font-size:11px">
+    <div id="ai-preview" style="display:none" class="ai-preview">
+      <h3>Data Preview <span id="ai-row-count" class="dim"></span></h3>
+      <div class="ai-scroll">
+        <table class="ai-table">
           <thead id="ai-thead"></thead>
           <tbody id="ai-tbody"></tbody>
         </table>
       </div>
     </div>
 
-    <button id="ai-btn" class="btn" style="display:none;margin-bottom:20px" onclick="runAIAnalysis()">Run Local Dataset Analysis</button>
+    <button id="ai-btn" class="btn" style="display:none">Run Local Dataset Analysis</button>
 
-    <div id="ai-loading" style="display:none;max-width:580px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:7px">
+    <div id="ai-loading" style="display:none" class="ai-loading">
       <span class="spinner"></span>
-      <span style="font-weight:500;font-size:13px">Analysing your dataset locally...</span>
-      <div id="ai-progress" style="font-size:12px;color:var(--text2);margin-top:5px;margin-left:24px">Reading records</div>
+      <span>Analysing your dataset locally...</span>
+      <div id="ai-progress" class="dim">Reading records</div>
     </div>
 
-    <div id="ai-results" style="display:none;max-width:900px">
-      <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px" id="ai-stat-grid"></div>
+    <div id="ai-results" style="display:none" class="ai-results">
+      <div class="sgrid" id="ai-stat-grid"></div>
       <div class="crow">
-        <div class="cc"><h4>Spoof reason breakdown</h4><canvas id="ai-rc" style="max-height:180px"></canvas></div>
-        <div class="cc"><h4>Speed distribution (labeled suspicious)</h4><canvas id="ai-sc" style="max-height:180px"></canvas></div>
+        <div class="cc"><h4>Spoof reason breakdown</h4><canvas id="ai-rc"></canvas></div>
+        <div class="cc"><h4>Speed distribution (labeled suspicious)</h4><canvas id="ai-sc"></canvas></div>
       </div>
-      <div style="background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:0 7px 7px 0;padding:18px;margin-bottom:20px">
-        <div style="font-size:10px;font-weight:700;color:var(--blue);letter-spacing:.08em;text-transform:uppercase;margin-bottom:9px">Local Heuristic Analysis</div>
-        <div id="ai-narrative" style="font-size:13px;line-height:1.8;color:var(--text);white-space:pre-wrap"></div>
+      <div class="narrative-box">
+        <div class="narrative-label">Local Heuristic Analysis</div>
+        <div id="ai-narrative"></div>
       </div>
       <h3>Flagged Aircraft — Detail</h3>
-      <div class="tw" style="margin-top:10px">
+      <div class="tw">
         <table>
           <thead><tr>
             <th>Aircraft ID</th><th>Flight</th><th>Lat / Lon</th><th>Alt (ft)</th>
@@ -210,7 +262,7 @@
 <div class="tc" id="tab-code">
   <div class="scroll-tc">
     <h2>Code — Feature Extraction and Anomaly Detection</h2>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:22px;line-height:1.6">Selected algorithm examples used by SkySecure V3. The live deployment status of each module is shown separately from these reference snippets.</p>
+    <p class="dim-p">Selected algorithm examples used by SkySecure V3. The live deployment status of each module is shown separately from these reference snippets.</p>
 
     <div class="code-section">
       <h3>feature_extractor.py</h3>
@@ -245,23 +297,47 @@
         features[<span class="str">'speed'</span>]    = frame[<span class="str">'speed'</span>]
         features[<span class="str">'heading'</span>]  = frame[<span class="str">'heading'</span>]
 
-        <span class="kw">if</span> len(history) >= <span class="num">2</span>:
+        <span class="kw">if</span> len(history) &gt;= <span class="num">2</span>:
             t0, lat0, lon0 = history[-<span class="num">2</span>]
             t1, lat1, lon1 = history[-<span class="num">1</span>]
             dt = t1 - t0
-            <span class="kw">if</span> dt > <span class="num">0</span>:
+            <span class="kw">if</span> dt &gt; <span class="num">0</span>:
                 dist     = haversine(lat0, lon0, lat1, lon1)
                 speed_ms = dist / dt
-                <span class="kw">if</span> speed_ms > <span class="num">650</span>:  <span class="cmt"># extreme positional jump</span>
+                <span class="kw">if</span> speed_ms &gt; <span class="num">650</span>:  <span class="cmt"># extreme positional jump</span>
                     features[<span class="str">'movement_anomaly'</span>] = <span class="num">True</span>
                     features[<span class="str">'anomaly_speed_ms'</span>] = speed_ms
 
         <span class="kw">return</span> np.array(list(features.values()), dtype=np.float32)
 
     <span class="kw">def</span> <span class="fn">_velocity_check</span>(self, frame):
-        <span class="kw">if</span> frame[<span class="str">'speed'</span>] > <span class="num">850</span>:
+        <span class="kw">if</span> frame[<span class="str">'speed'</span>] &gt; <span class="num">850</span>:
             <span class="kw">return</span> <span class="num">10.0</span>  <span class="cmt"># max anomaly score</span>
         <span class="kw">return</span> <span class="num">0.0</span></div>
+    </div>
+
+    <div class="code-section">
+      <h3>watch_monitor.py — transponder shutoff coverage proof</h3>
+      <div class="what-box">
+        <h4>What This Does</h4>
+        <ul>
+          <li>Keeps a ledger of every airborne aircraft the fusion engine tracks</li>
+          <li>When one goes silent above 1,500 ft at cruise speed, it counts aircraft still being received within 30 NM of the last fix</li>
+          <li>Emits TRANSPONDER_OFF only with 3+ live peers — proof the feed was alive, so coverage loss cannot masquerade as a shutoff</li>
+          <li>Never fires on low, slow, grounded, or briefly-tracked aircraft (landing, taxi, noise)</li>
+        </ul>
+      </div>
+      <div class="code-block"><span class="kw">def</span> <span class="fn">is_disappearance_candidate</span>(entry, now):
+    <span class="cmt"># Exclude the ordinary explanations first.</span>
+    <span class="kw">if</span> (entry[<span class="str">"alt"</span>] or <span class="num">0</span>) &lt; WATCH_MIN_ALT_FT:      <span class="kw">return</span> <span class="num">False</span>  <span class="cmt"># landing</span>
+    <span class="kw">if</span> (entry[<span class="str">"vel"</span>] or <span class="num">0</span>) &lt; WATCH_MIN_SPEED_KTS:    <span class="kw">return</span> <span class="num">False</span>  <span class="cmt"># taxi</span>
+    <span class="kw">if</span> (entry[<span class="str">"updates"</span>] or <span class="num">0</span>) &lt; WATCH_MIN_UPDATES:  <span class="kw">return</span> <span class="num">False</span>  <span class="cmt"># noise</span>
+    <span class="kw">return</span> now - entry[<span class="str">"last_seen"</span>] &gt;= WATCH_SILENCE_SEC
+
+peers = count_live_peers(entry, fresh, now)
+<span class="kw">if</span> peers &lt; WATCH_MIN_PEERS:
+    <span class="kw">continue</span>  <span class="cmt"># fail closed: cannot rule out a feed outage</span>
+emit(TRANSPONDER_OFF, evidence={<span class="str">"live_peers"</span>: peers, ...})</div>
     </div>
 
     <div class="code-section">
@@ -272,7 +348,7 @@
           <li>Isolation Forest partitions the feature space to isolate anomalies from normal data clusters</li>
           <li>LSTM flags physically implausible state transitions such as 900 kts at 200 ft altitude</li>
           <li>Ensemble score: 40% Isolation Forest weight + 60% LSTM weight</li>
-          <li>Alert triggered when score is >= 5 for >= 3 consecutive frames</li>
+          <li>Alert triggered when score is &gt;= 5 for &gt;= 3 consecutive frames</li>
           <li>Confidence intervals output alongside each threat score</li>
         </ul>
       </div>
@@ -281,61 +357,16 @@
 
     <span class="cmt"># Impossible coordinates — outside Earth bounds</span>
     prob += np.where(
-        (df[<span class="str">'Latitude'</span>].abs() > <span class="num">90</span>) | (df[<span class="str">'Longitude'</span>].abs() > <span class="num">180</span>),
+        (df[<span class="str">'Latitude'</span>].abs() &gt; <span class="num">90</span>) | (df[<span class="str">'Longitude'</span>].abs() &gt; <span class="num">180</span>),
         <span class="num">1.0</span>, <span class="num">0</span>
     )
     <span class="cmt"># Sentinel altitude value used in spoofed datasets</span>
     prob += np.where(df[<span class="str">'Altitude_ft'</span>] == <span class="num">999999</span>, <span class="num">0.95</span>, <span class="num">0</span>)
     <span class="cmt"># Physically impossible speed</span>
-    prob += np.where(df[<span class="str">'Speed_knots'</span>] > <span class="num">1200</span>, <span class="num">0.85</span>, <span class="num">0</span>)
+    prob += np.where(df[<span class="str">'Speed_knots'</span>] &gt; <span class="num">1200</span>, <span class="num">0.85</span>, <span class="num">0</span>)
     <span class="cmt"># Negative speed value</span>
     prob += np.where(df[<span class="str">'Speed_knots'</span>] &lt; <span class="num">0</span>,    <span class="num">0.9</span>,  <span class="num">0</span>)
-    <span class="kw">return</span> prob.clip(<span class="num">0</span>, <span class="num">1</span>)
-
-<span class="cmt"># Add movement anomaly contribution</span>
-df[<span class="str">'Spoof_Probability'</span>]  = heuristic_spoof_probability(df)
-df[<span class="str">'Spoof_Probability'</span>] += np.where(df[<span class="str">'Movement_Anomaly'</span>], <span class="num">0.3</span>, <span class="num">0</span>)
-df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_Probability'</span>].clip(<span class="num">0</span>, <span class="num">1</span>)</div>
-    </div>
-
-    <div class="code-section">
-      <h3>data_ingestor.py — OpenSky sequence fallback</h3>
-      <div class="what-box">
-        <h4>What This Does</h4>
-        <ul>
-          <li>Ingests live data from the OpenSky Network API and additional ADS-B sources</li>
-          <li>Normalises altitude from metres to feet and speed from m/s to knots</li>
-          <li>Falls back gracefully on API failure with structured error logging</li>
-          <li>Accurately maps each aircraft with correct flight details and position</li>
-        </ul>
-      </div>
-      <div class="code-block"><span class="kw">try</span>:
-    response = requests.get(
-        <span class="str">"https://opensky-network.org/api/states/all"</span>,
-        timeout=<span class="num">30</span>
-    )
-    response.raise_for_status()
-    data   = response.json()
-    states = data.get(<span class="str">"states"</span>, [])
-
-    <span class="kw">if</span> states:
-        columns_17 = [
-            <span class="str">"icao24"</span>, <span class="str">"callsign"</span>, <span class="str">"origin_country"</span>,
-            <span class="str">"time_position"</span>, <span class="str">"last_contact"</span>,
-            <span class="str">"longitude"</span>, <span class="str">"latitude"</span>, <span class="str">"baro_altitude"</span>,
-            <span class="str">"on_ground"</span>, <span class="str">"velocity"</span>, <span class="str">"heading"</span>,
-            <span class="str">"vertical_rate"</span>, <span class="str">"sensors"</span>, <span class="str">"geo_altitude"</span>,
-            <span class="str">"squawk"</span>, <span class="str">"spi"</span>, <span class="str">"position_source"</span>
-        ]
-        df_os = pd.DataFrame(states, columns=columns_17)
-        df_os[<span class="str">'Altitude_ft'</span>] = df_os[<span class="str">'baro_altitude'</span>] * <span class="num">3.28084</span>
-        df_os[<span class="str">'Speed_knots'</span>] = df_os[<span class="str">'velocity'</span>]     * <span class="num">1.94384</span>
-        df_os[<span class="str">'source'</span>]      = <span class="str">'OpenSky'</span>
-        st.success(f<span class="str">"Loaded {len(df_os)} aircraft from OpenSky"</span>)
-        df_list.append(df_os)
-
-<span class="kw">except</span> Exception <span class="kw">as</span> e:
-    st.warning(f<span class="str">"Error fetching OpenSky data: {e}"</span>)</div>
+    <span class="kw">return</span> prob.clip(<span class="num">0</span>, <span class="num">1</span>)</div>
     </div>
 
     <div class="code-section">
@@ -366,19 +397,14 @@ df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_
         <span class="kw">return</span> self.fc(out[:, -<span class="num">1</span>, :])
 
 <span class="kw">def</span> <span class="fn">ensemble_score</span>(if_score, lstm_score):
-    <span class="kw">return</span> (<span class="num">0.4</span> * if_score) + (<span class="num">0.6</span> * lstm_score)
-
-<span class="cmt"># Alert: score >= 5 for >= 3 consecutive frames</span>
-<span class="kw">if</span> len(score_buffer) >= <span class="num">3</span>:
-    <span class="kw">if</span> all(s >= <span class="num">5</span> <span class="kw">for</span> s <span class="kw">in</span> score_buffer[-<span class="num">3</span>:]):
-        alert_dispatcher.trigger(aircraft_id, score_buffer[-<span class="num">1</span>])</div>
+    <span class="kw">return</span> (<span class="num">0.4</span> * if_score) + (<span class="num">0.6</span> * lstm_score)</div>
     </div>
 
-    <div class="sgrid" style="margin-top:8px">
-      <div class="sc"><div class="v" style="color:var(--teal)">Prototype</div><div class="l">Engineering status</div></div>
-      <div class="sc"><div class="v" style="color:var(--teal)">Unvalidated</div><div class="l">Real-world accuracy</div></div>
-      <div class="sc"><div class="v" style="color:var(--teal)">Dataset required</div><div class="l">False-positive rate</div></div>
-      <div class="sc"><div class="v" style="color:var(--teal)">No claim</div><div class="l">Radar comparison</div></div>
+    <div class="sgrid">
+      <div class="sc"><div class="v c-cyan">Prototype</div><div class="l">Engineering status</div></div>
+      <div class="sc"><div class="v c-cyan">Unvalidated</div><div class="l">Real-world accuracy</div></div>
+      <div class="sc"><div class="v c-cyan">Dataset required</div><div class="l">False-positive rate</div></div>
+      <div class="sc"><div class="v c-cyan">No claim</div><div class="l">Radar comparison</div></div>
     </div>
   </div>
 </div>
@@ -387,7 +413,7 @@ df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_
 <div class="tc" id="tab-manual">
   <div class="scroll-tc">
     <h2>Manual Packet Entry</h2>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:20px">Enter raw aircraft telemetry to run spoof detection analysis.</p>
+    <p class="dim-p">Enter raw aircraft telemetry to run spoof detection analysis.</p>
     <div class="fgrid">
       <div class="fg"><label>ICAO24 Address</label><input id="m-icao" placeholder="e.g. A1B2C3" maxlength="6"/></div>
       <div class="fg"><label>Callsign</label><input id="m-cs" placeholder="e.g. UAL123"/></div>
@@ -398,7 +424,7 @@ df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_
       <div class="fg"><label>Heading (degrees)</label><input id="m-hdg" type="number" placeholder="0 to 359"/></div>
       <div class="fg"><label>Vertical Rate (fpm)</label><input id="m-vr" type="number" placeholder="e.g. 0"/></div>
     </div>
-    <button class="btn" style="margin-top:16px" onclick="analyzeManual()">Analyze Packet</button>
+    <button class="btn" id="m-analyze">Analyze Packet</button>
     <div id="mres" style="display:none" class="rbox"></div>
   </div>
 </div>
@@ -407,3 +433,4 @@ df[<span class="str">'Spoof_Probability'</span>]  = df[<span class="str">'Spoof_
 <script src="/vendor/chart-4.4.0.umd.min.js"></script>
 <script src="/app.js"></script>
 </body>
+</html>

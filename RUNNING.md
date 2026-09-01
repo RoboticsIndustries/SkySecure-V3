@@ -29,17 +29,19 @@ This is not the production update procedure for an existing installation.
 Never recreate PostgreSQL, Redis, Kafka, or ZooKeeper during an application release. Preserve their container identities, storage, and data.
 
 1. Back up PostgreSQL and record infrastructure container IDs/restart counts.
-2. Apply the idempotent migration to the running PostgreSQL container:
+2. Apply the idempotent migrations to the running PostgreSQL container:
 
 ```bash
 docker compose exec -T postgres psql -U skysecure -d skysecure -v ON_ERROR_STOP=1 < scripts/migrations/001_fusion_event_commits.sql
+docker compose exec -T postgres psql -U skysecure -d skysecure -v ON_ERROR_STOP=1 < scripts/migrations/002_anomaly_history.sql
+docker compose exec -T postgres psql -U skysecure -d skysecure -v ON_ERROR_STOP=1 < scripts/migrations/003_watch_events.sql
 ```
 
 3. Build and recreate only application services:
 
 ```bash
-docker compose build fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
-docker compose up -d --no-deps --force-recreate fusion-engine adsb-ingestor api mlat-solver anomaly-detector frontend
+docker compose build fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor watch-monitor frontend
+docker compose up -d --no-deps --force-recreate fusion-engine adsb-ingestor api mlat-solver anomaly-detector conflict-monitor watch-monitor frontend
 ```
 
 4. Verify `/healthz`, `/api/mlat/readiness`, `/api/layers`, same-origin REST/WebSocket behavior, CSP, logs, restart counts, deployed image IDs, and advancing `track_points`.
@@ -63,6 +65,19 @@ Without authenticated physical evidence, L4 must remain unavailable rather than 
 curl -fsS http://localhost:8000/healthz
 curl -fsS http://localhost:8000/api/mlat/readiness
 curl -fsS http://localhost:8000/api/layers
+curl -fsS http://localhost:8000/api/watch/summary
+curl -fsS http://localhost:8000/api/watch/events?hours=24
 ```
 
-MLAT readiness may correctly return HTTP 503 until enough configured physical receivers are recently active. Layer 3 may correctly report heuristic fallback when the trained checkpoint is absent.
+MLAT readiness may correctly return HTTP 503 until enough configured physical receivers are recently active. Layer 3 may correctly report heuristic fallback when the trained checkpoint is absent. The watch summary returns `analysis_available: false` until the watch monitor publishes its first snapshot.
+
+## Watch monitor
+
+The `watch-monitor` service owns transponder-shutoff and military-activity analysis. It scans fused live state, keeps a ledger of airborne tracks, and emits deduplicated events to Redis (live feed) and the `watch_events` PostgreSQL table (recoverable history, migration 003).
+
+- `TRANSPONDER_OFF` fires only when a track that was airborne above 1,500 ft at cruise speed goes silent for 120 s **and** at least 3 other aircraft are still being received within 30 NM of its last fix. The peer proof is what separates a plausible deliberate shutoff from an ordinary coverage or aggregator dropout; without it the monitor stays silent (fail closed). Landing, taxi, and briefly-tracked aircraft never qualify.
+- `EMERGENCY_SQUAWK` fires on observed 7500/7600/7700 codes.
+- `MIL_CONCENTRATION` fires once when 4+ military-scored aircraft cluster within 60 NM and clears only after a 15-minute hold with no members — multi-aircraft, deduplicated, sustained, recent.
+- `MIL_HIGH_PERFORMANCE` fires on military-scored aircraft flying well outside transport profiles (≥540 kts at or below 20,000 ft, or ≥6,000 fpm below 30,000 ft).
+
+A shutoff event means "disappeared under proven-live coverage" — consistent with a deliberate transponder shutoff, not proof of one. Residual explanations (descent below receiver line-of-sight, provider-side filtering) are recorded in the event metadata.
